@@ -1,0 +1,15 @@
+# 敏感信息 / 本地状态（不进仓库）
+.env
+sessions.json
+names.json
+notify_target.json
+notify.log
+mute.flag
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# IDE
+.idea/
