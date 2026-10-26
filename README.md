@@ -47,6 +47,10 @@ uv run bot.py    # 启动机器人（保持窗口开着）
 ## 五、使用
 
 - 直接发文本 = 给 Claude 下指令，多轮对话自动保持上下文
+- **任务执行中发消息会自动排队**，当前任务完成后依次执行（和桌面终端体验一致）；
+  `/stop` 中断当前任务并取消排队，`/unqueue` 只清排队、不动正在跑的任务
+- `!命令` = 直通 shell：在本机 PowerShell 直接执行、回显结果（不经 Claude，
+  相当于桌面终端的 `!` bash 模式；超时 120 秒，长任务建议发给 Claude）
 - Claude 的回复、执行的命令（🔧 开头）都会实时转发回来，结束附耗时/费用摘要
 - 群聊里 @机器人 触发
 
@@ -63,7 +67,7 @@ uv run bot.py    # 启动机器人（保持窗口开着）
 | `/unqueue` | 取消排队接管 |
 | `/rename [名字]` | 给当前会话起名，`/sessions` 列表优先显示 |
 | `/cwd [路径]` | 查看/切换 Claude 的工作目录 |
-| `/mode` | 查看权限模式 |
+| `/mode [模式]` | 查看/切换权限模式（`manual` `auto` `acceptEdits` `plan` `bypassPermissions`，下一条消息生效） |
 | `/mute` · `/unmute` | 手动暂停/恢复桌面事件推送 |
 
 > 多项目并行：不同飞书聊天（单聊/不同群）各自绑定独立会话；
@@ -115,7 +119,8 @@ Claude Code 的会话存在 `~/.claude/projects/` 下的转录文件里，不绑
 
 - 机器人能操控你的电脑：白名单（`ALLOWED_USERS`）是第一道防线
 - 默认权限模式 `acceptEdits`：Claude 可改文件，但跑命令受你 Claude 设置的限制
-- 若设置 `CLAUDE_PERMISSION_MODE=bypassPermissions`：白名单内的人可让 Claude 做任何事，风险自负
+- `/mode` 可运行时切换（含 `bypassPermissions`）；若设置 `CLAUDE_PERMISSION_MODE=bypassPermissions`：白名单内的人可让 Claude 做任何事，风险自负
+- `!命令` 直通 shell **绕过** Claude 的权限模式（等同于你本人坐在电脑前敲命令），仅白名单用户可用
 
 ## 七、常见问题
 
@@ -124,7 +129,7 @@ Claude Code 的会话存在 `~/.claude/projects/` 下的转录文件里，不绑
 | 提示找不到 claude | `.env` 里设 `CLAUDE_PATH=<claude 的完整路径>` |
 | 收不到消息 | 检查第 2 步：长连接模式是否开启、`im.message.receive_v1` 是否订阅、权限是否开通并重新发布 |
 | 会话失效 | 机器人会自动开新会话重试；`/cwd` 切目录会重置会话 |
-| 长任务被中断 | 调大 `.env` 里的 `CLAUDE_TIMEOUT` |
+| 长任务被中断 | 默认不限时；若设过 `CLAUDE_TIMEOUT`，调大或设 0（不限时），挂死用 `/stop` 远程杀 |
 
 会话记录存在 `sessions.json`（可删除重置全部会话），会话名存在 `names.json`。
 

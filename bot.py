@@ -41,10 +41,14 @@ APP_SECRET = os.environ["FEISHU_APP_SECRET"]
 WORK_DIR = Path(os.environ.get("WORK_DIR", str(BASE_DIR))).resolve()  # Claude 的工作目录
 ALLOWED_USERS = {u.strip() for u in os.environ.get("ALLOWED_USERS", "").split(",") if u.strip()}
 PERMISSION_MODE = os.environ.get("CLAUDE_PERMISSION_MODE", "acceptEdits").strip()
-CLAUDE_TIMEOUT = int(os.environ.get("CLAUDE_TIMEOUT", "600"))     # 单次任务超时（秒）
+CLAUDE_TIMEOUT = int(os.environ.get("CLAUDE_TIMEOUT", "0"))   # 单次任务超时（秒），<=0 不限时
 FORWARD_TOOLS = os.environ.get("FORWARD_TOOLS", "1").strip().lower() not in ("0", "false", "no")
 CLAUDE_EXTRA_ARGS = os.environ.get("CLAUDE_EXTRA_ARGS", "").strip()
 CLAUDE_PATH = os.environ.get("CLAUDE_PATH") or shutil.which("claude")
+
+# 权限模式全集（/mode 运行时切换 + 启动校验共用）
+PERMISSION_MODES = {"default", "acceptEdits", "auto", "bypassPermissions", "manual", "dontAsk", "plan"}
+SHELL_TIMEOUT = 120  # 飞书 ! 命令直通 shell 的超时（秒）
 
 SESSION_FILE = BASE_DIR / "sessions.json"
 MAX_CHUNK = 3500      # 单条飞书消息最大字符数，超长自动分段
@@ -53,19 +57,21 @@ SEND_INTERVAL = 0.5   # 发消息最小间隔（秒），避免触发飞书频�
 HELP_TEXT = """📖 命令列表
 /help — 查看本帮助
 /new — 开启新会话（清除历史上下文）
-/stop — 中断正在执行的任务
-/status — 查看当前任务状态
+/stop — 中断当前任务（排队的消息一并取消）
+/status — 查看当前任务与排队状态
 /session — 查看当前会话 ID（在电脑上 claude --resume <id> 可接续）
 /sessions [条数] — 列出电脑上最近的会话（含当前绑定的）
 /takeover [序号|会话ID|latest] — 接管电脑上的会话（在跑的自动排队，跑完接续）
 /peek [序号|会话ID|latest] — 旁观会话当前进度（正在干什么、最新输出）
-/unqueue — 取消排队接管
+/unqueue — 清空排队（消息队列 / 排队接管）
 /rename [名字] — 给当前会话起名（/sessions 列表优先显示名字）
 /cwd [路径] — 查看 / 切换 Claude 的工作目录
-/mode — 查看当前权限模式
+/mode [模式] — 查看 / 切换权限模式（manual、auto、acceptEdits…）
 /mute · /unmute — 暂停/恢复桌面事件推送
 
-直接发送文本 = 给 Claude 下指令，多轮对话自动保持上下文。"""
+直接发送文本 = 给 Claude 下指令，多轮对话自动保持上下文。
+任务执行中发消息会自动排队，当前任务完成后依次执行。
+!命令 = 直接在本机 PowerShell 执行（不经 Claude），如 !git status"""
 
 # 用于发消息的 API 客户端（与收消息的 WebSocket 客户端相互独立）
 api = lark.Client.builder() \
@@ -118,6 +124,10 @@ def _lookup_session(chat_id: str):
 # ---------------- 运行中的任务（chat_id -> {"proc","started","reason"}） ----------------
 _running_lock = threading.Lock()
 _running: dict = {}
+
+# ---------------- 消息排队（任务忙时新消息入队，当前任务跑完自动依次执行） ----------------
+_msg_queue_lock = threading.Lock()
+_msg_queue: dict = {}   # chat_id -> [str]
 
 # ---------------- 排队接管（会话在电脑上跑着时先绑定，消息排队等回合结束自动执行） ----------------
 _pending_lock = threading.Lock()
@@ -232,16 +242,71 @@ def _tool_summary(name: str, tool_input) -> str:
     return name
 
 
+def shell_task(chat_id: str, command: str) -> None:
+    """飞书直通 shell：!command 在本机 PowerShell 直接执行（不经过 Claude）。
+
+    相当于桌面终端的 bash 模式；白名单用户本就能通过 Claude 执行任意命令，
+    这里只是省掉模型中转。注意会绕过 Claude 的权限模式，输出用 UTF-8 读取。
+    """
+    try:
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; " + command],
+            cwd=str(WORK_DIR), capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+            timeout=SHELL_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        send_text(chat_id, f"⏱ 命令超过 {SHELL_TIMEOUT}s 被中断（长任务建议发给 Claude 处理）")
+        return
+    except FileNotFoundError:
+        send_text(chat_id, "❌ 找不到 powershell。")
+        return
+    out = (r.stdout or "").strip()
+    err = (r.stderr or "").strip()
+    body = out
+    if err:
+        body = (out + "\n" if out else "") + "[stderr]\n" + err
+    if not body:
+        body = "（无输出）"
+    send_text(chat_id, f"$ {command}\n{body}\n[exit {r.returncode}]")
+
+
 def run_task(chat_id: str, prompt: str) -> None:
-    """任务入口：同一会话同时只跑一个，忙时提示。"""
+    """任务入口：同一会话同时只跑一个；忙时新消息排队，跑完自动依次执行。
+
+    像桌面终端的 Claude 一样：执行中发消息不会丢，当前回合思考完就轮到它。
+    """
     with _running_lock:
         if chat_id in _running:
-            send_text(chat_id, "⏳ 上一条任务还在执行中，发送 /stop 可中断，或稍后再发。")
+            with _msg_queue_lock:
+                q = _msg_queue.setdefault(chat_id, [])
+                q.append(prompt)
+                n = len(q)
+            send_text(chat_id, f"📥 已排队（第 {n} 条），当前任务完成后自动执行")
             return
         slot = {"proc": None, "started": time.time(), "reason": None}
         _running[chat_id] = slot
     try:
-        _run_claude(chat_id, prompt, slot)
+        while True:
+            _run_claude(chat_id, prompt, slot)
+            if slot.get("reason") in ("stop", "timeout"):
+                # 被中断/超时：排队的消息一并取消——用户按停时预期是全停
+                with _msg_queue_lock:
+                    dropped = _msg_queue.pop(chat_id, [])
+                if dropped:
+                    send_text(chat_id, f"🚫 排队的 {len(dropped)} 条消息已一并取消。")
+                return
+            with _msg_queue_lock:
+                q = _msg_queue.get(chat_id)
+                prompt = q.pop(0) if q else None
+                if not q:
+                    _msg_queue.pop(chat_id, None)
+            if prompt is None:
+                return
+            slot["reason"] = None
+            slot["proc"] = None
+            slot["started"] = time.time()
     except Exception as e:
         send_text(chat_id, f"❌ 桥接器内部错误：{e!r}")
     finally:
@@ -287,14 +352,16 @@ def _run_claude(chat_id: str, prompt: str, slot: dict, ack: bool = True) -> None
     except (BrokenPipeError, OSError):
         pass
 
-    # 超时看门狗
-    def _timeout() -> None:
-        slot["reason"] = "timeout"
-        kill_task(proc)
+    # 超时看门狗（CLAUDE_TIMEOUT<=0 时不限时，挂死用 /stop 远程杀）
+    timer = None
+    if CLAUDE_TIMEOUT > 0:
+        def _timeout() -> None:
+            slot["reason"] = "timeout"
+            kill_task(proc)
 
-    timer = threading.Timer(CLAUDE_TIMEOUT, _timeout)
-    timer.daemon = True
-    timer.start()
+        timer = threading.Timer(CLAUDE_TIMEOUT, _timeout)
+        timer.daemon = True
+        timer.start()
 
     # stderr 用单独线程收集，防止管道写满造成死锁
     stderr_buf: list = []
@@ -329,7 +396,8 @@ def _run_claude(chat_id: str, prompt: str, slot: dict, ack: bool = True) -> None
             elif etype == "result":
                 result = evt
     finally:
-        timer.cancel()
+        if timer:
+            timer.cancel()
     returncode = proc.wait()
     t_err.join(timeout=2)
     tail = "".join(stderr_buf[-12:]).strip()
@@ -610,7 +678,7 @@ def _session_tail(session_file: Path, n: int = 5):
 
 # ---------------- 命令处理 ----------------
 def handle_command(chat_id: str, text: str) -> None:
-    global WORK_DIR
+    global WORK_DIR, PERMISSION_MODE
     parts = text.split()
     cmd = parts[0].lower()
     arg = text[len(parts[0]):].strip()
@@ -631,18 +699,30 @@ def handle_command(chat_id: str, text: str) -> None:
         with _running_lock:
             slot = _running.get(chat_id)
         if slot and slot.get("proc"):
+            with _msg_queue_lock:
+                qn = len(_msg_queue.get(chat_id) or [])
             slot["reason"] = "stop"
             kill_task(slot["proc"])
-            send_text(chat_id, "🛑 正在中断当前任务…")
+            extra = f"，排队的 {qn} 条消息将一并取消" if qn else ""
+            send_text(chat_id, f"🛑 正在中断当前任务{extra}…")
         else:
             send_text(chat_id, "当前没有正在执行的任务。")
     elif cmd == "/status":
         with _running_lock:
             slot = _running.get(chat_id)
+        with _msg_queue_lock:
+            qn = len(_msg_queue.get(chat_id) or [])
+        with _pending_lock:
+            pend = _pending.get(chat_id)
         if slot:
-            send_text(chat_id, f"⏳ 任务执行中，已运行 {int(time.time() - slot['started'])}s（/stop 可中断）")
+            msg = f"⏳ 任务执行中，已运行 {int(time.time() - slot['started'])}s（/stop 可中断）"
         else:
-            send_text(chat_id, "空闲中。")
+            msg = "空闲中。"
+        if qn:
+            msg += f"\n📥 排队中：{qn} 条消息"
+        if pend:
+            msg += f"\n⏳ 等待会话 {pend['sid'][:8]}… 空闲（已排 {len(pend['queue'])} 条）"
+        send_text(chat_id, msg)
     elif cmd == "/session":
         sess = _sessions.get(chat_id) or {}
         sid = sess.get("session_id")
@@ -762,13 +842,20 @@ def handle_command(chat_id: str, text: str) -> None:
         lines.append(f"\n/takeover {sid} ← 接管（正在跑的会话会自动排队，跑完接续）")
         send_text(chat_id, "\n".join(lines))
     elif cmd == "/unqueue":
+        with _msg_queue_lock:
+            msgs = _msg_queue.pop(chat_id, [])
         with _pending_lock:
-            had = _pending.pop(chat_id, None)
-        if had:
-            send_text(chat_id, f"↩️ 已取消排队（{len(had['queue'])} 条消息被丢弃）。会话绑定保留；"
-                               "发消息前先 /peek 确认会话已空闲，避免与桌面端交错。")
+            pend = _pending.pop(chat_id, None)
+        parts = []
+        if msgs:
+            parts.append(f"消息队列 {len(msgs)} 条")
+        if pend:
+            parts.append(f"排队接管（{len(pend['queue'])} 条）")
+        if parts:
+            send_text(chat_id, "↩️ 已清空：" + "、".join(parts) +
+                               "。正在执行的任务不受影响（要中断用 /stop）。")
         else:
-            send_text(chat_id, "当前没有排队中的接管。")
+            send_text(chat_id, "当前没有排队中的消息。")
     elif cmd == "/sessions":
         try:
             n = max(2, min(20, int(arg))) if arg else 8
@@ -820,8 +907,17 @@ def handle_command(chat_id: str, text: str) -> None:
                 save_sessions()
                 send_text(chat_id, f"📁 工作目录已切换：{WORK_DIR}\n（历史会话已重置）")
     elif cmd == "/mode":
-        send_text(chat_id, f"当前权限模式：{PERMISSION_MODE or '未设置（default）'}\n"
-                           "可选值见 .env 中 CLAUDE_PERMISSION_MODE 的注释。")
+        if not arg:
+            send_text(chat_id, f"当前权限模式：{PERMISSION_MODE or 'default'}\n"
+                               f"切换：/mode <{' | '.join(sorted(PERMISSION_MODES))}>\n"
+                               "对下一条消息生效。")
+        elif arg in PERMISSION_MODES:
+            PERMISSION_MODE = arg
+            warn = "\n⚠️ bypassPermissions = 白名单里的人可让 Claude 做任何事，风险自负。" \
+                if arg == "bypassPermissions" else ""
+            send_text(chat_id, f"✅ 权限模式已切换：{arg}（下一条消息生效）{warn}")
+        else:
+            send_text(chat_id, f"❌ 无效模式 {arg}\n可选：{' | '.join(sorted(PERMISSION_MODES))}")
     else:
         send_text(chat_id, f"未知命令 {cmd}，发送 /help 查看可用命令。")
 
@@ -893,6 +989,12 @@ def on_message(event: P2ImMessageReceiveV1) -> None:
             handle_command(chat_id, text)
             return
 
+        # !command：直通 shell（相当于桌面终端的 bash 模式），不经 Claude、不排队
+        if text.startswith("!") and text[1:].strip():
+            shell_cmd = text[1:].strip()
+            threading.Thread(target=shell_task, args=(chat_id, shell_cmd), daemon=True).start()
+            return
+
         # 排队接管中：消息入队，等目标会话回合结束后由 _wait_and_drain 自动执行
         with _pending_lock:
             pend = _pending.get(chat_id)
@@ -914,10 +1016,10 @@ def main() -> None:
                  "或在 .env 中设置 CLAUDE_PATH=claude 的完整路径")
     if not WORK_DIR.is_dir():
         sys.exit(f"❌ 工作目录不存在：{WORK_DIR}")
-    valid_modes = {"", "default", "acceptEdits", "auto", "bypassPermissions", "manual", "dontAsk", "plan"}
+    valid_modes = PERMISSION_MODES | {""}
     if PERMISSION_MODE not in valid_modes:
         sys.exit(f"❌ CLAUDE_PERMISSION_MODE 无效：{PERMISSION_MODE}\n"
-                 f"   可选值：{', '.join(sorted(m for m in valid_modes if m))}")
+                 f"   可选值：{', '.join(sorted(PERMISSION_MODES))}")
 
     handler = lark.EventDispatcherHandler.builder("", "") \
         .register_p2_im_message_receive_v1(on_message) \
@@ -931,7 +1033,7 @@ def main() -> None:
     print("✅ 飞书机器人已启动（WebSocket 长连接，无需公网 IP）")
     print(f"   Claude：{CLAUDE_PATH}")
     print(f"   工作目录：{WORK_DIR}")
-    print(f"   权限模式：{PERMISSION_MODE or 'default'}｜超时：{CLAUDE_TIMEOUT}s｜转发工具调用：{'开' if FORWARD_TOOLS else '关'}")
+    print(f"   权限模式：{PERMISSION_MODE or 'default'}｜超时：{CLAUDE_TIMEOUT if CLAUDE_TIMEOUT > 0 else '不限时'}｜转发工具调用：{'开' if FORWARD_TOOLS else '关'}")
     print(f"   白名单：{len(ALLOWED_USERS)} 人" + ("" if ALLOWED_USERS else "（未配置，首条消息会提示如何配置）"))
     print("   等待消息中…（Ctrl+C 退出）")
     ws.start()  # 阻塞，断线自动重连
