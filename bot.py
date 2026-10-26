@@ -57,7 +57,9 @@ HELP_TEXT = """📖 命令列表
 /status — 查看当前任务状态
 /session — 查看当前会话 ID（在电脑上 claude --resume <id> 可接续）
 /sessions [条数] — 列出电脑上最近的会话（含当前绑定的）
-/takeover [序号|会话ID|latest] — 接管电脑上的会话，带上全部上下文
+/takeover [序号|会话ID|latest] — 接管电脑上的会话（在跑的自动排队，跑完接续）
+/peek [序号|会话ID|latest] — 旁观会话当前进度（正在干什么、最新输出）
+/unqueue — 取消排队接管
 /rename [名字] — 给当前会话起名（/sessions 列表优先显示名字）
 /cwd [路径] — 查看 / 切换 Claude 的工作目录
 /mode — 查看当前权限模式
@@ -116,6 +118,59 @@ def _lookup_session(chat_id: str):
 # ---------------- 运行中的任务（chat_id -> {"proc","started","reason"}） ----------------
 _running_lock = threading.Lock()
 _running: dict = {}
+
+# ---------------- 排队接管（会话在电脑上跑着时先绑定，消息排队等回合结束自动执行） ----------------
+_pending_lock = threading.Lock()
+_pending: dict = {}        # chat_id -> {"sid","file","queue":[str],"started":float}
+PENDING_TIMEOUT = 1800     # 排队等待上限（秒）
+
+
+def _bind_session(chat_id: str, sid: str, cwd) -> None:
+    """把会话绑定到聊天（工作目录跟随会话所在项目）。"""
+    global WORK_DIR
+    if cwd and Path(cwd).is_dir():
+        WORK_DIR = Path(cwd).resolve()
+    with _sessions_lock:
+        _sessions[chat_id] = {
+            "session_id": sid,
+            "work_dir": str(WORK_DIR),
+            "updated": datetime.now().isoformat(timespec="seconds"),
+        }
+    save_sessions()
+
+
+def _wait_and_drain(chat_id: str) -> None:
+    """轮询排队中的会话，回合结束（空闲）后把排队消息依次执行。
+
+    之所以可行：CLI 无法向运行中的进程注入消息，但机器人每条消息都是重新
+    --resume 重读转录文件——等桌面回合把结果写完再发，上下文就是完整无缝的。
+    """
+    while True:
+        time.sleep(5)
+        with _pending_lock:
+            pend = _pending.get(chat_id)
+        if not pend:
+            return  # 已被取消
+        if time.time() - pend["started"] > PENDING_TIMEOUT:
+            with _pending_lock:
+                _pending.pop(chat_id, None)
+            send_text(chat_id, "⏱ 排队等待超时（30 分钟），已取消排队。\n"
+                               "会话绑定仍保留；/peek 确认它空闲后可直接发消息。")
+            return
+        state, _age = _session_state(pend["file"])
+        if state in ("running", None):
+            continue
+        with _pending_lock:
+            pend = _pending.pop(chat_id, None)
+        if not pend:
+            return
+        if not pend["queue"]:
+            send_text(chat_id, f"✅ 会话 {pend['sid'][:8]}… 已空闲，接管生效，随时发消息。")
+            return
+        send_text(chat_id, f"✅ 会话 {pend['sid'][:8]}… 已空闲，开始处理排队的 {len(pend['queue'])} 条消息…")
+        for msg in pend["queue"]:
+            run_task(chat_id, msg)   # run_task 自带互斥，顺序调用即串行
+        return
 
 
 def kill_task(proc: subprocess.Popen) -> None:
@@ -446,6 +501,113 @@ def _latest_desktop_session():
     return items[0]["session_id"], items[0]["cwd"]
 
 
+def _session_state(session_file: Path):
+    """看转录尾部判断会话当前状态，返回 (state, age)。
+
+    state：'running'=回合进行中（不可安全接管）；'idle'=回合已闭合（可安全接管）；
+    读不到返回 (None, None)。age 是文件距上次写入的秒数。
+    判定依据——最后一条实质对话记录：
+      · assistant 且含 text 块（正文回复）→ 回合已闭合 = idle
+      · 悬空 user，或只含 tool_use 的 assistant（工具执行中），或空 content 的
+        assistant（流式开始标记）→ 回合进行中 = running
+      · 悬空但文件太久没动（user 5 分钟 / tool_use 15 分钟）→ 大概率已异常结束，按 idle
+    （注意转录里 tool_result 记录的 type 也是 "user"，需按内容形态排除。）
+    """
+    try:
+        st = session_file.stat()
+        age = time.time() - st.st_mtime
+        with session_file.open("rb") as fh:
+            fh.seek(max(0, st.st_size - 262144))  # 只看尾部 256KB
+            data = fh.read().decode("utf-8", "replace")
+        last = ""
+        for line in data.splitlines():
+            if '"type"' not in line:
+                continue
+            try:
+                d = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            t = d.get("type")
+            if t not in ("user", "assistant"):
+                continue
+            c = (d.get("message") or {}).get("content")
+            if t == "user":
+                if d.get("isMeta"):
+                    continue
+                if isinstance(c, list) and any(
+                        isinstance(b, dict) and b.get("type") == "tool_result" for b in c):
+                    continue  # 工具结果记录，不是对话输入
+                has_text = (isinstance(c, str) and c.strip()) or (
+                    isinstance(c, list) and any(
+                        isinstance(b, dict) and b.get("type") == "text" and (b.get("text") or "").strip()
+                        for b in c))
+                if has_text:
+                    last = "user"
+            elif isinstance(c, list):
+                if any(isinstance(b, dict) and b.get("type") == "text"
+                       and (b.get("text") or "").strip() for b in c):
+                    last = "assistant"            # 有正文 = 回合闭合
+                elif any(isinstance(b, dict) and b.get("type") == "tool_use" for b in c):
+                    last = "assistant_tool"       # 只有工具调用 = 工具还在执行
+        if last == "assistant":
+            return "idle", age
+        if last == "user":
+            return ("running", age) if age <= 300 else ("idle", age)
+        if last == "assistant_tool":
+            return ("running", age) if age <= 900 else ("idle", age)
+        return None, age
+    except OSError:
+        return None, None
+
+
+def _session_tail(session_file: Path, n: int = 5):
+    """转录尾部最近的对话动态 [(时间, 角色, 摘要)]，用于 /peek 旁观。"""
+    out = []
+    try:
+        st = session_file.stat()
+        with session_file.open("rb") as fh:
+            fh.seek(max(0, st.st_size - 262144))
+            data = fh.read().decode("utf-8", "replace")
+        for line in data.splitlines():
+            if '"type"' not in line:
+                continue
+            try:
+                d = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            t = d.get("type")
+            if t not in ("user", "assistant"):
+                continue
+            ts = (d.get("timestamp") or "")[11:19]
+            c = (d.get("message") or {}).get("content")
+            if t == "user":
+                if d.get("isMeta"):
+                    continue
+                txt = ""
+                if isinstance(c, str):
+                    txt = c.strip()
+                elif isinstance(c, list):
+                    if any(isinstance(b, dict) and b.get("type") == "tool_result" for b in c):
+                        continue
+                    for b in c:
+                        if isinstance(b, dict) and b.get("type") == "text" and (b.get("text") or "").strip():
+                            txt = b["text"].strip()
+                            break
+                if txt:
+                    out.append((ts, "👤", txt.replace("\n", " ")[:60]))
+            elif isinstance(c, list):
+                for b in c:
+                    if not isinstance(b, dict):
+                        continue
+                    if b.get("type") == "text" and (b.get("text") or "").strip():
+                        out.append((ts, "🤖", b["text"].strip().replace("\n", " ")[:60]))
+                    elif b.get("type") == "tool_use":
+                        out.append((ts, "🔧", _tool_summary(b.get("name", ""), b.get("input"))))
+        return out[-n:]
+    except OSError:
+        return []
+
+
 # ---------------- 命令处理 ----------------
 def handle_command(chat_id: str, text: str) -> None:
     global WORK_DIR
@@ -461,6 +623,11 @@ def handle_command(chat_id: str, text: str) -> None:
         save_sessions()
         send_text(chat_id, "🆕 已开启新会话，下一条消息不带历史上下文。")
     elif cmd == "/stop":
+        with _pending_lock:
+            had_pending = _pending.pop(chat_id, None)
+        if had_pending:
+            send_text(chat_id, f"↩️ 已取消排队接管（{len(had_pending['queue'])} 条消息被丢弃）。")
+            return
         with _running_lock:
             slot = _running.get(chat_id)
         if slot and slot.get("proc"):
@@ -529,35 +696,79 @@ def handle_command(chat_id: str, text: str) -> None:
         if cur == sid:
             send_text(chat_id, f"✅ 这就是本聊天当前的会话（{sid[:8]}…），直接发消息即可。")
             return
-        # 活跃检测：转录文件最近仍在被写入 = 会话很可能还在电脑上运行，
-        # 同时接管会导致两边上下文分叉（实测：不报错但历史交错），需强制确认
+        # 活跃检测：回合还在跑 → 排队接管（先绑定，消息等回合结束自动执行）
         session_file, _ = _find_session_file(sid)
         if session_file and not force:
-            try:
-                age = time.time() - session_file.stat().st_mtime
-            except OSError:
-                age = None
-            if age is not None and age < 15:
+            state, age = _session_state(session_file)
+            if state == "running":
+                _bind_session(chat_id, sid, cwd)
+                with _pending_lock:
+                    cur = _pending.get(chat_id)
+                    if cur and cur.get("sid") == sid:
+                        already = True   # 重复接管同一会话：保留已排队的消息
+                    else:
+                        _pending[chat_id] = {"sid": sid, "file": session_file,
+                                             "queue": [], "started": time.time()}
+                        already = False
+                if not already:
+                    threading.Thread(target=_wait_and_drain, args=(chat_id,), daemon=True).start()
                 send_text(chat_id,
-                          f"⚠️ 会话 {sid[:8]}… {int(age)} 秒前仍在活动，很可能还在电脑上运行。\n"
-                          "两边同时使用会导致上下文分叉（回复互相看不见）。\n"
-                          f"等它跑完（🏁 通知）或退出桌面会话后重试；\n"
-                          f"确认要现在接管，发 /takeover {want}! 强制接管。")
+                          f"⏳ 会话 {sid[:8]}… 正在跑（{int(age)} 秒前仍在写入），已进入排队接管：\n"
+                          "· 现在发的消息会排队，等它回合结束自动依次执行\n"
+                          "· /peek 看它当前进度，/unqueue 取消排队（保留绑定）\n"
+                          "· 等待上限 30 分钟，超时自动放弃")
                 return
-        # 会话属于哪个目录，就把工作目录切过去（resume 按目录查找会话）
-        if cwd and Path(cwd).is_dir():
-            WORK_DIR = Path(cwd).resolve()
-        with _sessions_lock:
-            _sessions[chat_id] = {
-                "session_id": sid,
-                "work_dir": str(WORK_DIR),
-                "updated": datetime.now().isoformat(timespec="seconds"),
-            }
-        save_sessions()
+        _bind_session(chat_id, sid, cwd)
         send_text(chat_id,
                   f"✅ 已接管会话 {sid[:8]}…（目录：{WORK_DIR}）\n"
                   "下一条消息将带上该会话的全部上下文。\n"
                   "⚠️ 若桌面那边还开着，请先退出（避免两边同时写入）。")
+    elif cmd == "/peek":
+        want = arg.strip()
+        sid = None
+        if not want:
+            sid = (_sessions.get(chat_id) or {}).get("session_id")
+            if not sid:
+                send_text(chat_id, "当前聊天没有绑定会话。用法：/peek <序号|会话ID|latest>")
+                return
+        elif want.lower() == "latest":
+            sid, _ = _latest_desktop_session()
+        elif want.isdigit():
+            items = _recent_sessions(8, include_managed=True)
+            idx = int(want) - 1
+            if 0 <= idx < len(items):
+                sid = items[idx]["session_id"]
+        else:
+            sid, _ = _find_session_file(want)
+        if not sid:
+            send_text(chat_id, f"❌ 找不到会话 {want}")
+            return
+        sf, cwd2 = _find_session_file(sid)
+        if not sf:
+            send_text(chat_id, f"❌ 找不到会话 {sid[:8]}… 的转录文件")
+            return
+        state, age = _session_state(sf)
+        proj = Path(cwd2).name if cwd2 else "?"
+        name = _names.get(sid)
+        if state == "running":
+            head = f"👀 [{proj}] {sid[:8]}… ⚡回合进行中（{int(age)} 秒前仍在写入）"
+        elif state == "idle":
+            head = f"👀 [{proj}] {sid[:8]}… 💤空闲（最后活动 {_rel_time(sf.stat().st_mtime)}）"
+        else:
+            head = f"👀 [{proj}] {sid[:8]}…（状态未知）"
+        if name:
+            head += f" 📛{name}"
+        lines = [head, "最近动态："] + [f"  {t} {who} {txt}" for t, who, txt in _session_tail(sf)]
+        lines.append(f"\n/takeover {sid} ← 接管（正在跑的会话会自动排队，跑完接续）")
+        send_text(chat_id, "\n".join(lines))
+    elif cmd == "/unqueue":
+        with _pending_lock:
+            had = _pending.pop(chat_id, None)
+        if had:
+            send_text(chat_id, f"↩️ 已取消排队（{len(had['queue'])} 条消息被丢弃）。会话绑定保留；"
+                               "发消息前先 /peek 确认会话已空闲，避免与桌面端交错。")
+        else:
+            send_text(chat_id, "当前没有排队中的接管。")
     elif cmd == "/sessions":
         try:
             n = max(2, min(20, int(arg))) if arg else 8
@@ -680,6 +891,16 @@ def on_message(event: P2ImMessageReceiveV1) -> None:
             return
         if text.startswith("/"):
             handle_command(chat_id, text)
+            return
+
+        # 排队接管中：消息入队，等目标会话回合结束后由 _wait_and_drain 自动执行
+        with _pending_lock:
+            pend = _pending.get(chat_id)
+            if pend is not None:
+                pend["queue"].append(text)
+                queued = len(pend["queue"])
+        if pend is not None:
+            send_text(chat_id, f"📥 已排队（第 {queued} 条），等会话回合结束自动执行。/peek 看进度，/unqueue 取消。")
             return
 
         threading.Thread(target=run_task, args=(chat_id, text), daemon=True).start()
