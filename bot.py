@@ -114,11 +114,20 @@ def save_sessions() -> None:
 
 
 def _lookup_session(chat_id: str):
-    """会话绑定工作目录：目录变了就视为无会话。"""
+    """返回聊天绑定的会话 ID。work_dir 固化在各聊天自己的绑定里（per-chat），
+    不同聊天并行使用互不影响。"""
     sess = _sessions.get(chat_id) or {}
-    if sess.get("work_dir") == str(WORK_DIR):
-        return sess.get("session_id")
-    return None
+    return sess.get("session_id") or None
+
+
+def _chat_work_dir(chat_id: str) -> Path:
+    """聊天的工作目录：优先用会话绑定里固化的目录（随 /takeover 跟随会话），
+    没有绑定则用全局默认 WORK_DIR。"""
+    sess = _sessions.get(chat_id) or {}
+    wd = sess.get("work_dir")
+    if wd and Path(wd).is_dir():
+        return Path(wd)
+    return WORK_DIR
 
 
 # ---------------- 运行中的任务（chat_id -> {"proc","started","reason"}） ----------------
@@ -136,14 +145,16 @@ PENDING_TIMEOUT = 1800     # 排队等待上限（秒）
 
 
 def _bind_session(chat_id: str, sid: str, cwd) -> None:
-    """把会话绑定到聊天（工作目录跟随会话所在项目）。"""
-    global WORK_DIR
+    """把会话绑定到聊天。工作目录跟随会话所在项目，但只固化进本聊天的绑定，
+    不动全局 WORK_DIR——否则 A 聊天接管会破坏 B 聊天的会话续接。"""
     if cwd and Path(cwd).is_dir():
-        WORK_DIR = Path(cwd).resolve()
+        wd = str(Path(cwd).resolve())
+    else:
+        wd = str(WORK_DIR)
     with _sessions_lock:
         _sessions[chat_id] = {
             "session_id": sid,
-            "work_dir": str(WORK_DIR),
+            "work_dir": wd,
             "updated": datetime.now().isoformat(timespec="seconds"),
         }
     save_sessions()
@@ -252,7 +263,7 @@ def shell_task(chat_id: str, command: str) -> None:
         r = subprocess.run(
             ["powershell", "-NoProfile", "-Command",
              "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; " + command],
-            cwd=str(WORK_DIR), capture_output=True,
+            cwd=str(_chat_work_dir(chat_id)), capture_output=True,
             text=True, encoding="utf-8", errors="replace",
             timeout=SHELL_TIMEOUT,
         )
@@ -337,7 +348,7 @@ def _run_claude(chat_id: str, prompt: str, slot: dict, ack: bool = True) -> None
             cmd,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, encoding="utf-8", errors="replace",
-            cwd=str(WORK_DIR), env=child_env,
+            cwd=str(_chat_work_dir(chat_id)), env=child_env,
         )
     except FileNotFoundError:
         send_text(chat_id, "❌ 找不到 claude 命令，请在 .env 中用 CLAUDE_PATH 指定完整路径。")
@@ -434,7 +445,7 @@ def _finish(chat_id: str, result, returncode: int, tail: str, last_text: str, sl
         with _sessions_lock:
             _sessions[chat_id] = {
                 "session_id": sid,
-                "work_dir": str(WORK_DIR),
+                "work_dir": str(_chat_work_dir(chat_id)),
                 "updated": datetime.now().isoformat(timespec="seconds"),
             }
         save_sessions()
@@ -732,7 +743,7 @@ def handle_command(chat_id: str, text: str) -> None:
                    f"\n（在本机执行 claude --resume {sid} 可接续此会话）"
         else:
             show = "无"
-        send_text(chat_id, f"当前会话：{show}\n工作目录：{WORK_DIR}")
+        send_text(chat_id, f"当前会话：{show}\n工作目录：{_chat_work_dir(chat_id)}")
     elif cmd == "/rename":
         sess = _sessions.get(chat_id) or {}
         sid = sess.get("session_id")
@@ -800,7 +811,7 @@ def handle_command(chat_id: str, text: str) -> None:
                 return
         _bind_session(chat_id, sid, cwd)
         send_text(chat_id,
-                  f"✅ 已接管会话 {sid[:8]}…（目录：{WORK_DIR}）\n"
+                  f"✅ 已接管会话 {sid[:8]}…（目录：{_chat_work_dir(chat_id)}）\n"
                   "下一条消息将带上该会话的全部上下文。\n"
                   "⚠️ 若桌面那边还开着，请先退出（避免两边同时写入）。")
     elif cmd == "/peek":
@@ -895,22 +906,22 @@ def handle_command(chat_id: str, text: str) -> None:
         send_text(chat_id, "🔔 桌面事件推送已恢复。")
     elif cmd == "/cwd":
         if not arg:
-            send_text(chat_id, f"当前工作目录:{WORK_DIR}\n用法:/cwd D:\\path\\to\\project")
+            send_text(chat_id, f"当前工作目录:{_chat_work_dir(chat_id)}\n用法:/cwd D:\\path\\to\\project")
         else:
             p = Path(arg)
             if not p.is_dir():
                 send_text(chat_id, f"❌ 目录不存在：{p}")
             else:
-                WORK_DIR = p.resolve()
+                WORK_DIR = p.resolve()   # 改全局默认
                 with _sessions_lock:
-                    _sessions.clear()  # 会话绑定目录，切换后全部重置
+                    _sessions.pop(chat_id, None)  # 只重置本聊天的会话，不影响其他聊天
                 save_sessions()
-                send_text(chat_id, f"📁 工作目录已切换：{WORK_DIR}\n（历史会话已重置）")
+                send_text(chat_id, f"📁 工作目录已切换：{WORK_DIR}\n（本聊天的历史会话已重置）")
     elif cmd == "/mode":
         if not arg:
             send_text(chat_id, f"当前权限模式：{PERMISSION_MODE or 'default'}\n"
                                f"切换：/mode <{' | '.join(sorted(PERMISSION_MODES))}>\n"
-                               "对下一条消息生效。")
+                               "对下一条消息生效（机器人级设置，对所有聊天生效）。")
         elif arg in PERMISSION_MODES:
             PERMISSION_MODE = arg
             warn = "\n⚠️ bypassPermissions = 白名单里的人可让 Claude 做任何事，风险自负。" \

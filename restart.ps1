@@ -1,4 +1,4 @@
-# 一键重启飞书机器人：杀掉现有实例，再启动一个新的独立窗口
+﻿# 一键重启飞书机器人：杀掉现有实例，再启动一个新的独立窗口
 # 用法（PowerShell 里）：  powershell -ExecutionPolicy Bypass -File D:\work\feishu-claude\restart.ps1
 $ErrorActionPreference = "SilentlyContinue"
 $base = "D:\work\feishu-claude"
