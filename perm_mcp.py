@@ -21,8 +21,6 @@ import sys
 
 TOOL_NAME = "request_permission"
 DEFAULT_PORT = "37921"
-# 用户没点卡片/没回文字时的兜底等待（bot 侧 PERM_TIMEOUT 会先到，这里是双保险）
-ASK_TIMEOUT = 660
 
 
 def _send(obj: dict) -> None:
@@ -42,7 +40,8 @@ def ask_bot(args: dict) -> dict:
         with socket.create_connection(("127.0.0.1", port), timeout=15) as s:
             # errors=replace：部分宿主传来的中文会带残缺代理字符，严格编码会直接抛异常
             s.sendall((json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8", errors="replace"))
-            s.settimeout(ASK_TIMEOUT)
+            # 无限等待用户的决定（与桌面终端一致）；bot 挂掉时连接断开，走"通道不可用"兜底
+            s.settimeout(None)
             data = b""
             while not data.endswith(b"\n"):
                 chunk = s.recv(4096)

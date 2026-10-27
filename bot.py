@@ -55,8 +55,13 @@ SHELL_TIMEOUT = 120  # 飞书 ! 命令直通 shell 的超时（秒）
 
 # 权限确认卡片（--permission-prompt-tool → perm_mcp.py → 本地 socket → 飞书卡片）
 PERM_PORT = int(os.environ.get("FEISHU_PERM_PORT", "37921"))     # 与 perm_mcp.py 约定的本地端口
-PERM_TIMEOUT = int(os.environ.get("PERM_TIMEOUT_SECONDS", "600"))  # 等用户确认权限的上限（秒）
+PERM_TIMEOUT = int(os.environ.get("PERM_TIMEOUT_SECONDS", "0"))  # 等用户确认权限的上限（秒），0=不限时（与桌面终端一致）
 TAKEOVER_ASK_TIMEOUT = 60  # 接管运行中会话时等用户选卡片选项的上限（秒），超时默认排队
+
+# 静默模式（/quiet 切换，落盘 quiet.flag）：开着时不转发过程性输出（思考文本/🔧 工具调用），
+# 只推权限确认卡片、最终结果和异常——通知只出现在"需要你拍板"的时刻
+QUIET_FILE = BASE_DIR / "quiet.flag"
+QUIET = QUIET_FILE.exists()
 
 SESSION_FILE = BASE_DIR / "sessions.json"
 MAX_CHUNK = 3500      # 单条飞书消息最大字符数，超长自动分段
@@ -78,6 +83,7 @@ HELP_TEXT = """📖 命令列表
 /mode [模式] — 查看 / 切换权限模式（manual、auto、acceptEdits…）
 /listen — 群聊免 @ 模式：本群所有消息直接发给机器人（适合只有你+机器人的群）
 /mute · /unmute — 暂停/恢复桌面事件推送
+/quiet · /unquiet — 静默模式：不刷思考/工具过程，只推最终结果和权限确认
 
 直接发送文本 = 给 Claude 下指令，多轮对话自动保持上下文。
 任务执行中发的消息会直接递给 Claude（工具间隙读取，边跑边回应，和桌面终端一致）。
@@ -510,7 +516,9 @@ def _ask_choice(chat_id: str, title: str, body_md: str, options: list,
         labels = " / ".join(o.get("label", "?") for o in options)
         send_text(chat_id, f"💬 {title}\n{body_md}\n请回复选择：{labels}"
                            + (f"\n{note}" if note else ""))
-    entry["event"].wait(timeout)
+    # timeout<=0 或 None = 无限等待（权限确认与桌面终端一致，不会自动放弃；
+    # claude 进程退出时由 _cancel_perm_choice 兜底返回 cancel）
+    entry["event"].wait(timeout if timeout and timeout > 0 else None)
     with _choices_lock:
         if _choices.get(chat_id) is entry:
             _choices.pop(chat_id, None)
@@ -802,7 +810,7 @@ def _session_reader(chat_id: str, key: str, slot: dict) -> None:
 
     threading.Thread(target=_drain_stderr, daemon=True).start()
 
-    last_text = ""   # 本回合已转发过的最后一段 assistant 文本（用于和 result 去重）
+    last_sent = ""   # 本回合已实际转发过的最后一段 assistant 文本（result 与之去重；静默模式下保持为空）
     try:
         for line in proc.stdout:
             line = line.strip()
@@ -824,14 +832,16 @@ def _session_reader(chat_id: str, key: str, slot: dict) -> None:
                 for block in (evt.get("message") or {}).get("content") or []:
                     btype = block.get("type")
                     if btype == "text" and (block.get("text") or "").strip():
-                        last_text = block["text"].strip()
-                        send_text(chat_id, last_text)
-                    elif btype == "tool_use" and FORWARD_TOOLS:
+                        # 静默模式不刷过程性文本：思考内容不打扰，最终结果由 result 事件兜底推送
+                        if not QUIET:
+                            send_text(chat_id, block["text"].strip())
+                            last_sent = block["text"].strip()
+                    elif btype == "tool_use" and FORWARD_TOOLS and not QUIET:
                         send_text(chat_id, "🔧 " + _tool_summary(block.get("name", "?"), block.get("input")))
             elif etype == "result":
                 slot["in_turn"] = False
-                _finish_turn(chat_id, evt, last_text, slot)
-                last_text = ""
+                _finish_turn(chat_id, evt, last_sent, slot)
+                last_sent = ""
     except Exception as e:
         print(f"[会话读泵异常] {e!r}")
     returncode = proc.wait()
@@ -1130,6 +1140,19 @@ def _session_tail(session_file: Path, n: int = 5):
 
 
 # ---------------- 命令处理 ----------------
+def _set_quiet(v: bool) -> None:
+    """切换静默模式（落盘 quiet.flag，重启后保持）。机器人级设置，对所有聊天生效。"""
+    global QUIET
+    QUIET = v
+    try:
+        if v:
+            QUIET_FILE.write_text(datetime.now().isoformat(timespec="seconds"), "utf-8")
+        else:
+            QUIET_FILE.unlink()
+    except OSError:
+        pass
+
+
 def handle_command(chat_id: str, text: str) -> None:
     global WORK_DIR, PERMISSION_MODE
     parts = text.split()
@@ -1182,6 +1205,8 @@ def handle_command(chat_id: str, text: str) -> None:
             msg += f"\n📥 排队中：{qn} 条消息"
         if pend:
             msg += f"\n⏳ 等待会话 {pend['sid'][:8]}… 空闲（已排 {len(pend['queue'])} 条）"
+        if QUIET:
+            msg += "\n🔕 静默模式开启中（/unquiet 恢复实时转发）"
         send_text(chat_id, msg)
     elif cmd == "/session":
         sess = _sessions.get(chat_id) or {}
@@ -1392,6 +1417,14 @@ def handle_command(chat_id: str, text: str) -> None:
         except OSError:
             pass
         send_text(chat_id, "🔔 桌面事件推送已恢复。")
+    elif cmd == "/quiet":
+        _set_quiet(True)
+        send_text(chat_id, "🔕 静默模式已开启：思考过程和工具调用不再实时转发，"
+                           "只在需要你拍板时通知——权限确认卡片、每回合的最终结果、异常。"
+                           "/unquiet 恢复实时转发。")
+    elif cmd == "/unquiet":
+        _set_quiet(False)
+        send_text(chat_id, "🔔 静默模式已关闭，回复和工具调用恢复实时转发。")
     elif cmd == "/cwd":
         if not arg:
             send_text(chat_id, f"当前工作目录:{_chat_work_dir(chat_id)}\n用法:/cwd D:\\path\\to\\project")
