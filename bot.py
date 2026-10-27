@@ -1168,6 +1168,29 @@ def _card_toast(content: str, type_: str = "success") -> "P2CardActionTriggerRes
     return P2CardActionTriggerResponse({"toast": {"type": type_, "content": content}})
 
 
+def on_app_version(event) -> None:
+    """应用版本事件回调：发布/审核结果 → 通知到通知目标聊天（订阅、权限变更从此刻生效）。"""
+    try:
+        data = event.event
+        if data is None:
+            return
+        version = data.version_id or "?"
+        operation = data.operation or ""
+        remark = (data.remark or "").strip()
+        if "pass" in operation.lower() or "通过" in operation:
+            text = (f"🎉 飞书应用新版本已发布生效：{version}\n"
+                    f"（本次版本里的订阅/权限变更现已生效）")
+        else:
+            text = f"📋 应用版本审核事件：{operation} {version}\n{remark[:200]}"
+        try:
+            chat_id = json.loads((BASE_DIR / "notify_target.json").read_text("utf-8"))["chat_id"]
+            send_text(chat_id, text)
+        except Exception:
+            print(f"[版本通知] 无通知目标，未推送：{text}")
+    except Exception as e:
+        print(f"[版本事件处理出错] {e!r}")
+
+
 def on_card_action(event) -> object:
     """卡片按钮回调：点击快捷命令面板上的按钮 = 发送对应消息。"""
     try:
@@ -1206,6 +1229,7 @@ def main() -> None:
     handler = lark.EventDispatcherHandler.builder("", "") \
         .register_p2_im_message_receive_v1(on_message) \
         .register_p2_card_action_trigger(on_card_action) \
+        .register_p2_application_application_app_version_audit_v6(on_app_version) \
         .build()
 
     ws = lark.ws.Client(APP_ID, APP_SECRET,
