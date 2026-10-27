@@ -130,6 +130,17 @@ def _chat_work_dir(chat_id: str) -> Path:
     return WORK_DIR
 
 
+def _chat_label(chat_id: str) -> str:
+    """聊天当前会话的标识「项目名·会话名或短ID」，回复时带上提醒用户当前在哪个会话。"""
+    sess = _sessions.get(chat_id) or {}
+    sid = sess.get("session_id")
+    if not sid:
+        return ""
+    proj = Path(sess.get("work_dir") or str(WORK_DIR)).name
+    tag = _names.get(sid) or (sid[:8] + "…")
+    return f"[{proj}·{tag}]"
+
+
 # ---------------- 运行中的任务（chat_id -> {"proc","started","reason"}） ----------------
 _running_lock = threading.Lock()
 _running: dict = {}
@@ -329,7 +340,8 @@ def _run_claude(chat_id: str, prompt: str, slot: dict, ack: bool = True) -> None
     """调用 claude -p（stream-json），实时转发输出。"""
     session_id = _lookup_session(chat_id)
     if ack:
-        tag = f"续接会话 {session_id[:8]}…" if session_id else "新会话"
+        label = _chat_label(chat_id)
+        tag = f"续接 {label}" if label else "新会话"
         send_text(chat_id, f"🤖 收到（{tag}），开始执行…")
 
     # 注意：提示词通过 stdin 传入，避免经 .cmd 垫片时被 cmd.exe 解析特殊字符
@@ -457,7 +469,8 @@ def _finish(chat_id: str, result, returncode: int, tail: str, last_text: str, sl
     dur = (result.get("duration_ms") or 0) / 1000
     cost = result.get("total_cost_usd") or 0
     turns = result.get("num_turns", "?")
-    line = f"✅ 完成 · 耗时 {dur:.1f}s · {turns} 轮对话"
+    label = _chat_label(chat_id)
+    line = f"✅ {label + ' ' if label else ''}完成 · 耗时 {dur:.1f}s · {turns} 轮对话"
     if cost:
         line += f" · ${cost:.3f}"
     if result.get("is_error"):
@@ -467,7 +480,8 @@ def _finish(chat_id: str, result, returncode: int, tail: str, last_text: str, sl
     denials = result.get("permission_denials") or []
     if denials:
         send_text(chat_id, f"⚠️ 有 {len(denials)} 个操作因权限被拒绝。"
-                           "如需放开：.env 中设置 CLAUDE_PERMISSION_MODE=bypassPermissions（注意风险）。")
+                           "如需放开：发 /mode bypassPermissions（机器人级设置，注意风险），"
+                           "或把具体命令加进 Claude 设置的 allow 列表。")
 
 
 # ---------------- 会话接管（电脑 → 飞书） ----------------
