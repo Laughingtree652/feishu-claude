@@ -61,6 +61,7 @@ TAKEOVER_ASK_TIMEOUT = 60  # 接管运行中会话时等用户选卡片选项的
 SESSION_FILE = BASE_DIR / "sessions.json"
 MAX_CHUNK = 3500      # 单条飞书消息最大字符数，超长自动分段
 SEND_INTERVAL = 0.5   # 发消息最小间隔（秒），避免触发飞书频控
+LIVE_PATCH_INTERVAL = 1.2  # 流式卡片刷新间隔（秒）：更实时但太频繁会触发卡片更新频控
 
 HELP_TEXT = """📖 命令列表
 /help — 查看本帮助
@@ -81,6 +82,7 @@ HELP_TEXT = """📖 命令列表
 /quiet · /unquiet — 静默模式（本聊天）：不刷思考/工具过程，只推最终结果和权限确认
 
 直接发送文本 = 给 Claude 下指令，多轮对话自动保持上下文。
+回复以流式卡片实时呈现（边生成边更新，超长自动分段不丢内容）。
 任务执行中发的消息会直接递给 Claude（工具间隙读取，边跑边回应，和桌面终端一致）。
 Claude 需要权限确认时会发卡片，点按钮或直接回复文字（允许/拒绝/自定义说明）。
 !命令 = 直接在本机 PowerShell 执行（不经 Claude），如 !git status"""
@@ -390,14 +392,31 @@ _send_lock = threading.Lock()
 _last_send = 0.0
 
 
+def _split_chunks(text: str, cap: int = MAX_CHUNK) -> list:
+    """长文本分段：优先在换行处断开（避免硬切句子/代码行），内容不丢。
+
+    段与段之间的换行/空行会被当作分隔吃掉，属正常折损。
+    """
+    text = text or ""
+    out = []
+    while len(text) > cap:
+        cut = text.rfind("\n", 0, cap)
+        if cut < cap // 2:        # cap 内没有合适的换行（或太靠前）→ 硬切
+            cut = cap
+        out.append(text[:cut])
+        text = text[cut:].lstrip("\n")
+    if text:
+        out.append(text)
+    return out
+
+
 def send_text(chat_id: str, text: str) -> None:
-    """发送文本到指定会话：超长自动分段，带简单限速。"""
+    """发送文本到指定会话：超长自动分段（换行处断开，不丢内容），带简单限速。"""
     global _last_send
     text = (text or "").strip()
     if not text:
         return
-    chunks = [text[i:i + MAX_CHUNK] for i in range(0, len(text), MAX_CHUNK)]
-    for chunk in chunks:
+    for chunk in _split_chunks(text):
         with _send_lock:
             gap = _last_send + SEND_INTERVAL - time.time()
             if gap > 0:
@@ -440,6 +459,97 @@ def _send_card(chat_id: str, card: dict):
     except Exception as e:
         print(f"[发卡片异常] {e!r}")
         return None
+
+
+class _LiveReply:
+    """Claude 流式回复的实时卡片：文本增量节流刷新，块末定格；超长自动续新卡片。
+
+    卡片发送/更新失败自动降级为普通文本消息（整块补发），内容不丢。
+    由会话读泵线程独占使用（同一聊天的输出天然串行，无需加锁）。
+    """
+
+    def __init__(self, chat_id: str):
+        self.chat_id = chat_id
+        self.msg_id = None      # 当前卡片消息 id
+        self.buf = ""           # 本文本块已积累的内容
+        self.sealed = None      # 已定格进卡片的前段（buf 超过单卡上限时）
+        self.ok = True          # 卡片通道可用（失败后停止流式，块末走文本降级）
+        self._last_patch = 0.0
+
+    def _card(self, content: str, streaming: bool) -> dict:
+        els = [{"tag": "div", "text": {"tag": "lark_md", "content": content or "…"}}]
+        if streaming:
+            els.append({"tag": "note", "elements": [
+                {"tag": "plain_text", "content": "✍️ 正在生成…"}]})
+        return {"config": {"wide_screen_mode": True}, "elements": els}
+
+    def _patch(self, content: str, streaming: bool) -> None:
+        """把当前卡片整卡更新为指定内容；失败置 ok=False（后续走文本降级）。"""
+        try:
+            req = PatchMessageRequest.builder() \
+                .message_id(self.msg_id) \
+                .request_body(PatchMessageRequestBody.builder()
+                              .content(json.dumps(self._card(content, streaming),
+                                                  ensure_ascii=False))
+                              .build()) \
+                .build()
+            resp = api.im.v1.message.patch(req)
+            if not resp.success():
+                print(f"[流式卡片更新失败] code={resp.code} msg={resp.msg}")
+                self.ok = False
+        except Exception as e:
+            print(f"[流式卡片更新异常] {e!r}")
+            self.ok = False
+        self._last_patch = time.time()
+
+    def feed(self, chunk: str) -> None:
+        """流进一个文本增量：首帧建卡，之后节流整卡刷新；超限先定格满段。"""
+        self.buf += chunk
+        if self.msg_id is None:
+            # 首帧就超限时只放前段，避免卡片内容超限被整卡拒绝
+            preview = self.buf if len(self.buf) < MAX_CHUNK else _split_chunks(self.buf)[0]
+            self.msg_id = _send_card(self.chat_id, self._card(preview, True))
+            self._last_patch = time.time()
+            if self.msg_id is None:
+                self.ok = False
+                return
+        if not self.ok:
+            return
+        if self.sealed is not None:
+            return   # 满段已定格：尾部攒到块末 close 时一起补发
+        if len(self.buf) >= MAX_CHUNK:
+            self.sealed = _split_chunks(self.buf)[0]
+            self._patch(self.sealed, streaming=False)
+            return
+        if time.time() - self._last_patch >= LIVE_PATCH_INTERVAL:
+            self._patch(self.buf, streaming=True)
+
+    def close(self, final=None) -> bool:
+        """文本块结束：整块定格（去"生成中"角标；剩余内容续新卡片）。
+
+        返回 False = 卡片没能承载（调用方用普通文本补发整块，内容不丢）。
+        """
+        text = self.buf if final is None else final
+        if self.msg_id is None or not self.ok:
+            return False
+        if self.sealed is not None:
+            if not text.startswith(self.sealed):
+                return False   # 极端情况（增量与成块文本不一致）：整块走文本降级
+            rest = text[len(self.sealed):]
+        else:
+            chunks = _split_chunks(text)
+            self._patch(chunks[0], streaming=False)
+            if not self.ok:
+                return False
+            rest = "".join(chunks[1:])
+        if rest.strip():
+            for c in _split_chunks(rest):
+                mid = _send_card(self.chat_id, self._card(c, False))
+                if mid is None:
+                    send_text(self.chat_id, c)   # 续卡失败：该段走文本，不丢内容
+                else:
+                    self.msg_id = mid
+        return True
 
 
 def send_panel(chat_id: str) -> None:
@@ -821,7 +931,7 @@ def _spawn_claude(chat_id: str, session_id):
     注意：提示词通过 stdin 传入，避免经 .cmd 垫片时被 cmd.exe 解析特殊字符。
     """
     cmd = [CLAUDE_PATH, "-p", "--input-format", "stream-json",
-           "--output-format", "stream-json", "--verbose"]
+           "--output-format", "stream-json", "--verbose", "--include-partial-messages"]
     mode = _chat_mode(chat_id)
     if mode:
         cmd += ["--permission-mode", mode]
@@ -861,10 +971,11 @@ def _session_reader(chat_id: str, key: str, slot: dict) -> None:
     threading.Thread(target=_drain_stderr, daemon=True).start()
 
     last_sent = ""   # 本回合已实际转发过的最后一段 assistant 文本（result 与之去重；静默模式下保持为空）
+    live = None      # 当前流式回复卡片（stream_event 增量驱动，assistant 成块事件收尾）
     try:
         for line in proc.stdout:
             line = line.strip()
-            slot["last_event"] = time.time()   # 任何事件都算活跃（含 thinking_tokens）
+            slot["last_event"] = time.time()   # 任何事件都算活跃（含 thinking_tokens / stream_event）
             if not line.startswith("{"):
                 continue  # 忽略夹杂的非 JSON 行
             try:
@@ -885,23 +996,50 @@ def _session_reader(chat_id: str, key: str, slot: dict) -> None:
                             if s is slot and k != sid:
                                 del _running[k]
                         _running.setdefault(sid, slot)
+            elif etype == "stream_event":
+                # 流式增量（--include-partial-messages）：只关心回复文本，
+                # thinking_delta / 工具入参增量不展示（静默诉求：思考过程不打扰）
+                sev = evt.get("event") or {}
+                if sev.get("type") == "content_block_delta":
+                    d = sev.get("delta") or {}
+                    if d.get("type") == "text_delta" and d.get("text") \
+                            and chat_id not in _quiet:
+                        if live is None:
+                            live = _LiveReply(chat_id)
+                        live.feed(d["text"])
             elif etype == "assistant":
                 for block in (evt.get("message") or {}).get("content") or []:
                     btype = block.get("type")
                     if btype == "text" and (block.get("text") or "").strip():
-                        # 静默模式不刷过程性文本：思考内容不打扰，最终结果由 result 事件兜底推送
-                        if chat_id not in _quiet:
-                            send_text(chat_id, block["text"].strip())
-                            last_sent = block["text"].strip()
+                        final = block["text"].strip()
+                        if live is not None:
+                            # 流式卡片收尾定格（超长续卡 / 通道失败降级都在里面）
+                            if not live.close(final):
+                                send_text(chat_id, final)
+                            live = None
+                            last_sent = final
+                        elif chat_id not in _quiet:
+                            # 没走流式（卡片通道降级/静默刚开启）：普通文本兜底
+                            send_text(chat_id, final)
+                            last_sent = final
                     elif btype == "tool_use" and FORWARD_TOOLS and chat_id not in _quiet:
+                        if live is not None:   # 文本后紧跟工具调用：先定格卡片再发 🔧
+                            live.close()
+                            live = None
                         send_text(chat_id, "🔧 " + _tool_summary(block.get("name", "?"), block.get("input")))
             elif etype == "result":
+                if live is not None:   # 异常路径兜底：定格尚未收尾的卡片
+                    live.close()
+                    live = None
                 slot["in_turn"] = False
                 _finish_turn(chat_id, evt, last_sent, slot)
                 last_sent = ""
     except Exception as e:
         print(f"[会话读泵异常] {e!r}")
     returncode = proc.wait()
+    if live is not None:   # 进程退出仍有未收尾卡片：用已积累内容定格，不丢
+        live.close()
+        live = None
     _cancel_perm_choice(chat_id)   # claude 已退出（跑完/被停），挂着的权限确认不再等
     tail = "".join(stderr_buf[-12:]).strip()
     reason = slot.get("reason")
