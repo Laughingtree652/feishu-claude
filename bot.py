@@ -605,43 +605,49 @@ def _freeze_choice_card(msg_id, card: dict, answer) -> None:
     """用户已答复（点按钮/回文字/超时/取消）：把卡片更新成定格状态。
 
     在选项上直接体现：选中项变主色并标（已选择），其余按钮置灰不可点；
-    文字/超时/取消则在卡片尾部附一行说明。更新失败只打日志不影响流程。
+    文字/超时/取消则在卡片尾部附一行说明。patch 失败重试兜底（共 3 次，
+    间隔 1 秒，覆盖瞬态失败/频控），全部失败只打日志不影响流程。
     """
     if not msg_id:
         return
-    try:
-        new_card = json.loads(json.dumps(card))
-        chosen = answer[1] if answer and answer[0] == "choice" else None
-        status = None
-        if answer is None or answer[0] == "timeout":
-            status = "⏰ 超时未选择（已按默认规则处理）"
-        elif answer[0] == "text":
-            status = f"💬 自定义回复：{(answer[1] or '')[:80]}"
-        elif answer[0] == "cancel":
-            status = "↩️ 已取消（任务结束）"
-        for el in new_card.get("elements", []):
-            if el.get("tag") != "action":
-                continue
-            for btn in el.get("actions", []):
-                btn["disabled"] = True
-                if chosen is not None and (btn.get("value") or {}).get("v") == chosen:
-                    btn["type"] = "primary"
-                    label = (btn.get("text") or {}).get("content", "?")
-                    btn["text"] = {"tag": "plain_text", "content": f"{label}（已选择）"}
-        if status:
-            new_card.setdefault("elements", []).append(
-                {"tag": "div", "text": {"tag": "lark_md", "content": status}})
-        req = PatchMessageRequest.builder() \
-            .message_id(msg_id) \
-            .request_body(PatchMessageRequestBody.builder()
-                          .content(json.dumps(new_card, ensure_ascii=False))
-                          .build()) \
-            .build()
-        resp = api.im.v1.message.patch(req)
-        if not resp.success():
-            log(f"[卡片定格失败] msg_id={msg_id} code={resp.code} msg={resp.msg}")
-    except Exception as e:
-        log(f"[卡片定格异常] msg_id={msg_id} {e!r}")
+    new_card = json.loads(json.dumps(card))
+    chosen = answer[1] if answer and answer[0] == "choice" else None
+    status = None
+    if answer is None or answer[0] == "timeout":
+        status = "⏰ 超时未选择（已按默认规则处理）"
+    elif answer[0] == "text":
+        status = f"💬 自定义回复：{(answer[1] or '')[:80]}"
+    elif answer[0] == "cancel":
+        status = "↩️ 已取消（任务结束）"
+    for el in new_card.get("elements", []):
+        if el.get("tag") != "action":
+            continue
+        for btn in el.get("actions", []):
+            btn["disabled"] = True
+            if chosen is not None and (btn.get("value") or {}).get("v") == chosen:
+                btn["type"] = "primary"
+                label = (btn.get("text") or {}).get("content", "?")
+                btn["text"] = {"tag": "plain_text", "content": f"{label}（已选择）"}
+    if status:
+        new_card.setdefault("elements", []).append(
+            {"tag": "div", "text": {"tag": "lark_md", "content": status}})
+    req = PatchMessageRequest.builder() \
+        .message_id(msg_id) \
+        .request_body(PatchMessageRequestBody.builder()
+                      .content(json.dumps(new_card, ensure_ascii=False))
+                      .build()) \
+        .build()
+    for attempt in range(3):
+        try:
+            resp = api.im.v1.message.patch(req)
+            if resp.success():
+                return
+            log(f"[卡片定格失败] 第{attempt + 1}/3次 msg_id={msg_id} "
+                f"code={resp.code} msg={resp.msg}")
+        except Exception as e:
+            log(f"[卡片定格异常] 第{attempt + 1}/3次 msg_id={msg_id} {e!r}")
+        if attempt < 2:
+            time.sleep(1)
 
 
 def _ask_choice(chat_id: str, title: str, body_md: str, options: list,
