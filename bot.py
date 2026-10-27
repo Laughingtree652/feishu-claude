@@ -147,6 +147,7 @@ if LISTEN_FILE.exists():
     except Exception:
         _listen = set()
 _chat_types: dict = {}   # chat_id -> "p2p"/"group"（on_message 记录，命令处理时用）
+_hint_ts: dict = {}      # chat_id -> 上次"群里裸命令"提示时间（限频用）
 
 
 def save_listen() -> None:
@@ -1254,8 +1255,14 @@ def handle_command(chat_id: str, text: str) -> None:
             with _listen_lock:
                 _listen.add(chat_id)
             save_listen()
-            send_text(chat_id, "✅ 已开启：本群所有消息都直接发给机器人（无需 @）。\n"
-                               "适合只有你+机器人的群；人多的大群建议保持 @ 触发。")
+            label = _chat_label(chat_id)
+            send_text(chat_id,
+                      "📢 本群已进入「免 @ 直连模式」\n"
+                      "· 后续所有消息都会被接收，无需再 @机器人\n"
+                      "· 普通文字 = 给 Claude 的指令；/开头 = 机器人命令；!开头 = 本机直通命令\n"
+                      "· 再发一次 /listen 即可退出（恢复 @ 触发）\n"
+                      "· 非白名单成员的消息仍会被拒绝，人多的群建议保持 @ 模式\n"
+                      f"· 当前绑定：{label or '（暂无会话，发首条消息自动新建）'}")
     elif cmd == "/sessions":
         try:
             n = max(2, min(20, int(arg))) if arg else 8
@@ -1369,6 +1376,13 @@ def on_message(event: P2ImMessageReceiveV1) -> None:
             with _listen_lock:
                 listen = chat_id in _listen
             if not (msg.mentions or listen):
+                # 白名单用户发了裸命令（没 @）：提示怎么触发/怎么开免 @（10 分钟限频防刷屏）
+                if text.startswith("/") and sender_id in ALLOWED_USERS \
+                        and time.time() - _hint_ts.get(chat_id, 0) > 600:
+                    _hint_ts[chat_id] = time.time()
+                    send_text(chat_id, "（群聊里需要 @机器人 才会响应，如 @机器人 /status。\n"
+                                       "只有你+机器人的群可以 @机器人 /listen 开启免 @ 直连模式，"
+                                       "之后所有消息直接处理）")
                 return
             for m in msg.mentions or []:
                 text = text.replace(m.key or "", "")
