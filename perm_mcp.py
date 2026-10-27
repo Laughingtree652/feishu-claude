@@ -40,7 +40,8 @@ def ask_bot(args: dict) -> dict:
                "suggestions": args.get("suggestions") or []}
     try:
         with socket.create_connection(("127.0.0.1", port), timeout=15) as s:
-            s.sendall((json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8"))
+            # errors=replace：部分宿主传来的中文会带残缺代理字符，严格编码会直接抛异常
+            s.sendall((json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8", errors="replace"))
             s.settimeout(ASK_TIMEOUT)
             data = b""
             while not data.endswith(b"\n"):

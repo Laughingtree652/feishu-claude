@@ -23,6 +23,8 @@ import lark_oapi as lark
 from lark_oapi.api.im.v1 import (
     CreateMessageRequest,
     CreateMessageRequestBody,
+    PatchMessageRequest,
+    PatchMessageRequestBody,
     P2ImMessageReceiveV1,
 )
 from dotenv import load_dotenv
@@ -289,6 +291,8 @@ def _takeover_running_dialog(chat_id: str, sid: str, cwd, session_file, age: flo
         t = (val or "").strip().lower()
         val = "force" if t in ("强制", "force", "立即", "now") else \
               "cancel" if t in ("取消", "cancel", "算了", "不") else "queue"
+    elif kind != "choice":
+        val = "queue"   # 超时/被新提问顶替：默认排队（原行为）
     if val == "cancel":
         send_text(chat_id, "↩️ 已取消接管。")
         return
@@ -366,8 +370,8 @@ def send_text(chat_id: str, text: str) -> None:
                 print(f"[发消息异常] {e!r}")
 
 
-def _send_card(chat_id: str, card: dict) -> bool:
-    """发送交互卡片，成功返回 True（失败原因打日志，由调用方决定文字兜底）。"""
+def _send_card(chat_id: str, card: dict):
+    """发送交互卡片，成功返回 message_id（卡片定格更新用），失败返回 None。"""
     req = CreateMessageRequest.builder() \
         .receive_id_type("chat_id") \
         .request_body(
@@ -381,11 +385,11 @@ def _send_card(chat_id: str, card: dict) -> bool:
         resp = api.im.v1.message.create(req)
         if not resp.success():
             print(f"[发卡片失败] code={resp.code} msg={resp.msg}")
-            return False
-        return True
+            return None
+        return resp.data.message_id if resp.data else None
     except Exception as e:
         print(f"[发卡片异常] {e!r}")
-        return False
+        return None
 
 
 def send_panel(chat_id: str) -> None:
@@ -422,6 +426,49 @@ _choices_lock = threading.Lock()
 _choices: dict = {}   # chat_id -> {"id","event","answer","tag","labels"}
 
 
+def _freeze_choice_card(msg_id, card: dict, answer) -> None:
+    """用户已答复（点按钮/回文字/超时/取消）：把卡片更新成定格状态。
+
+    在选项上直接体现：选中项变主色并标（已选择），其余按钮置灰不可点；
+    文字/超时/取消则在卡片尾部附一行说明。更新失败只打日志不影响流程。
+    """
+    if not msg_id:
+        return
+    try:
+        new_card = json.loads(json.dumps(card))
+        chosen = answer[1] if answer and answer[0] == "choice" else None
+        status = None
+        if answer is None or answer[0] == "timeout":
+            status = "⏰ 超时未选择（已按默认规则处理）"
+        elif answer[0] == "text":
+            status = f"💬 自定义回复：{(answer[1] or '')[:80]}"
+        elif answer[0] == "cancel":
+            status = "↩️ 已取消（任务结束）"
+        for el in new_card.get("elements", []):
+            if el.get("tag") != "action":
+                continue
+            for btn in el.get("actions", []):
+                btn["disabled"] = True
+                if chosen is not None and (btn.get("value") or {}).get("v") == chosen:
+                    btn["type"] = "primary"
+                    label = (btn.get("text") or {}).get("content", "?")
+                    btn["text"] = {"tag": "plain_text", "content": f"{label}（已选择）"}
+        if status:
+            new_card.setdefault("elements", []).append(
+                {"tag": "div", "text": {"tag": "lark_md", "content": status}})
+        req = PatchMessageRequest.builder() \
+            .message_id(msg_id) \
+            .request_body(PatchMessageRequestBody.builder()
+                          .content(json.dumps(new_card, ensure_ascii=False))
+                          .build()) \
+            .build()
+        resp = api.im.v1.message.patch(req)
+        if not resp.success():
+            print(f"[卡片定格失败] code={resp.code} msg={resp.msg}")
+    except Exception as e:
+        print(f"[卡片定格异常] {e!r}")
+
+
 def _ask_choice(chat_id: str, title: str, body_md: str, options: list,
                 timeout: float, note: str = "", template: str = "orange",
                 tag: str = "") -> tuple:
@@ -429,8 +476,9 @@ def _ask_choice(chat_id: str, title: str, body_md: str, options: list,
 
     必须在工作线程里调用（会阻塞到用户响应或超时，不能占用 WS 事件循环）。
     options: [{"label": 按钮文字, "value": 选项值, "style": "primary"/"danger"/"default"}]
-    返回 ("choice", value) / ("text", 用户原文) / ("timeout", None)。
+    返回 ("choice", value) / ("text", 用户原文) / ("timeout", None) / ("cancel", None)。
     同一聊天同时只挂一个待决策：新的会顶掉旧的（旧的按超时返回）。
+    答复后卡片会更新成定格状态（选中项标注、按钮禁用）。
     卡片发送失败时自动降级为文字提问，文字回复路径不依赖卡片回传订阅。
     """
     req_id = f"c{time.time_ns()}"
@@ -455,7 +503,8 @@ def _ask_choice(chat_id: str, title: str, body_md: str, options: list,
             "header": {"template": template,
                        "title": {"tag": "plain_text", "content": title}},
             "elements": elements}
-    if not _send_card(chat_id, card):
+    msg_id = _send_card(chat_id, card)
+    if not msg_id:
         labels = " / ".join(o.get("label", "?") for o in options)
         send_text(chat_id, f"💬 {title}\n{body_md}\n请回复选择：{labels}"
                            + (f"\n{note}" if note else ""))
@@ -463,7 +512,9 @@ def _ask_choice(chat_id: str, title: str, body_md: str, options: list,
     with _choices_lock:
         if _choices.get(chat_id) is entry:
             _choices.pop(chat_id, None)
-    return entry["answer"] if entry["answer"] is not None else ("timeout", None)
+    answer = entry["answer"] if entry["answer"] is not None else ("timeout", None)
+    _freeze_choice_card(msg_id, card, answer)
+    return answer
 
 
 def _resolve_choice(chat_id: str, req_id: str, val):
@@ -478,11 +529,11 @@ def _resolve_choice(chat_id: str, req_id: str, val):
 
 
 def _cancel_perm_choice(chat_id: str) -> None:
-    """claude 进程已退出（跑完/被 /stop）：权限确认等不下去了，按超时处理。"""
+    """claude 进程已退出（跑完/被 /stop）：权限确认等不下去了，标记取消。"""
     with _choices_lock:
         entry = _choices.get(chat_id)
         if entry is not None and entry.get("tag") == "perm" and entry["answer"] is None:
-            entry["answer"] = ("timeout", None)
+            entry["answer"] = ("cancel", None)
             entry["event"].set()
 
 
@@ -491,13 +542,18 @@ PERM_ALLOW_WORDS = {"y", "yes", "ok", "1", "允许", "同意", "好", "可以", 
 PERM_DENY_WORDS = {"n", "no", "2", "拒绝", "不行", "不可以", "不准", "deny", "reject", "取消"}
 
 
+def _safe_md(s: str) -> str:
+    """Strip lone surrogates (text corrupted by some hosts' broken encoding)."""
+    return s.encode("utf-8", errors="replace").decode("utf-8")
+
+
 def _perm_input_display(tool: str, inp) -> str:
     """权限确认卡片上展示的操作内容：命令/路径优先，其余压缩成 JSON。"""
     if isinstance(inp, dict):
         for key in ("command", "file_path", "path", "url", "pattern", "query"):
             if inp.get(key):
-                return str(inp[key])[:600]
-    return json.dumps(inp, ensure_ascii=False)[:600]
+                return _safe_md(str(inp[key]))[:600]
+    return _safe_md(json.dumps(inp, ensure_ascii=False))[:600]
 
 
 def _perm_server() -> None:
@@ -553,9 +609,12 @@ def _perm_conn(conn) -> None:
                 else:
                     result = {"behavior": "deny", "message": f"用户回复：{val}"}
             else:
-                result = {"behavior": "deny", "message": "⏰ 等待确认超时，已按拒绝处理"}
-                send_text(chat_id, f"⏰ 权限确认超时（{tool}），已按拒绝处理，"
-                                   f"可用 /mode 调整权限模式后重发。")
+                if kind == "cancel":
+                    result = {"behavior": "deny", "message": "任务已结束，权限确认已取消"}
+                else:
+                    result = {"behavior": "deny", "message": "⏰ 等待确认超时，已按拒绝处理"}
+                    send_text(chat_id, f"⏰ 权限确认超时（{tool}），已按拒绝处理，"
+                                       f"可用 /mode 调整权限模式后重发。")
         elif payload and payload.get("type") == "perm":
             result = {"behavior": "deny", "message": "权限确认缺少聊天上下文"}
     except Exception as e:
