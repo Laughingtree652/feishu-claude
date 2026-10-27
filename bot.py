@@ -71,7 +71,7 @@ HELP_TEXT = """📖 命令列表
 /sessions [条数] — 列出电脑上最近的会话（含当前绑定的）
 /takeover [序号|会话ID|latest] — 接管电脑上的会话（在跑的发卡片选：排队/强制/取消）
 /peek [序号|会话ID|latest] — 旁观会话当前进度（正在干什么、最新输出）
-/unqueue — 清空排队（消息队列 / 排队接管）
+/unqueue — 取消排队接管
 /rename [名字] — 给当前会话起名（/sessions 列表优先显示名字）
 /addcmd 标签 消息 · /delcmd 序号 · /cmds · /panel — 快捷命令按钮面板
 /cwd [路径] — 查看 / 切换 Claude 的工作目录
@@ -80,7 +80,7 @@ HELP_TEXT = """📖 命令列表
 /mute · /unmute — 暂停/恢复桌面事件推送
 
 直接发送文本 = 给 Claude 下指令，多轮对话自动保持上下文。
-任务执行中发消息会自动排队，当前任务完成后依次执行。
+任务执行中发的消息会直接递给 Claude（工具间隙读取，边跑边回应，和桌面终端一致）。
 Claude 需要权限确认时会发卡片，点按钮或直接回复文字（允许/拒绝/自定义说明）。
 !命令 = 直接在本机 PowerShell 执行（不经 Claude），如 !git status"""
 
@@ -297,6 +297,7 @@ def _takeover_running_dialog(chat_id: str, sid: str, cwd, session_file, age: flo
         send_text(chat_id, "↩️ 已取消接管。")
         return
     if val == "force":
+        _recycle_chat_sessions(chat_id)   # 换绑：旧会话的驻留进程让位
         _bind_session(chat_id, sid, cwd)
         send_text(chat_id,
                   f"✅ 已强制接管会话 {sid[:8]}…（目录：{_chat_work_dir(chat_id)}）\n"
@@ -304,6 +305,7 @@ def _takeover_running_dialog(chat_id: str, sid: str, cwd, session_file, age: flo
                   "⚠️ 桌面那边若还开着，两边同时用会分叉，建议先退出桌面端。")
         return
     # queue：绑定 + 排队接管（沿用 _wait_and_drain 轮询机制）
+    _recycle_chat_sessions(chat_id)   # 换绑：旧会话的驻留进程让位
     _bind_session(chat_id, sid, cwd)
     keep = raw_text if (kind == "text" and raw_text and raw_text.strip()
                         and raw_text.strip().lower() not in ("排队", "queue")) else None
@@ -674,66 +676,95 @@ def shell_task(chat_id: str, command: str) -> None:
     send_text(chat_id, f"$ {command}\n{body}\n[exit {r.returncode}]")
 
 
-def run_task(chat_id: str, prompt: str) -> None:
-    """任务入口：同一会话同时只跑一个；忙时新消息排队，跑完自动依次执行。
+# ---------------- 长驻会话进程（stream-json 双向，2026-10-27 实测工具间隙可注入） ----------------
+SESSION_IDLE_TIMEOUT = int(os.environ.get("SESSION_IDLE_TIMEOUT", "900"))  # 闲置回收（秒）
 
-    像桌面终端的 Claude 一样：执行中发消息不会丢，当前回合思考完就轮到它。
-    互斥键是会话（见 _task_key）：不同会话互不阻塞。
+
+def _user_msg_line(text: str) -> str:
+    """stream-json 输入格式的一行用户消息。"""
+    return json.dumps({"type": "user", "message": {"role": "user",
+                                                   "content": [{"type": "text", "text": text}]}},
+                      ensure_ascii=False) + "\n"
+
+
+def _write_to_session(slot: dict, text: str) -> bool:
+    """把用户消息写进长驻进程的 stdin（运行中会在工具间隙被读取；空闲则开启下一回合）。
+
+    写入需按 slot 锁串行化（可能多线程同时递消息）；管道断裂返回 False，由上层重建。
+    """
+    proc = slot.get("proc")
+    if proc is None or proc.poll() is not None:
+        return False
+    try:
+        with slot["wlock"]:
+            proc.stdin.write(_user_msg_line(text))
+            proc.stdin.flush()
+        slot["last_event"] = time.time()
+        slot["turn_start"] = time.time()
+        slot["in_turn"] = True
+        return True
+    except (BrokenPipeError, OSError, ValueError):
+        return False
+
+
+def _recycle_chat_sessions(chat_id: str, reason: str = "recycle") -> None:
+    """终结该聊天名下的所有长驻会话进程（/new /cwd /takeover 换绑时用）。"""
+    with _running_lock:
+        for key, slot in list(_running.items()):
+            if slot.get("chat_id") == chat_id and slot.get("proc") is not None:
+                slot["reason"] = reason
+                kill_task(slot["proc"])
+
+
+def run_task(chat_id: str, prompt: str) -> None:
+    """任务入口：每个会话一个长驻 claude 进程（stream-json 双向）。
+
+    进程活着 → 消息直接写 stdin：正在执行的任务会在工具调用间隙读到它、
+    边跑边回应（和桌面终端一致的体验）；进程不在（首次/闲置回收/崩溃）→
+    新起一个，绑定会话自动 --resume 续接。互斥键是会话（_task_key）：
+    同一会话被另一聊天占用时拒绝，不同会话互不阻塞。
     """
     key = _task_key(chat_id)
     with _running_lock:
-        if key in _running:
-            holder = _running[key]
-            if holder.get("chat_id") != chat_id:
+        slot = _running.get(key)
+        if slot is not None:
+            if slot.get("chat_id") != chat_id:
                 send_text(chat_id, f"⚠️ 会话 {key[:8]}… 正在被另一个聊天使用，"
                                    "为避免上下文交错已拒绝。稍后重试。")
                 return
-            with _msg_queue_lock:
-                q = _msg_queue.setdefault(key, [])
-                q.append(prompt)
-                n = len(q)
-            send_text(chat_id, f"📥 已排队（第 {n} 条），当前任务完成后自动执行")
+            if _write_to_session(slot, prompt):
+                send_text(chat_id, "💬 已送达当前会话（正在执行的话会在工具间隙读取，"
+                                   "Claude 会根据进度决定何时回应）")
+                return
+        # 没有活进程：在锁内完成 起进程+首条消息写入，保证消息次序不乱
+        slot = {"chat_id": chat_id, "proc": None, "started": time.time(), "reason": None,
+                "wlock": threading.Lock(), "last_event": time.time(),
+                "turn_start": time.time(), "in_turn": False, "sid": _lookup_session(chat_id)}
+        try:
+            proc = _spawn_claude(chat_id, slot["sid"])
+        except FileNotFoundError:
+            send_text(chat_id, "❌ 找不到 claude 命令，请在 .env 中用 CLAUDE_PATH 指定完整路径。")
             return
-        slot = {"chat_id": chat_id, "proc": None, "started": time.time(), "reason": None}
+        except OSError as e:
+            send_text(chat_id, f"❌ 启动 claude 进程失败：{e!r}")
+            return
+        slot["proc"] = proc
         _running[key] = slot
-    try:
-        while True:
-            _run_claude(chat_id, prompt, slot)
-            if slot.get("reason") in ("stop", "timeout"):
-                # 被中断/超时：排队的消息一并取消——用户按停时预期是全停
-                with _msg_queue_lock:
-                    dropped = _msg_queue.pop(key, [])
-                if dropped:
-                    send_text(chat_id, f"🚫 排队的 {len(dropped)} 条消息已一并取消。")
-                return
-            with _msg_queue_lock:
-                q = _msg_queue.get(key)
-                prompt = q.pop(0) if q else None
-                if not q:
-                    _msg_queue.pop(key, None)
-            if prompt is None:
-                return
-            slot["reason"] = None
-            slot["proc"] = None
-            slot["started"] = time.time()
-    except Exception as e:
-        send_text(chat_id, f"❌ 桥接器内部错误：{e!r}")
-    finally:
-        with _running_lock:
-            if _running.get(key) is slot:
-                _running.pop(key, None)
+        _write_to_session(slot, prompt)
+    label = _chat_label(chat_id)
+    tag = f"续接 {label} · {_mode_label()}" if label else f"新会话 · {_mode_label()}"
+    send_text(chat_id, f"🤖 收到（{tag}），开始执行…")
+    threading.Thread(target=_session_reader, args=(chat_id, key, slot), daemon=True).start()
+    threading.Thread(target=_session_watchdog, args=(chat_id, key, slot), daemon=True).start()
 
 
-def _run_claude(chat_id: str, prompt: str, slot: dict, ack: bool = True) -> None:
-    """调用 claude -p（stream-json），实时转发输出。"""
-    session_id = _lookup_session(chat_id)
-    if ack:
-        label = _chat_label(chat_id)
-        tag = f"续接 {label} · {_mode_label()}" if label else f"新会话 · {_mode_label()}"
-        send_text(chat_id, f"🤖 收到（{tag}），开始执行…")
+def _spawn_claude(chat_id: str, session_id):
+    """起长驻 claude 进程（stream-json 输入/输出；stdin 保持打开持续接收消息）。
 
-    # 注意：提示词通过 stdin 传入，避免经 .cmd 垫片时被 cmd.exe 解析特殊字符
-    cmd = [CLAUDE_PATH, "-p", "--output-format", "stream-json", "--verbose"]
+    注意：提示词通过 stdin 传入，避免经 .cmd 垫片时被 cmd.exe 解析特殊字符。
+    """
+    cmd = [CLAUDE_PATH, "-p", "--input-format", "stream-json",
+           "--output-format", "stream-json", "--verbose"]
     if PERMISSION_MODE:
         cmd += ["--permission-mode", PERMISSION_MODE]
     # 权限确认走飞书卡片：claude 遇到权限提示时调用 MCP 工具
@@ -752,52 +783,30 @@ def _run_claude(chat_id: str, prompt: str, slot: dict, ack: bool = True) -> None
     # FEISHU_CHAT_ID/FEISHU_PERM_PORT：perm_mcp.py 借此路由卡片和连回本进程
     child_env = {**os.environ, "FEISHU_BOT_CHILD": "1",
                  "FEISHU_CHAT_ID": chat_id, "FEISHU_PERM_PORT": str(PERM_PORT)}
-    try:
-        proc = subprocess.Popen(
-            cmd,
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, encoding="utf-8", errors="replace",
-            cwd=str(_chat_work_dir(chat_id)), env=child_env,
-        )
-    except FileNotFoundError:
-        send_text(chat_id, "❌ 找不到 claude 命令，请在 .env 中用 CLAUDE_PATH 指定完整路径。")
-        return
-    slot["proc"] = proc
-    try:
-        proc.stdin.write(prompt)
-    except (BrokenPipeError, OSError):
-        pass  # 进程已提前退出（如参数错误），继续读输出让错误信息浮出来
-    try:
-        proc.stdin.close()
-    except (BrokenPipeError, OSError):
-        pass
+    return subprocess.Popen(
+        cmd,
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, encoding="utf-8", errors="replace",
+        cwd=str(_chat_work_dir(chat_id)), env=child_env,
+    )
 
-    # 超时看门狗（CLAUDE_TIMEOUT<=0 时不限时，挂死用 /stop 远程杀）
-    timer = None
-    if CLAUDE_TIMEOUT > 0:
-        def _timeout() -> None:
-            slot["reason"] = "timeout"
-            kill_task(proc)
 
-        timer = threading.Timer(CLAUDE_TIMEOUT, _timeout)
-        timer.daemon = True
-        timer.start()
-
-    # stderr 用单独线程收集，防止管道写满造成死锁
+def _session_reader(chat_id: str, key: str, slot: dict) -> None:
+    """长驻进程输出泵：转发回复/工具调用，逐回合汇报；进程退出时收尾并清理。"""
+    proc = slot["proc"]
     stderr_buf: list = []
 
     def _drain_stderr() -> None:
         for line in proc.stderr:
             stderr_buf.append(line)
 
-    t_err = threading.Thread(target=_drain_stderr, daemon=True)
-    t_err.start()
+    threading.Thread(target=_drain_stderr, daemon=True).start()
 
-    last_text = ""   # 已转发过的最后一段 assistant 文本（用于和最终 result 去重）
-    result = None
+    last_text = ""   # 本回合已转发过的最后一段 assistant 文本（用于和 result 去重）
     try:
         for line in proc.stdout:
             line = line.strip()
+            slot["last_event"] = time.time()   # 任何事件都算活跃（含 thinking_tokens）
             if not line.startswith("{"):
                 continue  # 忽略夹杂的非 JSON 行
             try:
@@ -805,7 +814,13 @@ def _run_claude(chat_id: str, prompt: str, slot: dict, ack: bool = True) -> None
             except json.JSONDecodeError:
                 continue
             etype = evt.get("type")
-            if etype == "assistant":
+            if etype == "system" and evt.get("subtype") == "init":
+                sid = evt.get("session_id")
+                if sid:
+                    slot["sid"] = sid
+                    # 绑定会话：下一条消息（若进程已回收）自动 --resume 续接
+                    _bind_session(chat_id, sid, str(_chat_work_dir(chat_id)))
+            elif etype == "assistant":
                 for block in (evt.get("message") or {}).get("content") or []:
                     btype = block.get("type")
                     if btype == "text" and (block.get("text") or "").strip():
@@ -814,52 +829,40 @@ def _run_claude(chat_id: str, prompt: str, slot: dict, ack: bool = True) -> None
                     elif btype == "tool_use" and FORWARD_TOOLS:
                         send_text(chat_id, "🔧 " + _tool_summary(block.get("name", "?"), block.get("input")))
             elif etype == "result":
-                result = evt
-    finally:
-        if timer:
-            timer.cancel()
+                slot["in_turn"] = False
+                _finish_turn(chat_id, evt, last_text, slot)
+                last_text = ""
+    except Exception as e:
+        print(f"[会话读泵异常] {e!r}")
     returncode = proc.wait()
     _cancel_perm_choice(chat_id)   # claude 已退出（跑完/被停），挂着的权限确认不再等
-    t_err.join(timeout=2)
     tail = "".join(stderr_buf[-12:]).strip()
-
-    # --resume 失效（目录切换/记录损坏等）→ 清掉会话自动重试一次
-    if slot.get("reason") is None and returncode != 0 and result is None \
-            and session_id and ("session" in tail.lower() or "conversation" in tail.lower()):
-        with _sessions_lock:
-            _sessions.pop(chat_id, None)
-        save_sessions()
-        send_text(chat_id, "🔄 原会话已失效，自动开启新会话重试…")
-        _run_claude(chat_id, prompt, slot, ack=False)
-        return
-
-    _finish(chat_id, result, returncode, tail, last_text, slot)
-
-
-def _finish(chat_id: str, result, returncode: int, tail: str, last_text: str, slot: dict) -> None:
-    """收尾：保存会话、汇报结果。"""
     reason = slot.get("reason")
-    if reason == "timeout":
-        send_text(chat_id, f"⚠️ 执行超过 {CLAUDE_TIMEOUT}s，已强制中断。可在 .env 中调大 CLAUDE_TIMEOUT。")
-        return
+    with _running_lock:
+        if _running.get(key) is slot:
+            _running.pop(key, None)
     if reason == "stop":
         send_text(chat_id, "⛔ 已手动中断。")
-        return
-    if result is None:
-        send_text(chat_id, f"❌ Claude 异常退出（code={returncode}）\n{tail[-800:] or '（无错误输出）'}")
-        return
+    elif reason == "timeout":
+        send_text(chat_id, f"⚠️ 执行超过 {CLAUDE_TIMEOUT}s，已强制中断。可在 .env 中调大 CLAUDE_TIMEOUT。")
+    elif reason == "idle":
+        send_text(chat_id, "💤 会话进程已闲置回收（上下文已保存），随时发消息继续。")
+    elif reason == "recycle":
+        pass  # 主动让位（/new /cwd /takeover 换绑），命令本身已有回复
+    elif returncode != 0:
+        if slot.get("sid") and ("session" in tail.lower() or "conversation" in tail.lower()):
+            # --resume 失效（目录切换/记录损坏等）
+            with _sessions_lock:
+                _sessions.pop(chat_id, None)
+            save_sessions()
+            send_text(chat_id, "❌ 原会话已失效（绑定已清除），再发一次消息将自动开新会话。")
+        else:
+            send_text(chat_id, f"❌ Claude 进程异常退出（code={returncode}）\n"
+                               f"{tail[-800:] or '（无错误输出）'}")
 
-    # 记录会话 ID，下一条消息自动 --resume 续接
-    sid = result.get("session_id")
-    if sid:
-        with _sessions_lock:
-            _sessions[chat_id] = {
-                "session_id": sid,
-                "work_dir": str(_chat_work_dir(chat_id)),
-                "updated": datetime.now().isoformat(timespec="seconds"),
-            }
-        save_sessions()
 
+def _finish_turn(chat_id: str, result: dict, last_text: str, slot: dict) -> None:
+    """单个回合结束的汇报（长驻进程里每条消息各有一个 result 事件）。"""
     final_text = (result.get("result") or "").strip()
     if final_text and final_text != last_text:
         send_text(chat_id, final_text)
@@ -880,6 +883,33 @@ def _finish(chat_id: str, result, returncode: int, tail: str, last_text: str, sl
         send_text(chat_id, f"⚠️ 有 {len(denials)} 个操作因权限被拒绝。"
                            "如需放开：发 /mode bypassPermissions（机器人级设置，注意风险），"
                            "或把具体命令加进 Claude 设置的 allow 列表。")
+
+
+def _session_watchdog(chat_id: str, key: str, slot: dict) -> None:
+    """长驻进程看门狗：闲置太久优雅回收（关 stdin）；CLAUDE_TIMEOUT>0 时单回合超时强杀。"""
+    while True:
+        time.sleep(15)
+        proc = slot.get("proc")
+        if proc is None or proc.poll() is not None:
+            return  # 进程已退出，读泵负责收尾
+        with _running_lock:
+            if _running.get(key) is not slot:
+                return  # 该会话已换绑/重建
+        now = time.time()
+        if CLAUDE_TIMEOUT > 0 and slot.get("in_turn") \
+                and now - slot.get("turn_start", now) > CLAUDE_TIMEOUT:
+            slot["reason"] = "timeout"
+            kill_task(proc)
+            return
+        # 闲置回收只在该回合已结束时做：长工具执行期间可能长时间无输出，
+        # 但回合没结束就不算闲置（in_turn 保护）
+        if not slot.get("in_turn") and now - slot.get("last_event", now) > SESSION_IDLE_TIMEOUT:
+            slot["reason"] = "idle"
+            try:
+                proc.stdin.close()   # 优雅退出：claude 收到 EOF，跑完当前回合自然退出
+            except (BrokenPipeError, OSError, ValueError):
+                pass
+            return
 
 
 # ---------------- 会话接管（电脑 → 飞书） ----------------
@@ -1109,6 +1139,7 @@ def handle_command(chat_id: str, text: str) -> None:
     if cmd == "/help":
         send_text(chat_id, HELP_TEXT)
     elif cmd == "/new":
+        _recycle_chat_sessions(chat_id)   # 终结旧会话的驻留进程
         with _sessions_lock:
             _sessions.pop(chat_id, None)
         save_sessions()
@@ -1141,9 +1172,10 @@ def handle_command(chat_id: str, text: str) -> None:
         with _pending_lock:
             pend = _pending.get(chat_id)
         if slots:
-            msg = "⏳ 任务执行中" + ("（多会话并行）" if len(slots) > 1 else "") + "：" + \
-                  "、".join(f"会话 {k[:8]}… {int(time.time() - v['started'])}s" for k, v in slots) + \
-                  "\n（/stop 可全部中断）"
+            msg = "⏳ 会话进程驻留中" + ("（多会话并行）" if len(slots) > 1 else "") + "：" + \
+                  "、".join(f"{k[:8]}… 最近活动 {int(time.time() - v.get('last_event', v['started']))}s 前"
+                            for k, v in slots) + \
+                  "\n（消息直达会话进程，无需排队；闲置 15 分钟自动回收；/stop 可中断）"
         else:
             msg = "空闲中。"
         if qn:
@@ -1213,6 +1245,7 @@ def handle_command(chat_id: str, text: str) -> None:
                                  args=(chat_id, sid, cwd, session_file, age),
                                  daemon=True).start()
                 return
+        _recycle_chat_sessions(chat_id)   # 换绑：旧会话的驻留进程让位
         _bind_session(chat_id, sid, cwd)
         send_text(chat_id,
                   f"✅ 已接管会话 {sid[:8]}…（目录：{_chat_work_dir(chat_id)}）\n"
@@ -1367,6 +1400,7 @@ def handle_command(chat_id: str, text: str) -> None:
             if not p.is_dir():
                 send_text(chat_id, f"❌ 目录不存在：{p}")
             else:
+                _recycle_chat_sessions(chat_id)   # 目录变了，旧会话进程作废
                 WORK_DIR = p.resolve()   # 改全局默认
                 with _sessions_lock:
                     _sessions.pop(chat_id, None)  # 只重置本聊天的会话，不影响其他聊天
