@@ -3,7 +3,7 @@
 import ast
 from pathlib import Path
 
-for f in ["bot.py", "notify.py"]:
+for f in ["bot.py", "notify.py", "perm_mcp.py"]:
     src = Path(f).read_text(encoding="utf-8")
     ast.parse(src)
     print(f, "syntax OK")

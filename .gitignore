@@ -3,6 +3,7 @@
 sessions.json
 names.json
 commands.json
+listen.json
 notify_target.json
 notify.log
 mute.flag

@@ -11,6 +11,7 @@ import json
 import os
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import threading
@@ -50,6 +51,11 @@ CLAUDE_PATH = os.environ.get("CLAUDE_PATH") or shutil.which("claude")
 PERMISSION_MODES = {"default", "acceptEdits", "auto", "bypassPermissions", "manual", "dontAsk", "plan"}
 SHELL_TIMEOUT = 120  # 飞书 ! 命令直通 shell 的超时（秒）
 
+# 权限确认卡片（--permission-prompt-tool → perm_mcp.py → 本地 socket → 飞书卡片）
+PERM_PORT = int(os.environ.get("FEISHU_PERM_PORT", "37921"))     # 与 perm_mcp.py 约定的本地端口
+PERM_TIMEOUT = int(os.environ.get("PERM_TIMEOUT_SECONDS", "600"))  # 等用户确认权限的上限（秒）
+TAKEOVER_ASK_TIMEOUT = 60  # 接管运行中会话时等用户选卡片选项的上限（秒），超时默认排队
+
 SESSION_FILE = BASE_DIR / "sessions.json"
 MAX_CHUNK = 3500      # 单条飞书消息最大字符数，超长自动分段
 SEND_INTERVAL = 0.5   # 发消息最小间隔（秒），避免触发飞书频控
@@ -61,17 +67,19 @@ HELP_TEXT = """📖 命令列表
 /status — 查看当前任务与排队状态
 /session — 查看当前会话 ID（在电脑上 claude --resume <id> 可接续）
 /sessions [条数] — 列出电脑上最近的会话（含当前绑定的）
-/takeover [序号|会话ID|latest] — 接管电脑上的会话（在跑的自动排队，跑完接续）
+/takeover [序号|会话ID|latest] — 接管电脑上的会话（在跑的发卡片选：排队/强制/取消）
 /peek [序号|会话ID|latest] — 旁观会话当前进度（正在干什么、最新输出）
 /unqueue — 清空排队（消息队列 / 排队接管）
 /rename [名字] — 给当前会话起名（/sessions 列表优先显示名字）
 /addcmd 标签 消息 · /delcmd 序号 · /cmds · /panel — 快捷命令按钮面板
 /cwd [路径] — 查看 / 切换 Claude 的工作目录
 /mode [模式] — 查看 / 切换权限模式（manual、auto、acceptEdits…）
+/listen — 群聊免 @ 模式：本群所有消息直接发给机器人（适合只有你+机器人的群）
 /mute · /unmute — 暂停/恢复桌面事件推送
 
 直接发送文本 = 给 Claude 下指令，多轮对话自动保持上下文。
 任务执行中发消息会自动排队，当前任务完成后依次执行。
+Claude 需要权限确认时会发卡片，点按钮或直接回复文字（允许/拒绝/自定义说明）。
 !命令 = 直接在本机 PowerShell 执行（不经 Claude），如 !git status"""
 
 # 用于发消息的 API 客户端（与收消息的 WebSocket 客户端相互独立）
@@ -125,6 +133,26 @@ def save_commands() -> None:
     with _commands_lock:
         try:
             COMMANDS_FILE.write_text(json.dumps(_commands, ensure_ascii=False, indent=1), "utf-8")
+        except OSError:
+            pass
+
+
+# ---------------- 免 @ 群（/listen 维护：只有自己+机器人的群里消息全量接收） ----------------
+LISTEN_FILE = BASE_DIR / "listen.json"
+_listen_lock = threading.Lock()
+_listen: set = set()
+if LISTEN_FILE.exists():
+    try:
+        _listen = set(json.loads(LISTEN_FILE.read_text("utf-8")))
+    except Exception:
+        _listen = set()
+_chat_types: dict = {}   # chat_id -> "p2p"/"group"（on_message 记录，命令处理时用）
+
+
+def save_listen() -> None:
+    with _listen_lock:
+        try:
+            LISTEN_FILE.write_text(json.dumps(sorted(_listen), ensure_ascii=False, indent=1), "utf-8")
         except OSError:
             pass
 
@@ -239,6 +267,58 @@ def _wait_and_drain(chat_id: str) -> None:
         return
 
 
+def _takeover_running_dialog(chat_id: str, sid: str, cwd, session_file, age: float) -> None:
+    """目标会话正在跑：发卡片让用户选 排队/强制/取消（60 秒无响应默认排队）。
+
+    独立线程执行——handle_command 在 WS 事件循环里，不能阻塞等用户点按钮。
+    """
+    tag = _names.get(sid) or f"{sid[:8]}…"
+    raw_text = None
+    kind, val = _ask_choice(
+        chat_id, "⏳ 会话正在运行",
+        f"会话 **{tag}** 正在跑（{int(age)} 秒前仍在写入），怎么接管？",
+        [{"label": "⏳ 排队等它结束", "value": "queue", "style": "primary"},
+         {"label": "⚡ 强制立即接管", "value": "force", "style": "danger"},
+         {"label": "❌ 取消", "value": "cancel", "style": "default"}],
+        timeout=TAKEOVER_ASK_TIMEOUT, template="orange", tag="takeover",
+        note="也可以直接回复文字：`排队` / `强制` / `取消`。60 秒未选默认排队。\n"
+             "（老用法仍可用：/takeover <id>! 跳过选择直接强制接管）")
+    if kind == "text":
+        raw_text = val
+        t = (val or "").strip().lower()
+        val = "force" if t in ("强制", "force", "立即", "now") else \
+              "cancel" if t in ("取消", "cancel", "算了", "不") else "queue"
+    if val == "cancel":
+        send_text(chat_id, "↩️ 已取消接管。")
+        return
+    if val == "force":
+        _bind_session(chat_id, sid, cwd)
+        send_text(chat_id,
+                  f"✅ 已强制接管会话 {sid[:8]}…（目录：{_chat_work_dir(chat_id)}）\n"
+                  "下一条消息将带上该会话的全部上下文。\n"
+                  "⚠️ 桌面那边若还开着，两边同时用会分叉，建议先退出桌面端。")
+        return
+    # queue：绑定 + 排队接管（沿用 _wait_and_drain 轮询机制）
+    _bind_session(chat_id, sid, cwd)
+    keep = raw_text if (kind == "text" and raw_text and raw_text.strip()
+                        and raw_text.strip().lower() not in ("排队", "queue")) else None
+    with _pending_lock:
+        cur = _pending.get(chat_id)
+        already = bool(cur and cur.get("sid") == sid)
+        if not already:
+            # 卡片等待期间用户发的指令文字：选了排队就别丢，一并入队
+            _pending[chat_id] = {"sid": sid, "file": session_file,
+                                 "queue": [keep] if keep else [],
+                                 "started": time.time()}
+    if not already:
+        threading.Thread(target=_wait_and_drain, args=(chat_id,), daemon=True).start()
+    send_text(chat_id,
+              f"⏳ 已进入排队接管（{tag}）：\n"
+              "· 现在发的消息会排队，等它回合结束自动依次执行\n"
+              "· /peek 看它当前进度，/unqueue 取消排队（保留绑定）\n"
+              "· 等待上限 30 分钟，超时自动放弃")
+
+
 def kill_task(proc: subprocess.Popen) -> None:
     """终止 claude 进程树（Windows 下 .cmd 垫片会派生 node 子进程，必须整树终止）。"""
     try:
@@ -285,6 +365,28 @@ def send_text(chat_id: str, text: str) -> None:
                 print(f"[发消息异常] {e!r}")
 
 
+def _send_card(chat_id: str, card: dict) -> bool:
+    """发送交互卡片，成功返回 True（失败原因打日志，由调用方决定文字兜底）。"""
+    req = CreateMessageRequest.builder() \
+        .receive_id_type("chat_id") \
+        .request_body(
+            CreateMessageRequestBody.builder()
+            .receive_id(chat_id)
+            .msg_type("interactive")
+            .content(json.dumps(card, ensure_ascii=False))
+            .build()
+        ).build()
+    try:
+        resp = api.im.v1.message.create(req)
+        if not resp.success():
+            print(f"[发卡片失败] code={resp.code} msg={resp.msg}")
+            return False
+        return True
+    except Exception as e:
+        print(f"[发卡片异常] {e!r}")
+        return False
+
+
 def send_panel(chat_id: str) -> None:
     """发送快捷命令卡片：每条命令一个按钮，点击即发送对应消息（卡片回传交互）。"""
     if not _commands:
@@ -310,21 +412,163 @@ def send_panel(chat_id: str) -> None:
                    "title": {"tag": "plain_text", "content": "⚡ 快捷命令"}},
         "elements": [{"tag": "action", "actions": r} for r in rows],
     }
-    req = CreateMessageRequest.builder() \
-        .receive_id_type("chat_id") \
-        .request_body(
-            CreateMessageRequestBody.builder()
-            .receive_id(chat_id)
-            .msg_type("interactive")
-            .content(json.dumps(card, ensure_ascii=False))
-            .build()
-        ).build()
+    if not _send_card(chat_id, card):
+        send_text(chat_id, "❌ 卡片发送失败，重试 /panel。")
+
+
+# ---------------- 待决策卡片（权限确认 / 接管选择等，支持按钮+文字自定义回复） ----------------
+_choices_lock = threading.Lock()
+_choices: dict = {}   # chat_id -> {"id","event","answer","tag","labels"}
+
+
+def _ask_choice(chat_id: str, title: str, body_md: str, options: list,
+                timeout: float, note: str = "", template: str = "orange",
+                tag: str = "") -> tuple:
+    """发一张选择卡片并阻塞等用户响应（点按钮，或直接回文字=自定义输入）。
+
+    必须在工作线程里调用（会阻塞到用户响应或超时，不能占用 WS 事件循环）。
+    options: [{"label": 按钮文字, "value": 选项值, "style": "primary"/"danger"/"default"}]
+    返回 ("choice", value) / ("text", 用户原文) / ("timeout", None)。
+    同一聊天同时只挂一个待决策：新的会顶掉旧的（旧的按超时返回）。
+    卡片发送失败时自动降级为文字提问，文字回复路径不依赖卡片回传订阅。
+    """
+    req_id = f"c{time.time_ns()}"
+    entry = {"id": req_id, "event": threading.Event(), "answer": None,
+             "tag": tag, "labels": {o.get("value"): o.get("label", "?") for o in options}}
+    with _choices_lock:
+        old = _choices.get(chat_id)
+        if old is not None:
+            old["answer"] = ("timeout", None)
+            old["event"].set()
+        _choices[chat_id] = entry
+    btns = [{"tag": "button", "text": {"tag": "plain_text", "content": o.get("label", "?")},
+             "type": o.get("style", "default"), "value": {"ask": req_id, "v": o.get("value")}}
+            for o in options]
+    elements = []
+    if body_md:
+        elements.append({"tag": "div", "text": {"tag": "lark_md", "content": body_md}})
+    elements.append({"tag": "action", "actions": btns})
+    if note:
+        elements.append({"tag": "div", "text": {"tag": "lark_md", "content": note}})
+    card = {"config": {"wide_screen_mode": True},
+            "header": {"template": template,
+                       "title": {"tag": "plain_text", "content": title}},
+            "elements": elements}
+    if not _send_card(chat_id, card):
+        labels = " / ".join(o.get("label", "?") for o in options)
+        send_text(chat_id, f"💬 {title}\n{body_md}\n请回复选择：{labels}"
+                           + (f"\n{note}" if note else ""))
+    entry["event"].wait(timeout)
+    with _choices_lock:
+        if _choices.get(chat_id) is entry:
+            _choices.pop(chat_id, None)
+    return entry["answer"] if entry["answer"] is not None else ("timeout", None)
+
+
+def _resolve_choice(chat_id: str, req_id: str, val):
+    """卡片按钮回调：把选项写回等待线程。返回按钮文字（给 toast），已答/过期返回 None。"""
+    with _choices_lock:
+        entry = _choices.get(chat_id)
+        if entry is None or entry.get("id") != req_id or entry["answer"] is not None:
+            return None
+        entry["answer"] = ("choice", val)
+        entry["event"].set()
+        return entry["labels"].get(val, str(val))
+
+
+def _cancel_perm_choice(chat_id: str) -> None:
+    """claude 进程已退出（跑完/被 /stop）：权限确认等不下去了，按超时处理。"""
+    with _choices_lock:
+        entry = _choices.get(chat_id)
+        if entry is not None and entry.get("tag") == "perm" and entry["answer"] is None:
+            entry["answer"] = ("timeout", None)
+            entry["event"].set()
+
+
+# 权限确认的自定义文字 → 决定（其余文字按"拒绝并带说明"处理，说明会转给 Claude）
+PERM_ALLOW_WORDS = {"y", "yes", "ok", "1", "允许", "同意", "好", "可以", "准许", "allow", "approve"}
+PERM_DENY_WORDS = {"n", "no", "2", "拒绝", "不行", "不可以", "不准", "deny", "reject", "取消"}
+
+
+def _perm_input_display(tool: str, inp) -> str:
+    """权限确认卡片上展示的操作内容：命令/路径优先，其余压缩成 JSON。"""
+    if isinstance(inp, dict):
+        for key in ("command", "file_path", "path", "url", "pattern", "query"):
+            if inp.get(key):
+                return str(inp[key])[:600]
+    return json.dumps(inp, ensure_ascii=False)[:600]
+
+
+def _perm_server() -> None:
+    """本地 TCP 通道：perm_mcp.py（claude 的权限回调 MCP 服务器）把请求转过来。"""
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
-        resp = api.im.v1.message.create(req)
-        if not resp.success():
-            send_text(chat_id, f"❌ 卡片发送失败 code={resp.code}：{resp.msg}")
+        srv.bind(("127.0.0.1", PERM_PORT))
+    except OSError as e:
+        print(f"[权限通道] 端口 {PERM_PORT} 绑定失败：{e!r}（权限确认将自动拒绝，其余功能不受影响）")
+        return
+    srv.listen(8)
+    print(f"[权限通道] 127.0.0.1:{PERM_PORT} 已监听")
+    while True:
+        try:
+            conn, _ = srv.accept()
+        except OSError:
+            break
+        threading.Thread(target=_perm_conn, args=(conn,), daemon=True).start()
+
+
+def _perm_conn(conn) -> None:
+    """一次连接 = 一次权限确认：读请求 → 发卡片等用户 → 把决定写回连接。"""
+    try:
+        conn.settimeout(30)
+        line = conn.makefile("rb").readline()
+        payload = json.loads(line) if line.strip() else None
+    except Exception:
+        payload = None
+    result = {"behavior": "deny", "message": "权限确认请求无效"}
+    try:
+        if payload and payload.get("type") == "perm" and payload.get("chat_id"):
+            chat_id = payload["chat_id"]
+            tool = str(payload.get("tool_name") or "?")
+            disp = _perm_input_display(tool, payload.get("tool_input"))
+            kind, val = _ask_choice(
+                chat_id, "🔐 需要权限确认", f"**工具**：`{tool}`\n**内容**：\n{disp}",
+                [{"label": "✅ 允许", "value": "allow", "style": "primary"},
+                 {"label": "❌ 拒绝", "value": "deny", "style": "danger"}],
+                timeout=PERM_TIMEOUT, template="orange", tag="perm",
+                note="也可以直接回复文字：`允许` / `拒绝`，或任意说明（将作为拒绝原因转给 Claude）")
+            if kind == "choice":
+                if val == "allow":
+                    result = {"behavior": "allow"}
+                else:
+                    result = {"behavior": "deny", "message": "用户在飞书上拒绝了本次操作"}
+            elif kind == "text":
+                t = (val or "").strip().lower()
+                if t in PERM_ALLOW_WORDS:
+                    result = {"behavior": "allow"}
+                elif t in PERM_DENY_WORDS:
+                    result = {"behavior": "deny", "message": "用户在飞书上拒绝了本次操作"}
+                else:
+                    result = {"behavior": "deny", "message": f"用户回复：{val}"}
+            else:
+                result = {"behavior": "deny", "message": "⏰ 等待确认超时，已按拒绝处理"}
+                send_text(chat_id, f"⏰ 权限确认超时（{tool}），已按拒绝处理，"
+                                   f"可用 /mode 调整权限模式后重发。")
+        elif payload and payload.get("type") == "perm":
+            result = {"behavior": "deny", "message": "权限确认缺少聊天上下文"}
     except Exception as e:
-        send_text(chat_id, f"❌ 卡片发送异常：{e!r}")
+        print(f"[权限确认处理出错] {e!r}")
+        result = {"behavior": "deny", "message": "权限确认处理内部错误"}
+    finally:
+        try:
+            conn.sendall((json.dumps(result, ensure_ascii=False) + "\n").encode("utf-8"))
+        except OSError:
+            pass
+        try:
+            conn.close()
+        except OSError:
+            pass
 
 
 # ---------------- Claude 执行 ----------------
@@ -432,13 +676,22 @@ def _run_claude(chat_id: str, prompt: str, slot: dict, ack: bool = True) -> None
     cmd = [CLAUDE_PATH, "-p", "--output-format", "stream-json", "--verbose"]
     if PERMISSION_MODE:
         cmd += ["--permission-mode", PERMISSION_MODE]
+    # 权限确认走飞书卡片：claude 遇到权限提示时调用 MCP 工具
+    # （perm_mcp.py → 本地 socket → 卡片/文字回复）。bypassPermissions 不会产生提示，跳过。
+    if PERMISSION_MODE != "bypassPermissions":
+        mcp_config = {"mcpServers": {"feishu": {
+            "command": sys.executable, "args": [str(BASE_DIR / "perm_mcp.py")]}}}
+        cmd += ["--permission-prompt-tool", "mcp__feishu__request_permission",
+                "--mcp-config", json.dumps(mcp_config, separators=(",", ":"))]
     if CLAUDE_EXTRA_ARGS:
         cmd += shlex.split(CLAUDE_EXTRA_ARGS)
     if session_id:
         cmd += ["--resume", session_id]
 
     # FEISHU_BOT_CHILD=1：让 notify.py 跳过机器人自己的 claude 子进程，避免重复通知
-    child_env = {**os.environ, "FEISHU_BOT_CHILD": "1"}
+    # FEISHU_CHAT_ID/FEISHU_PERM_PORT：perm_mcp.py 借此路由卡片和连回本进程
+    child_env = {**os.environ, "FEISHU_BOT_CHILD": "1",
+                 "FEISHU_CHAT_ID": chat_id, "FEISHU_PERM_PORT": str(PERM_PORT)}
     try:
         proc = subprocess.Popen(
             cmd,
@@ -506,6 +759,7 @@ def _run_claude(chat_id: str, prompt: str, slot: dict, ack: bool = True) -> None
         if timer:
             timer.cancel()
     returncode = proc.wait()
+    _cancel_perm_choice(chat_id)   # claude 已退出（跑完/被停），挂着的权限确认不再等
     t_err.join(timeout=2)
     tail = "".join(stderr_buf[-12:]).strip()
 
@@ -890,27 +1144,14 @@ def handle_command(chat_id: str, text: str) -> None:
         if cur == sid:
             send_text(chat_id, f"✅ 这就是本聊天当前的会话（{sid[:8]}…），直接发消息即可。")
             return
-        # 活跃检测：回合还在跑 → 排队接管（先绑定，消息等回合结束自动执行）
+        # 活跃检测：回合还在跑 → 发卡片选 排队/强制/取消（60 秒无响应默认排队）
         session_file, _ = _find_session_file(sid)
         if session_file and not force:
             state, age = _session_state(session_file)
             if state == "running":
-                _bind_session(chat_id, sid, cwd)
-                with _pending_lock:
-                    cur = _pending.get(chat_id)
-                    if cur and cur.get("sid") == sid:
-                        already = True   # 重复接管同一会话：保留已排队的消息
-                    else:
-                        _pending[chat_id] = {"sid": sid, "file": session_file,
-                                             "queue": [], "started": time.time()}
-                        already = False
-                if not already:
-                    threading.Thread(target=_wait_and_drain, args=(chat_id,), daemon=True).start()
-                send_text(chat_id,
-                          f"⏳ 会话 {sid[:8]}… 正在跑（{int(age)} 秒前仍在写入），已进入排队接管：\n"
-                          "· 现在发的消息会排队，等它回合结束自动依次执行\n"
-                          "· /peek 看它当前进度，/unqueue 取消排队（保留绑定）\n"
-                          "· 等待上限 30 分钟，超时自动放弃")
+                threading.Thread(target=_takeover_running_dialog,
+                                 args=(chat_id, sid, cwd, session_file, age),
+                                 daemon=True).start()
                 return
         _bind_session(chat_id, sid, cwd)
         send_text(chat_id,
@@ -1000,6 +1241,21 @@ def handle_command(chat_id: str, text: str) -> None:
         send_text(chat_id, "\n".join(lines))
     elif cmd == "/panel":
         send_panel(chat_id)
+    elif cmd == "/listen":
+        if _chat_types.get(chat_id) != "group":
+            send_text(chat_id, "单聊本来就无需 @，这个设置只对群聊有意义。")
+            return
+        if chat_id in _listen:
+            with _listen_lock:
+                _listen.discard(chat_id)
+            save_listen()
+            send_text(chat_id, "↩️ 已关闭：本群恢复需要 @机器人 才响应。")
+        else:
+            with _listen_lock:
+                _listen.add(chat_id)
+            save_listen()
+            send_text(chat_id, "✅ 已开启：本群所有消息都直接发给机器人（无需 @）。\n"
+                               "适合只有你+机器人的群；人多的大群建议保持 @ 触发。")
     elif cmd == "/sessions":
         try:
             n = max(2, min(20, int(arg))) if arg else 8
@@ -1107,11 +1363,14 @@ def on_message(event: P2ImMessageReceiveV1) -> None:
         except json.JSONDecodeError:
             return
 
-        # 群聊：必须 @机器人（任意 @ 即触发，白名单负责拦截外人），并去掉 @ 占位符
+        # 群聊：默认需 @机器人（白名单负责拦截外人）；/listen 开启的群免 @ 全量接收
+        _chat_types[chat_id] = msg.chat_type
         if msg.chat_type == "group":
-            if not msg.mentions:
+            with _listen_lock:
+                listen = chat_id in _listen
+            if not (msg.mentions or listen):
                 return
-            for m in msg.mentions:
+            for m in msg.mentions or []:
                 text = text.replace(m.key or "", "")
             text = text.strip()
             if not text:
@@ -1148,6 +1407,17 @@ def dispatch_text(chat_id: str, text: str, sender_id: str = "") -> None:
     if text.startswith("!") and text[1:].strip():
         shell_cmd = text[1:].strip()
         threading.Thread(target=shell_task, args=(chat_id, shell_cmd), daemon=True).start()
+        return
+
+    # 有待决策卡片（权限确认/接管选择）：纯文字 = 自定义回复（命令和 ! 前缀不受影响）
+    routed = False
+    with _choices_lock:
+        entry = _choices.get(chat_id)
+        if entry is not None and entry["answer"] is None:
+            entry["answer"] = ("text", text)
+            entry["event"].set()
+            routed = True
+    if routed:
         return
 
     # 排队接管中：消息入队，等目标会话回合结束后由 _wait_and_drain 自动执行
@@ -1203,7 +1473,14 @@ def on_card_action(event) -> object:
             return _card_toast("❌ 缺少聊天信息", "error")
         if ALLOWED_USERS and op not in ALLOWED_USERS:
             return _card_toast("🔒 你不在白名单内", "error")
-        idx = ((data.action.value or {}) if data.action else {}).get("i")
+        value = ((data.action.value or {}) if data.action else {}) or {}
+        req = value.get("ask")
+        if req:
+            label = _resolve_choice(chat_id, str(req), value.get("v"))
+            if label is None:
+                return _card_toast("❌ 该问题已回答或已过期", "error")
+            return _card_toast(f"✅ 已选择：{label}")
+        idx = value.get("i")
         if idx is None or not str(idx).isdigit() or int(idx) >= len(_commands):
             return _card_toast("❌ 该命令已删除，重新发 /panel 获取新面板", "error")
         text = _commands[int(idx)].get("text", "")
@@ -1242,6 +1519,8 @@ def main() -> None:
     print(f"   工作目录：{WORK_DIR}")
     print(f"   权限模式：{PERMISSION_MODE or 'default'}｜超时：{CLAUDE_TIMEOUT if CLAUDE_TIMEOUT > 0 else '不限时'}｜转发工具调用：{'开' if FORWARD_TOOLS else '关'}")
     print(f"   白名单：{len(ALLOWED_USERS)} 人" + ("" if ALLOWED_USERS else "（未配置，首条消息会提示如何配置）"))
+    # 权限确认通道：perm_mcp.py（claude 的 MCP 权限回调）连回本进程
+    threading.Thread(target=_perm_server, daemon=True).start()
     print("   等待消息中…（Ctrl+C 退出）")
     ws.start()  # 阻塞，断线自动重连
 
