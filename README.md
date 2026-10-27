@@ -1,7 +1,7 @@
 # 飞书 ↔ 本地 Claude Code 桥接器
 
 在飞书里给机器人发消息 → 本地 `claude` CLI 执行（多轮会话自动续接）→
-Claude 的回复和工具调用实时转发回飞书。**WebSocket 长连接模式，无需公网 IP。**
+回复以**流式卡片**实时回传（边生成边更新），工具调用实时转发。**WebSocket 长连接模式，无需公网 IP。**
 
 ## 一、前置条件
 
@@ -159,7 +159,8 @@ Claude Code 的会话存在 `~/.claude/projects/` 下的转录文件里，不绑
 | 会话失效 | 机器人会自动开新会话重试；`/cwd` 切目录会重置会话 |
 | 长任务被中断 | 默认不限时；若设过 `CLAUDE_TIMEOUT`，调大或设 0（不限时），挂死用 `/stop` 远程杀 |
 
-会话记录存在 `sessions.json`（可删除重置全部会话），会话名存在 `names.json`。
+本地状态文件（都在机器人目录，删掉即重置）：会话绑定 `sessions.json`、会话名 `names.json`、
+免 @ 群 `listen.json`、各聊天独立的权限模式 `modes.json` / 静默模式 `quiet.json`。
 
 ## 八、从 GitHub 拉取部署
 
