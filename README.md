@@ -75,7 +75,7 @@ uv run bot.py    # 启动机器人（保持窗口开着）
 | `/help` | 查看帮助 |
 | `/new` | 开启新会话（清除上下文） |
 | `/stop` | 中断正在执行的任务 |
-| `/status` | 查看任务状态 |
+| `/status` | 状态面板：机器人设置（权限/静默/免@）+ 会话绑定、工作目录、进程工作状态 |
 | `/session` | 查看会话 ID（在本机 `claude --resume <id>` 可接续） |
 | `/sessions [条数]` | 列出电脑上最近的会话（含当前绑定的；默认 8 条，`/sessions 15` 可看更多） |
 | `/takeover [序号\|ID\|latest]` | 接管电脑上的会话，带上全部上下文（正在跑的发卡片选：排队/强制/取消；加 `!` 跳过选择直接强制） |
@@ -86,7 +86,7 @@ uv run bot.py    # 启动机器人（保持窗口开着）
 | `/panel` | 发送快捷命令按钮卡片，点按钮即发送对应消息 |
 | `/rename [名字]` | 给当前会话起名，`/sessions` 列表优先显示 |
 | `/cwd [路径]` | 查看/切换 Claude 的工作目录 |
-| `/mode [模式]` | 查看/切换权限模式（`manual` `auto` `acceptEdits` `plan` `bypassPermissions`，下一条消息生效） |
+| `/mode [模式]` | 查看/切换权限模式（`manual` `auto` `acceptEdits` `plan` `bypassPermissions`，下一条消息生效；驻留进程会自动用新模式重建） |
 | `/listen` | 群聊免 @ 模式：本群所有消息直接发给机器人（适合只有你+机器人的群） |
 | `/mute` · `/unmute` | 手动暂停/恢复桌面事件推送 |
 | `/quiet` · `/unquiet` | 静默模式：不转发思考/工具过程，只推权限确认卡片和最终结果 |

@@ -71,7 +71,7 @@ HELP_TEXT = """📖 命令列表
 /help — 查看本帮助
 /new — 开启新会话（清除历史上下文）
 /stop — 中断当前任务（排队的消息一并取消）
-/status — 查看当前任务与排队状态
+/status — 状态面板：机器人设置（权限/静默/免@）+ 会话绑定与进程工作状态
 /session — 查看当前会话 ID（在电脑上 claude --resume <id> 可接续）
 /sessions [条数] — 列出电脑上最近的会话（含当前绑定的）
 /takeover [序号|会话ID|latest] — 接管电脑上的会话（在跑的发卡片选：排队/强制/取消）
@@ -732,9 +732,15 @@ def run_task(chat_id: str, prompt: str) -> None:
     新起一个，绑定会话自动 --resume 续接。互斥键是会话（_task_key）：
     同一会话被另一聊天占用时拒绝，不同会话互不阻塞。
     """
-    key = _task_key(chat_id)
     with _running_lock:
+        # key 在锁内算（init 绑定与键迁移都在锁内完成，避免拿到半程状态重复起进程）
+        key = _task_key(chat_id)
         slot = _running.get(key)
+        if slot is None and key != chat_id:
+            # 兜底：init 刚绑定会话、slot 还没从 chat_id 键迁移到会话键的窗口期
+            cand = _running.get(chat_id)
+            if cand is not None and cand.get("chat_id") == chat_id and cand.get("sid") == key:
+                slot = cand
         if slot is not None:
             if slot.get("chat_id") != chat_id:
                 send_text(chat_id, f"⚠️ 会话 {key[:8]}… 正在被另一个聊天使用，"
@@ -747,7 +753,8 @@ def run_task(chat_id: str, prompt: str) -> None:
         # 没有活进程：在锁内完成 起进程+首条消息写入，保证消息次序不乱
         slot = {"chat_id": chat_id, "proc": None, "started": time.time(), "reason": None,
                 "wlock": threading.Lock(), "last_event": time.time(),
-                "turn_start": time.time(), "in_turn": False, "sid": _lookup_session(chat_id)}
+                "turn_start": time.time(), "in_turn": False, "sid": _lookup_session(chat_id),
+                "mode": PERMISSION_MODE}   # 起进程时用的权限模式（/mode 切换后检测重建用）
         try:
             proc = _spawn_claude(chat_id, slot["sid"])
         except FileNotFoundError:
@@ -828,6 +835,13 @@ def _session_reader(chat_id: str, key: str, slot: dict) -> None:
                     slot["sid"] = sid
                     # 绑定会话：下一条消息（若进程已回收）自动 --resume 续接
                     _bind_session(chat_id, sid, str(_chat_work_dir(chat_id)))
+                    # 首次会话的 slot 原先用 chat_id 作键：迁移到会话键，
+                    # 后续 _task_key(chat_id) 才能命中（否则会重复起进程）
+                    with _running_lock:
+                        for k, s in list(_running.items()):
+                            if s is slot and k != sid:
+                                del _running[k]
+                        _running.setdefault(sid, slot)
             elif etype == "assistant":
                 for block in (evt.get("message") or {}).get("content") or []:
                     btype = block.get("type")
@@ -849,8 +863,10 @@ def _session_reader(chat_id: str, key: str, slot: dict) -> None:
     tail = "".join(stderr_buf[-12:]).strip()
     reason = slot.get("reason")
     with _running_lock:
-        if _running.get(key) is slot:
-            _running.pop(key, None)
+        # slot 可能登记在会话键下（init 后迁移过），两个键都查
+        for k in (key, slot.get("sid")):
+            if k and _running.get(k) is slot:
+                _running.pop(k, None)
     if reason == "stop":
         send_text(chat_id, "⛔ 已手动中断。")
     elif reason == "timeout":
@@ -894,6 +910,16 @@ def _finish_turn(chat_id: str, result: dict, last_text: str, slot: dict) -> None
                            "如需放开：发 /mode bypassPermissions（机器人级设置，注意风险），"
                            "或把具体命令加进 Claude 设置的 allow 列表。")
 
+    # /mode 是机器人级设置，而驻留进程的模式在起进程时就固定了：模式变过的话
+    # 本回合结束后优雅退役（关 stdin），下一条消息用新模式重建
+    if slot.get("mode") and slot.get("mode") != PERMISSION_MODE:
+        try:
+            slot["reason"] = "recycle"
+            if slot.get("proc") and slot["proc"].poll() is None:
+                slot["proc"].stdin.close()
+        except (BrokenPipeError, OSError, ValueError):
+            pass
+
 
 def _session_watchdog(chat_id: str, key: str, slot: dict) -> None:
     """长驻进程看门狗：闲置太久优雅回收（关 stdin）；CLAUDE_TIMEOUT>0 时单回合超时强杀。"""
@@ -903,7 +929,7 @@ def _session_watchdog(chat_id: str, key: str, slot: dict) -> None:
         if proc is None or proc.poll() is not None:
             return  # 进程已退出，读泵负责收尾
         with _running_lock:
-            if _running.get(key) is not slot:
+            if not any(_running.get(k) is slot for k in (key, slot.get("sid"))):
                 return  # 该会话已换绑/重建
         now = time.time()
         if CLAUDE_TIMEOUT > 0 and slot.get("in_turn") \
@@ -1194,20 +1220,43 @@ def handle_command(chat_id: str, text: str) -> None:
             qn = len(_msg_queue.get(_task_key(chat_id)) or [])
         with _pending_lock:
             pend = _pending.get(chat_id)
+        with _listen_lock:
+            listening = chat_id in _listen
+        lines = [
+            "📊 状态",
+            "",
+            "⚙️ 机器人设置（所有聊天共用）",
+            f"· 权限模式：{_mode_label()}（/mode 切换，驻留进程会自动用新模式重建）",
+            "· 静默模式：" + ("开启——只推权限卡片/最终结果/异常（/unquiet 关闭）" if QUIET
+                             else "关闭（/quiet 开启：不刷思考/工具过程）"),
+            "· 桌面事件推送：" + ("已静音（/unmute 恢复）" if (BASE_DIR / "mute.flag").exists()
+                                else "正常（/mute 静音）"),
+        ]
+        if listening:
+            lines.append("· 群免 @：本群已开启（/listen 关闭）")
+        if CLAUDE_TIMEOUT > 0:
+            lines.append(f"· 单回合限时：{CLAUDE_TIMEOUT}s（超时强杀，/stop 随时中断）")
+        label = _chat_label(chat_id)
+        lines += ["", "🧠 本聊天的 Claude 会话",
+                  f"· 会话：{label[1:-1] if label else '未绑定（下一条消息开新会话）'}",
+                  f"· 工作目录：{_chat_work_dir(chat_id)}"]
+        cur_key = _task_key(chat_id)
         if slots:
-            msg = "⏳ 会话进程驻留中" + ("（多会话并行）" if len(slots) > 1 else "") + "：" + \
-                  "、".join(f"{k[:8]}… 最近活动 {int(time.time() - v.get('last_event', v['started']))}s 前"
-                            for k, v in slots) + \
-                  "\n（消息直达会话进程，无需排队；闲置 15 分钟自动回收；/stop 可中断）"
+            for k, v in slots:
+                who = "当前会话" if k == cur_key else f"{k[:8]}…"
+                idle_s = int(time.time() - v.get("last_event", v["started"]))
+                if v.get("in_turn"):
+                    lines.append(f"· 进程状态：🔴 {who} 工作中（最近活动 {idle_s}s 前；/stop 可中断）")
+                else:
+                    lines.append(f"· 进程状态：🟢 {who} 空闲驻留（{idle_s}s 无活动，"
+                                 f"{SESSION_IDLE_TIMEOUT // 60} 分钟后自动回收，消息直达进程）")
         else:
-            msg = "空闲中。"
+            lines.append("· 进程状态：⚪ 无驻留进程（发消息自动 --resume 续接上下文）")
         if qn:
-            msg += f"\n📥 排队中：{qn} 条消息"
+            lines.append(f"· 📥 排队中：{qn} 条消息（自动依次执行）")
         if pend:
-            msg += f"\n⏳ 等待会话 {pend['sid'][:8]}… 空闲（已排 {len(pend['queue'])} 条）"
-        if QUIET:
-            msg += "\n🔕 静默模式开启中（/unquiet 恢复实时转发）"
-        send_text(chat_id, msg)
+            lines.append(f"· ⏳ 排队接管：等会话 {pend['sid'][:8]}… 空闲（已积 {len(pend['queue'])} 条；/unqueue 取消）")
+        send_text(chat_id, "\n".join(lines))
     elif cmd == "/session":
         sess = _sessions.get(chat_id) or {}
         sid = sess.get("session_id")
@@ -1446,9 +1495,22 @@ def handle_command(chat_id: str, text: str) -> None:
                                "对下一条消息生效（机器人级设置，对所有聊天生效）。")
         elif arg in PERMISSION_MODES:
             PERMISSION_MODE = arg
+            # 驻留进程的模式在起进程时就固定：空闲的旧模式进程立即退役
+            # （工作中的等本回合结束自动退役，见 _finish_turn），下条消息都用新模式重建
+            with _running_lock:
+                stale = [s for s in _running.values()
+                         if s.get("mode") != PERMISSION_MODE and not s.get("in_turn")]
+            for s in stale:
+                s["reason"] = "recycle"
+                try:
+                    if s.get("proc") and s["proc"].poll() is None:
+                        s["proc"].stdin.close()
+                except (BrokenPipeError, OSError, ValueError):
+                    pass
             warn = "\n⚠️ bypassPermissions = 白名单里的人可让 Claude 做任何事，风险自负。" \
                 if arg == "bypassPermissions" else ""
-            send_text(chat_id, f"✅ 权限模式已切换：{arg}（下一条消息生效）{warn}")
+            send_text(chat_id, f"✅ 权限模式已切换：{arg}（下一条消息生效；正在执行的任务"
+                               "会在本回合结束后用新模式重建）{warn}")
         else:
             send_text(chat_id, f"❌ 无效模式 {arg}\n可选：{' | '.join(sorted(PERMISSION_MODES))}")
     else:
