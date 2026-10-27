@@ -2,6 +2,7 @@
 .env
 sessions.json
 names.json
+commands.json
 notify_target.json
 notify.log
 mute.flag

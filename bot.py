@@ -65,6 +65,7 @@ HELP_TEXT = """📖 命令列表
 /peek [序号|会话ID|latest] — 旁观会话当前进度（正在干什么、最新输出）
 /unqueue — 清空排队（消息队列 / 排队接管）
 /rename [名字] — 给当前会话起名（/sessions 列表优先显示名字）
+/addcmd 标签 消息 · /delcmd 序号 · /cmds · /panel — 快捷命令按钮面板
 /cwd [路径] — 查看 / 切换 Claude 的工作目录
 /mode [模式] — 查看 / 切换权限模式（manual、auto、acceptEdits…）
 /mute · /unmute — 暂停/恢复桌面事件推送
@@ -107,6 +108,26 @@ def save_names() -> None:
         except OSError:
             pass
 
+# ---------------- 快捷命令（卡片按钮面板，/addcmd 维护） ----------------
+COMMANDS_FILE = BASE_DIR / "commands.json"
+_commands_lock = threading.Lock()
+_commands: list = []
+if COMMANDS_FILE.exists():
+    try:
+        _commands = json.loads(COMMANDS_FILE.read_text("utf-8"))
+        if not isinstance(_commands, list):
+            _commands = []
+    except Exception:
+        _commands = []
+
+
+def save_commands() -> None:
+    with _commands_lock:
+        try:
+            COMMANDS_FILE.write_text(json.dumps(_commands, ensure_ascii=False, indent=1), "utf-8")
+        except OSError:
+            pass
+
 
 def save_sessions() -> None:
     with _sessions_lock:
@@ -141,13 +162,26 @@ def _chat_label(chat_id: str) -> str:
     return f"[{proj}·{tag}]"
 
 
-# ---------------- 运行中的任务（chat_id -> {"proc","started","reason"}） ----------------
+def _mode_label() -> str:
+    """当前权限模式的简短标识（bypass 加警示）。"""
+    m = PERMISSION_MODE or "default"
+    return f"⚠️{m}" if m == "bypassPermissions" else m
+
+
+# ---------------- 运行中的任务（键=会话ID或chat_id -> {"chat_id","proc","started","reason"}） ----------------
+# 互斥/排队的粒度是「会话」：不同会话的任务互不阻塞（哪怕同一聊天先后 /takeover
+# 切换）；同一会话同时只跑一个——两个聊天绑同一会话时后到的直接拒绝（防交错写）。
 _running_lock = threading.Lock()
 _running: dict = {}
 
-# ---------------- 消息排队（任务忙时新消息入队，当前任务跑完自动依次执行） ----------------
+# ---------------- 消息排队（任务忙时新消息入队，当前任务跑完自动依次执行；键同上） ----------------
 _msg_queue_lock = threading.Lock()
-_msg_queue: dict = {}   # chat_id -> [str]
+_msg_queue: dict = {}   # 会话键 -> [str]
+
+
+def _task_key(chat_id: str) -> str:
+    """任务互斥键：聊天绑定了会话用会话 ID，否则用聊天自身（新会话彼此独立）。"""
+    return (_sessions.get(chat_id) or {}).get("session_id") or chat_id
 
 # ---------------- 排队接管（会话在电脑上跑着时先绑定，消息排队等回合结束自动执行） ----------------
 _pending_lock = threading.Lock()
@@ -251,6 +285,48 @@ def send_text(chat_id: str, text: str) -> None:
                 print(f"[发消息异常] {e!r}")
 
 
+def send_panel(chat_id: str) -> None:
+    """发送快捷命令卡片：每条命令一个按钮，点击即发送对应消息（卡片回传交互）。"""
+    if not _commands:
+        send_text(chat_id, "还没有快捷命令。用法：/addcmd 标签 消息内容\n"
+                           "例：/addcmd 状态 /status\n添加后发 /panel 生成按钮面板。")
+        return
+    rows, row = [], []
+    for i, c in enumerate(_commands):
+        row.append({
+            "tag": "button",
+            "text": {"tag": "plain_text", "content": c.get("label", "?")},
+            "type": "default",
+            "value": {"i": str(i)},
+        })
+        if len(row) == 3:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    card = {
+        "config": {"wide_screen_mode": True},
+        "header": {"template": "blue",
+                   "title": {"tag": "plain_text", "content": "⚡ 快捷命令"}},
+        "elements": [{"tag": "action", "actions": r} for r in rows],
+    }
+    req = CreateMessageRequest.builder() \
+        .receive_id_type("chat_id") \
+        .request_body(
+            CreateMessageRequestBody.builder()
+            .receive_id(chat_id)
+            .msg_type("interactive")
+            .content(json.dumps(card, ensure_ascii=False))
+            .build()
+        ).build()
+    try:
+        resp = api.im.v1.message.create(req)
+        if not resp.success():
+            send_text(chat_id, f"❌ 卡片发送失败 code={resp.code}：{resp.msg}")
+    except Exception as e:
+        send_text(chat_id, f"❌ 卡片发送异常：{e!r}")
+
+
 # ---------------- Claude 执行 ----------------
 def _tool_summary(name: str, tool_input) -> str:
     """把工具调用入参压缩成一行摘要。"""
@@ -298,32 +374,39 @@ def run_task(chat_id: str, prompt: str) -> None:
     """任务入口：同一会话同时只跑一个；忙时新消息排队，跑完自动依次执行。
 
     像桌面终端的 Claude 一样：执行中发消息不会丢，当前回合思考完就轮到它。
+    互斥键是会话（见 _task_key）：不同会话互不阻塞。
     """
+    key = _task_key(chat_id)
     with _running_lock:
-        if chat_id in _running:
+        if key in _running:
+            holder = _running[key]
+            if holder.get("chat_id") != chat_id:
+                send_text(chat_id, f"⚠️ 会话 {key[:8]}… 正在被另一个聊天使用，"
+                                   "为避免上下文交错已拒绝。稍后重试。")
+                return
             with _msg_queue_lock:
-                q = _msg_queue.setdefault(chat_id, [])
+                q = _msg_queue.setdefault(key, [])
                 q.append(prompt)
                 n = len(q)
             send_text(chat_id, f"📥 已排队（第 {n} 条），当前任务完成后自动执行")
             return
-        slot = {"proc": None, "started": time.time(), "reason": None}
-        _running[chat_id] = slot
+        slot = {"chat_id": chat_id, "proc": None, "started": time.time(), "reason": None}
+        _running[key] = slot
     try:
         while True:
             _run_claude(chat_id, prompt, slot)
             if slot.get("reason") in ("stop", "timeout"):
                 # 被中断/超时：排队的消息一并取消——用户按停时预期是全停
                 with _msg_queue_lock:
-                    dropped = _msg_queue.pop(chat_id, [])
+                    dropped = _msg_queue.pop(key, [])
                 if dropped:
                     send_text(chat_id, f"🚫 排队的 {len(dropped)} 条消息已一并取消。")
                 return
             with _msg_queue_lock:
-                q = _msg_queue.get(chat_id)
+                q = _msg_queue.get(key)
                 prompt = q.pop(0) if q else None
                 if not q:
-                    _msg_queue.pop(chat_id, None)
+                    _msg_queue.pop(key, None)
             if prompt is None:
                 return
             slot["reason"] = None
@@ -333,7 +416,8 @@ def run_task(chat_id: str, prompt: str) -> None:
         send_text(chat_id, f"❌ 桥接器内部错误：{e!r}")
     finally:
         with _running_lock:
-            _running.pop(chat_id, None)
+            if _running.get(key) is slot:
+                _running.pop(key, None)
 
 
 def _run_claude(chat_id: str, prompt: str, slot: dict, ack: bool = True) -> None:
@@ -341,7 +425,7 @@ def _run_claude(chat_id: str, prompt: str, slot: dict, ack: bool = True) -> None
     session_id = _lookup_session(chat_id)
     if ack:
         label = _chat_label(chat_id)
-        tag = f"续接 {label}" if label else "新会话"
+        tag = f"续接 {label} · {_mode_label()}" if label else f"新会话 · {_mode_label()}"
         send_text(chat_id, f"🤖 收到（{tag}），开始执行…")
 
     # 注意：提示词通过 stdin 传入，避免经 .cmd 垫片时被 cmd.exe 解析特殊字符
@@ -470,7 +554,7 @@ def _finish(chat_id: str, result, returncode: int, tail: str, last_text: str, sl
     cost = result.get("total_cost_usd") or 0
     turns = result.get("num_turns", "?")
     label = _chat_label(chat_id)
-    line = f"✅ {label + ' ' if label else ''}完成 · 耗时 {dur:.1f}s · {turns} 轮对话"
+    line = f"✅ {label + ' ' if label else ''}完成（{_mode_label()}） · 耗时 {dur:.1f}s · {turns} 轮对话"
     if cost:
         line += f" · ${cost:.3f}"
     if result.get("is_error"):
@@ -722,25 +806,30 @@ def handle_command(chat_id: str, text: str) -> None:
             send_text(chat_id, f"↩️ 已取消排队接管（{len(had_pending['queue'])} 条消息被丢弃）。")
             return
         with _running_lock:
-            slot = _running.get(chat_id)
-        if slot and slot.get("proc"):
-            with _msg_queue_lock:
-                qn = len(_msg_queue.get(chat_id) or [])
-            slot["reason"] = "stop"
-            kill_task(slot["proc"])
-            extra = f"，排队的 {qn} 条消息将一并取消" if qn else ""
+            slots = [(k, v) for k, v in _running.items() if v.get("chat_id") == chat_id]
+        if slots:
+            dropped_total = 0
+            for key, slot in slots:
+                slot["reason"] = "stop"
+                if slot.get("proc"):
+                    kill_task(slot["proc"])
+                with _msg_queue_lock:
+                    dropped_total += len(_msg_queue.pop(key, []))
+            extra = f"，排队的 {dropped_total} 条消息将一并取消" if dropped_total else ""
             send_text(chat_id, f"🛑 正在中断当前任务{extra}…")
         else:
             send_text(chat_id, "当前没有正在执行的任务。")
     elif cmd == "/status":
         with _running_lock:
-            slot = _running.get(chat_id)
+            slots = [(k, v) for k, v in _running.items() if v.get("chat_id") == chat_id]
         with _msg_queue_lock:
-            qn = len(_msg_queue.get(chat_id) or [])
+            qn = len(_msg_queue.get(_task_key(chat_id)) or [])
         with _pending_lock:
             pend = _pending.get(chat_id)
-        if slot:
-            msg = f"⏳ 任务执行中，已运行 {int(time.time() - slot['started'])}s（/stop 可中断）"
+        if slots:
+            msg = "⏳ 任务执行中" + ("（多会话并行）" if len(slots) > 1 else "") + "：" + \
+                  "、".join(f"会话 {k[:8]}… {int(time.time() - v['started'])}s" for k, v in slots) + \
+                  "\n（/stop 可全部中断）"
         else:
             msg = "空闲中。"
         if qn:
@@ -881,6 +970,36 @@ def handle_command(chat_id: str, text: str) -> None:
                                "。正在执行的任务不受影响（要中断用 /stop）。")
         else:
             send_text(chat_id, "当前没有排队中的消息。")
+    elif cmd == "/addcmd":
+        parts_arg = arg.split(None, 1)
+        if len(parts_arg) < 2 or not parts_arg[1].strip():
+            send_text(chat_id, "用法：/addcmd 按钮标签 消息内容\n"
+                               "例：/addcmd 状态 /status\n"
+                               "/addcmd 看进度 /peek latest\n"
+                               "/addcmd 测试 跑一下测试套件并汇总失败原因")
+            return
+        with _commands_lock:
+            _commands.append({"label": parts_arg[0][:12], "text": parts_arg[1].strip()[:500]})
+        save_commands()
+        send_text(chat_id, f"✅ 已添加「{parts_arg[0][:12]}」。发 /panel 生成按钮面板"
+                           "（面板是快照，加删命令后要重发 /panel）。")
+    elif cmd == "/delcmd":
+        if not arg.isdigit() or not (1 <= int(arg) <= len(_commands)):
+            send_text(chat_id, "用法：/delcmd 序号（用 /cmds 查看当前命令）")
+            return
+        with _commands_lock:
+            removed = _commands.pop(int(arg) - 1)
+        save_commands()
+        send_text(chat_id, f"✅ 已删除「{removed.get('label')}」。记得重发 /panel。")
+    elif cmd == "/cmds":
+        if not _commands:
+            send_text(chat_id, "还没有快捷命令（/addcmd 添加）。")
+            return
+        lines = ["⚡ 当前快捷命令："] + [
+            f"{i}. {c['label']} → {c['text'][:40]}" for i, c in enumerate(_commands, 1)]
+        send_text(chat_id, "\n".join(lines))
+    elif cmd == "/panel":
+        send_panel(chat_id)
     elif cmd == "/sessions":
         try:
             n = max(2, min(20, int(arg))) if arg else 8
@@ -983,15 +1102,6 @@ def on_message(event: P2ImMessageReceiveV1) -> None:
             send_text(chat_id, "🔒 你不在白名单（ALLOWED_USERS）内，无法使用该机器人。")
             return
 
-        # 记录通知目标：桌面 hook 的 notify.py 读它把提醒推到这个聊天（最后活跃的聊天优先）
-        try:
-            (BASE_DIR / "notify_target.json").write_text(
-                json.dumps({"chat_id": chat_id, "open_id": sender_id,
-                            "updated": datetime.now().isoformat(timespec="seconds")},
-                           ensure_ascii=False), "utf-8")
-        except OSError:
-            pass
-
         try:
             text = json.loads(msg.content or "{}").get("text", "")
         except json.JSONDecodeError:
@@ -1010,29 +1120,76 @@ def on_message(event: P2ImMessageReceiveV1) -> None:
         text = text.strip()
         if not text:
             return
-        if text.startswith("/"):
-            handle_command(chat_id, text)
-            return
-
-        # !command：直通 shell（相当于桌面终端的 bash 模式），不经 Claude、不排队
-        if text.startswith("!") and text[1:].strip():
-            shell_cmd = text[1:].strip()
-            threading.Thread(target=shell_task, args=(chat_id, shell_cmd), daemon=True).start()
-            return
-
-        # 排队接管中：消息入队，等目标会话回合结束后由 _wait_and_drain 自动执行
-        with _pending_lock:
-            pend = _pending.get(chat_id)
-            if pend is not None:
-                pend["queue"].append(text)
-                queued = len(pend["queue"])
-        if pend is not None:
-            send_text(chat_id, f"📥 已排队（第 {queued} 条），等会话回合结束自动执行。/peek 看进度，/unqueue 取消。")
-            return
-
-        threading.Thread(target=run_task, args=(chat_id, text), daemon=True).start()
+        dispatch_text(chat_id, text)
     except Exception as e:
         print(f"[处理消息出错] {e!r}")
+
+
+def dispatch_text(chat_id: str, text: str, sender_id: str = "") -> None:
+    """统一文本分发（消息与卡片按钮共用）：命令 / !shell / 排队接管 / Claude 任务。
+
+    调用方负责白名单校验；按钮回调与 on_message 都走这里。
+    """
+    # 记录通知目标：桌面 hook 的 notify.py 读它把提醒推到这个聊天（最后活跃的聊天优先）
+    if sender_id:
+        try:
+            (BASE_DIR / "notify_target.json").write_text(
+                json.dumps({"chat_id": chat_id, "open_id": sender_id,
+                            "updated": datetime.now().isoformat(timespec="seconds")},
+                           ensure_ascii=False), "utf-8")
+        except OSError:
+            pass
+
+    if text.startswith("/"):
+        handle_command(chat_id, text)
+        return
+
+    # !command：直通 shell（相当于桌面终端的 bash 模式），不经 Claude、不排队
+    if text.startswith("!") and text[1:].strip():
+        shell_cmd = text[1:].strip()
+        threading.Thread(target=shell_task, args=(chat_id, shell_cmd), daemon=True).start()
+        return
+
+    # 排队接管中：消息入队，等目标会话回合结束后由 _wait_and_drain 自动执行
+    with _pending_lock:
+        pend = _pending.get(chat_id)
+        if pend is not None:
+            pend["queue"].append(text)
+            queued = len(pend["queue"])
+    if pend is not None:
+        send_text(chat_id, f"📥 已排队（第 {queued} 条），等会话回合结束自动执行。/peek 看进度，/unqueue 取消。")
+        return
+
+    threading.Thread(target=run_task, args=(chat_id, text), daemon=True).start()
+
+
+def _card_toast(content: str, type_: str = "success") -> "P2CardActionTriggerResponse":
+    from lark_oapi.event.callback.model.p2_card_action_trigger import P2CardActionTriggerResponse
+    return P2CardActionTriggerResponse({"toast": {"type": type_, "content": content}})
+
+
+def on_card_action(event) -> object:
+    """卡片按钮回调：点击快捷命令面板上的按钮 = 发送对应消息。"""
+    try:
+        data = event.event
+        if data is None or data.context is None:
+            return _card_toast("❌ 事件数据不完整", "error")
+        chat_id = data.context.open_chat_id or ""
+        op = data.operator.open_id if data.operator else ""
+        if not chat_id:
+            return _card_toast("❌ 缺少聊天信息", "error")
+        if ALLOWED_USERS and op not in ALLOWED_USERS:
+            return _card_toast("🔒 你不在白名单内", "error")
+        idx = ((data.action.value or {}) if data.action else {}).get("i")
+        if idx is None or not str(idx).isdigit() or int(idx) >= len(_commands):
+            return _card_toast("❌ 该命令已删除，重新发 /panel 获取新面板", "error")
+        text = _commands[int(idx)].get("text", "")
+        if not text:
+            return _card_toast("❌ 空命令", "error")
+        threading.Thread(target=dispatch_text, args=(chat_id, text, op), daemon=True).start()
+        return _card_toast(f"✅ 已发送：{text[:30]}")
+    except Exception as e:
+        return _card_toast(f"❌ {e!r}", "error")
 
 
 def main() -> None:
@@ -1048,6 +1205,7 @@ def main() -> None:
 
     handler = lark.EventDispatcherHandler.builder("", "") \
         .register_p2_im_message_receive_v1(on_message) \
+        .register_p2_card_action_trigger(on_card_action) \
         .build()
 
     ws = lark.ws.Client(APP_ID, APP_SECRET,
