@@ -9,6 +9,7 @@ notify.log
 mute.flag
 quiet.json
 modes.json
+bot.log
 
 # Python
 .venv/

@@ -387,6 +387,21 @@ def kill_task(proc: subprocess.Popen) -> None:
         pass
 
 
+# ---------------- 运行日志（打印 + 落盘 bot.log，机器人窗口看不到时远程排障用） ----------------
+LOG_FILE = BASE_DIR / "bot.log"
+
+
+def log(msg: str) -> None:
+    """关键路径日志：控制台打印之外追加到 bot.log（带时间戳，UTF-8）。"""
+    line = f"{datetime.now().strftime('%m-%d %H:%M:%S')} {msg}"
+    print(line)
+    try:
+        with LOG_FILE.open("a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except OSError:
+        pass
+
+
 # ---------------- 发送消息 ----------------
 _send_lock = threading.Lock()
 _last_send = 0.0
@@ -434,9 +449,9 @@ def send_text(chat_id: str, text: str) -> None:
             try:
                 resp = api.im.v1.message.create(req)
                 if not resp.success():
-                    print(f"[发消息失败] code={resp.code} msg={resp.msg}")
+                    log(f"[发消息失败] code={resp.code} msg={resp.msg}")
             except Exception as e:
-                print(f"[发消息异常] {e!r}")
+                log(f"[发消息异常] {e!r}")
 
 
 def _send_card(chat_id: str, card: dict):
@@ -453,11 +468,11 @@ def _send_card(chat_id: str, card: dict):
     try:
         resp = api.im.v1.message.create(req)
         if not resp.success():
-            print(f"[发卡片失败] code={resp.code} msg={resp.msg}")
+            log(f"[发卡片失败] code={resp.code} msg={resp.msg}")
             return None
         return resp.data.message_id if resp.data else None
     except Exception as e:
-        print(f"[发卡片异常] {e!r}")
+        log(f"[发卡片异常] {e!r}")
         return None
 
 
@@ -495,10 +510,10 @@ class _LiveReply:
                 .build()
             resp = api.im.v1.message.patch(req)
             if not resp.success():
-                print(f"[流式卡片更新失败] code={resp.code} msg={resp.msg}")
+                log(f"[流式卡片更新失败] code={resp.code} msg={resp.msg}")
                 self.ok = False
         except Exception as e:
-            print(f"[流式卡片更新异常] {e!r}")
+            log(f"[流式卡片更新异常] {e!r}")
             self.ok = False
         self._last_patch = time.time()
 
@@ -624,9 +639,9 @@ def _freeze_choice_card(msg_id, card: dict, answer) -> None:
             .build()
         resp = api.im.v1.message.patch(req)
         if not resp.success():
-            print(f"[卡片定格失败] code={resp.code} msg={resp.msg}")
+            log(f"[卡片定格失败] msg_id={msg_id} code={resp.code} msg={resp.msg}")
     except Exception as e:
-        print(f"[卡片定格异常] {e!r}")
+        log(f"[卡片定格异常] msg_id={msg_id} {e!r}")
 
 
 def _ask_choice(chat_id: str, title: str, body_md: str, options: list,
@@ -675,6 +690,8 @@ def _ask_choice(chat_id: str, title: str, body_md: str, options: list,
         if _choices.get(chat_id) is entry:
             _choices.pop(chat_id, None)
     answer = entry["answer"] if entry["answer"] is not None else ("timeout", None)
+    log(f"[决策] ask={req_id[-8:]} kind={answer[0]} val={str(answer[1])[:40]} "
+        f"→ 定格卡片 msg_id={msg_id}")
     _freeze_choice_card(msg_id, card, answer)
     return answer
 
@@ -725,10 +742,10 @@ def _perm_server() -> None:
     try:
         srv.bind(("127.0.0.1", PERM_PORT))
     except OSError as e:
-        print(f"[权限通道] 端口 {PERM_PORT} 绑定失败：{e!r}（权限确认将自动拒绝，其余功能不受影响）")
+        log(f"[权限通道] 端口 {PERM_PORT} 绑定失败：{e!r}（权限确认将自动拒绝，其余功能不受影响）")
         return
     srv.listen(8)
-    print(f"[权限通道] 127.0.0.1:{PERM_PORT} 已监听")
+    log(f"[权限通道] 127.0.0.1:{PERM_PORT} 已监听")
     while True:
         try:
             conn, _ = srv.accept()
@@ -780,7 +797,7 @@ def _perm_conn(conn) -> None:
         elif payload and payload.get("type") == "perm":
             result = {"behavior": "deny", "message": "权限确认缺少聊天上下文"}
     except Exception as e:
-        print(f"[权限确认处理出错] {e!r}")
+        log(f"[权限确认处理出错] {e!r}")
         result = {"behavior": "deny", "message": "权限确认处理内部错误"}
     finally:
         try:
@@ -933,7 +950,7 @@ def _spawn_claude(chat_id: str, session_id):
     cmd = [CLAUDE_PATH, "-p", "--input-format", "stream-json",
            "--output-format", "stream-json", "--verbose", "--include-partial-messages"]
     mode = _chat_mode(chat_id)
-    if mode:
+    if mode and mode != "default":   # CLI 的 --permission-mode 不收 "default"，省略即默认
         cmd += ["--permission-mode", mode]
     # 权限确认走飞书卡片：claude 遇到权限提示时调用 MCP 工具
     # （perm_mcp.py → 本地 socket → 卡片/文字回复）。bypassPermissions 不会产生提示，跳过。
@@ -1035,7 +1052,7 @@ def _session_reader(chat_id: str, key: str, slot: dict) -> None:
                 _finish_turn(chat_id, evt, last_sent, slot)
                 last_sent = ""
     except Exception as e:
-        print(f"[会话读泵异常] {e!r}")
+        log(f"[会话读泵异常] {e!r}")
     returncode = proc.wait()
     if live is not None:   # 进程退出仍有未收尾卡片：用已积累内容定格，不丢
         live.close()
@@ -1853,6 +1870,7 @@ def on_card_action(event) -> object:
         value = ((data.action.value or {}) if data.action else {}) or {}
         req = value.get("ask")
         if req:
+            log(f"[卡片动作] 收到选项点击 chat={chat_id[-6:]} ask={str(req)[-8:]} v={value.get('v')}")
             label = _resolve_choice(chat_id, str(req), value.get("v"))
             if label is None:
                 return _card_toast("❌ 该问题已回答或已过期", "error")
