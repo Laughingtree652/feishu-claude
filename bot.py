@@ -5,7 +5,8 @@
 飞书发消息给机器人 → 调用本地 claude CLI（多轮会话自动续接）→
 Claude 的回复与工具调用实时转发回飞书，实现远程操控。
 
-可用命令：/help /new /stop /status /session /sessions /takeover /cwd /mode /mute /unmute
+可用命令：/help /new /exit /stop /status /session /sessions /takeover /cwd /mode /mute /unmute
+（会话独占：同一会话只归一个聊天，后接管者优先，被挤掉的聊天会收到通知）
 """
 import json
 import os
@@ -71,6 +72,7 @@ HELP_TEXT = """📖 命令列表
 /session — 查看当前会话 ID（在电脑上 claude --resume <id> 可接续）
 /sessions [条数] — 列出电脑上最近的会话（含当前绑定的）
 /takeover [序号|会话ID|latest] — 接管电脑上的会话（在跑的发卡片选：排队/强制/取消）
+/exit — 退出当前接管的会话（解绑+回收驻留进程；历史保留，可再 /takeover）
 /peek [序号|会话ID|latest] — 旁观会话当前进度（正在干什么、最新输出）
 /unqueue — 取消排队接管
 /rename [名字] — 给当前会话起名（/sessions 列表优先显示名字）
@@ -270,20 +272,39 @@ _pending: dict = {}        # chat_id -> {"sid","file","queue":[str],"started":fl
 PENDING_TIMEOUT = 1800     # 排队等待上限（秒）
 
 
-def _bind_session(chat_id: str, sid: str, cwd) -> None:
+def _bind_session(chat_id: str, sid: str, cwd) -> list:
     """把会话绑定到聊天。工作目录跟随会话所在项目，但只固化进本聊天的绑定，
-    不动全局 WORK_DIR——否则 A 聊天接管会破坏 B 聊天的会话续接。"""
+    不动全局 WORK_DIR——否则 A 聊天接管会破坏 B 聊天的会话续接。
+
+    会话独占：同一会话同一时间只归一个聊天。绑定时若已被其他聊天占用，
+    所有权转移给本聊天（后接管者优先，否则「实际工作的永远是第一个聊天」）：
+    原聊天解绑、驻留进程让位并收到通知，避免两个聊天各起进程把同一会话
+    写成两条时间线。返回被挤掉的聊天列表（空=无冲突）。
+
+    注意：会调用 _recycle_chat_sessions（内部拿 _running_lock），不能在
+    持有 _running_lock 时调用本函数。
+    """
     if cwd and Path(cwd).is_dir():
         wd = str(Path(cwd).resolve())
     else:
         wd = str(WORK_DIR)
+    evicted = []
     with _sessions_lock:
+        for other, info in list(_sessions.items()):
+            if other != chat_id and (info or {}).get("session_id") == sid:
+                del _sessions[other]
+                evicted.append(other)
         _sessions[chat_id] = {
             "session_id": sid,
             "work_dir": wd,
             "updated": datetime.now().isoformat(timespec="seconds"),
         }
     save_sessions()
+    for other in evicted:
+        _recycle_chat_sessions(other, reason="takeover")
+        send_text(other, f"↪️ 会话 {sid[:8]}… 已被另一个聊天接管，本聊天已解绑"
+                         f"（历史保留，/takeover {sid[:8]} 可重新接管）。")
+    return evicted
 
 
 def _wait_and_drain(chat_id: str) -> None:
@@ -348,11 +369,12 @@ def _takeover_running_dialog(chat_id: str, sid: str, cwd, session_file, age: flo
         return
     if val == "force":
         _recycle_chat_sessions(chat_id)   # 换绑：旧会话的驻留进程让位
-        _bind_session(chat_id, sid, cwd)
+        evicted = _bind_session(chat_id, sid, cwd)
+        stolen = "\n📌 该会话此前绑定在另一个聊天，已转移过来（对方已收到通知）。" if evicted else ""
         send_text(chat_id,
                   f"✅ 已强制接管会话 {sid[:8]}…（目录：{_chat_work_dir(chat_id)}）\n"
                   "下一条消息将带上该会话的全部上下文。\n"
-                  "⚠️ 桌面那边若还开着，两边同时用会分叉，建议先退出桌面端。")
+                  "⚠️ 桌面那边若还开着，两边同时用会分叉，建议先退出桌面端。" + stolen)
         return
     # queue：绑定 + 排队接管（沿用 _wait_and_drain 轮询机制）
     _recycle_chat_sessions(chat_id)   # 换绑：旧会话的驻留进程让位
@@ -919,7 +941,8 @@ def run_task(chat_id: str, prompt: str) -> None:
         if slot is not None:
             if slot.get("chat_id") != chat_id:
                 send_text(chat_id, f"⚠️ 会话 {key[:8]}… 正在被另一个聊天使用，"
-                                   "为避免上下文交错已拒绝。稍后重试。")
+                                   f"已拒绝（避免两边各写一条时间线）。"
+                                   f"用 /takeover {key[:8]} 可把会话接管过来。")
                 return
             if _write_to_session(slot, prompt):
                 send_text(chat_id, "💬 已送达当前会话（正在执行的话会在工具间隙读取，"
@@ -1380,10 +1403,28 @@ def handle_command(chat_id: str, text: str) -> None:
         send_text(chat_id, HELP_TEXT)
     elif cmd == "/new":
         _recycle_chat_sessions(chat_id)   # 终结旧会话的驻留进程
+        with _pending_lock:   # 排队接管一并取消（否则队列线程稍后会发给新会话）
+            _pending.pop(chat_id, None)
         with _sessions_lock:
             _sessions.pop(chat_id, None)
         save_sessions()
         send_text(chat_id, "🆕 已开启新会话，下一条消息不带历史上下文。")
+    elif cmd == "/exit":
+        info = _sessions.get(chat_id)
+        if not info:
+            send_text(chat_id, "当前聊天没有绑定会话，无需退出（直接发消息会开新会话）。")
+            return
+        sid = info.get("session_id") or ""
+        _recycle_chat_sessions(chat_id, reason="exit")   # 回收本聊天的驻留进程
+        with _pending_lock:   # 排队接管一并取消
+            _pending.pop(chat_id, None)
+        with _sessions_lock:
+            _sessions.pop(chat_id, None)
+        save_sessions()
+        label = _names.get(sid) or f"{sid[:8]}…"
+        send_text(chat_id, f"🚪 已退出会话 {label}（驻留进程已回收，历史保留）。\n"
+                           f"· /takeover {sid[:8]} 可随时重新接管\n"
+                           "· 直接发消息则开启全新会话")
     elif cmd == "/stop":
         with _pending_lock:
             had_pending = _pending.pop(chat_id, None)
@@ -1512,11 +1553,12 @@ def handle_command(chat_id: str, text: str) -> None:
                                  daemon=True).start()
                 return
         _recycle_chat_sessions(chat_id)   # 换绑：旧会话的驻留进程让位
-        _bind_session(chat_id, sid, cwd)
+        evicted = _bind_session(chat_id, sid, cwd)
+        stolen = "\n📌 该会话此前绑定在另一个聊天，已转移过来（对方已收到通知）。" if evicted else ""
         send_text(chat_id,
                   f"✅ 已接管会话 {sid[:8]}…（目录：{_chat_work_dir(chat_id)}）\n"
                   "下一条消息将带上该会话的全部上下文。\n"
-                  "⚠️ 若桌面那边还开着，请先退出（避免两边同时写入）。")
+                  "⚠️ 若桌面那边还开着，请先退出（避免两边同时写入）。" + stolen)
     elif cmd == "/peek":
         want = arg.strip()
         sid = None
@@ -1903,6 +1945,30 @@ def main() -> None:
     if PERMISSION_MODE not in valid_modes:
         sys.exit(f"❌ CLAUDE_PERMISSION_MODE 无效：{PERMISSION_MODE}\n"
                  f"   可选值：{', '.join(sorted(PERMISSION_MODES))}")
+
+    # 启动自愈：清理旧版遗留的「同一会话绑多个聊天」脏状态（会话独占规则，
+    # 运行期由 _bind_session 的抢占维持）。保留 updated 最新的绑定，其余解绑并通知。
+    with _sessions_lock:
+        newest = {}   # sid -> (updated, chat_id)
+        for chat, info in _sessions.items():
+            sid = (info or {}).get("session_id")
+            if sid:
+                upd = (info or {}).get("updated") or ""
+                if sid not in newest or upd > newest[sid][0]:
+                    newest[sid] = (upd, chat)
+        evicted = [(chat, (info or {}).get("session_id"))
+                   for chat, info in _sessions.items()
+                   if (info or {}).get("session_id") in newest
+                   and newest[(info or {}).get("session_id")][1] != chat]
+        for chat, _sid in evicted:
+            del _sessions[chat]
+    if evicted:
+        save_sessions()
+        for chat, sid in evicted:
+            log(f"[启动自愈] 会话 {sid[:8]}… 重复绑定，保留最新，解绑 chat={chat[-6:]}")
+            send_text(chat, f"↪️ 启动检查：会话 {sid[:8]}… 此前同时绑定了多个聊天"
+                            "（会话独占规则），本聊天已解绑；"
+                            f"/takeover {sid[:8]} 可重新接管。")
 
     handler = lark.EventDispatcherHandler.builder("", "") \
         .register_p2_im_message_receive_v1(on_message) \
