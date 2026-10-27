@@ -43,7 +43,7 @@ APP_SECRET = os.environ["FEISHU_APP_SECRET"]
 
 WORK_DIR = Path(os.environ.get("WORK_DIR", str(BASE_DIR))).resolve()  # Claude 的工作目录
 ALLOWED_USERS = {u.strip() for u in os.environ.get("ALLOWED_USERS", "").split(",") if u.strip()}
-PERMISSION_MODE = os.environ.get("CLAUDE_PERMISSION_MODE", "acceptEdits").strip()
+PERMISSION_MODE = os.environ.get("CLAUDE_PERMISSION_MODE", "acceptEdits").strip()  # 全局默认权限模式（/mode 可按聊天覆盖）
 CLAUDE_TIMEOUT = int(os.environ.get("CLAUDE_TIMEOUT", "0"))   # 单次任务超时（秒），<=0 不限时
 FORWARD_TOOLS = os.environ.get("FORWARD_TOOLS", "1").strip().lower() not in ("0", "false", "no")
 CLAUDE_EXTRA_ARGS = os.environ.get("CLAUDE_EXTRA_ARGS", "").strip()
@@ -57,11 +57,6 @@ SHELL_TIMEOUT = 120  # 飞书 ! 命令直通 shell 的超时（秒）
 PERM_PORT = int(os.environ.get("FEISHU_PERM_PORT", "37921"))     # 与 perm_mcp.py 约定的本地端口
 PERM_TIMEOUT = int(os.environ.get("PERM_TIMEOUT_SECONDS", "0"))  # 等用户确认权限的上限（秒），0=不限时（与桌面终端一致）
 TAKEOVER_ASK_TIMEOUT = 60  # 接管运行中会话时等用户选卡片选项的上限（秒），超时默认排队
-
-# 静默模式（/quiet 切换，落盘 quiet.flag）：开着时不转发过程性输出（思考文本/🔧 工具调用），
-# 只推权限确认卡片、最终结果和异常——通知只出现在"需要你拍板"的时刻
-QUIET_FILE = BASE_DIR / "quiet.flag"
-QUIET = QUIET_FILE.exists()
 
 SESSION_FILE = BASE_DIR / "sessions.json"
 MAX_CHUNK = 3500      # 单条飞书消息最大字符数，超长自动分段
@@ -80,10 +75,10 @@ HELP_TEXT = """📖 命令列表
 /rename [名字] — 给当前会话起名（/sessions 列表优先显示名字）
 /addcmd 标签 消息 · /delcmd 序号 · /cmds · /panel — 快捷命令按钮面板
 /cwd [路径] — 查看 / 切换 Claude 的工作目录
-/mode [模式] — 查看 / 切换权限模式（manual、auto、acceptEdits…）
+/mode [模式] — 查看 / 切换本聊天的权限模式（manual、auto、acceptEdits…，未设置时用全局默认）
 /listen — 群聊免 @ 模式：本群所有消息直接发给机器人（适合只有你+机器人的群）
-/mute · /unmute — 暂停/恢复桌面事件推送
-/quiet · /unquiet — 静默模式：不刷思考/工具过程，只推最终结果和权限确认
+/mute · /unmute — 暂停/恢复桌面事件推送（全局）
+/quiet · /unquiet — 静默模式（本聊天）：不刷思考/工具过程，只推最终结果和权限确认
 
 直接发送文本 = 给 Claude 下指令，多轮对话自动保持上下文。
 任务执行中发的消息会直接递给 Claude（工具间隙读取，边跑边回应，和桌面终端一致）。
@@ -166,6 +161,53 @@ def save_listen() -> None:
             pass
 
 
+# ---------------- 静默模式 / 权限模式覆盖（/quiet /mode 维护，均按聊天独立落盘） ----------------
+# 静默模式：开着时本聊天不转发过程性输出（思考文本/🔧 工具调用），只推权限确认卡片、
+# 最终结果和异常——通知只出现在"需要你拍板"的时刻
+QUIET_FILE = BASE_DIR / "quiet.json"
+_quiet: set = set()
+if QUIET_FILE.exists():
+    try:
+        _quiet = set(json.loads(QUIET_FILE.read_text("utf-8")))
+    except Exception:
+        _quiet = set()
+elif (BASE_DIR / "quiet.flag").exists():
+    # 旧版全局静默开关迁移：对所有绑定过会话的聊天开启，并删除旧标记
+    _quiet = set(_sessions)
+    try:
+        QUIET_FILE.write_text(json.dumps(sorted(_quiet), ensure_ascii=False, indent=1), "utf-8")
+        (BASE_DIR / "quiet.flag").unlink()
+    except OSError:
+        pass
+
+MODES_FILE = BASE_DIR / "modes.json"
+_modes: dict = {}   # chat_id -> 权限模式（本聊天独立设置；未设置用全局默认 PERMISSION_MODE）
+if MODES_FILE.exists():
+    try:
+        _modes = json.loads(MODES_FILE.read_text("utf-8"))
+    except Exception:
+        _modes = {}
+
+
+def save_quiet() -> None:
+    try:
+        QUIET_FILE.write_text(json.dumps(sorted(_quiet), ensure_ascii=False, indent=1), "utf-8")
+    except OSError:
+        pass
+
+
+def save_modes() -> None:
+    try:
+        MODES_FILE.write_text(json.dumps(_modes, ensure_ascii=False, indent=1), "utf-8")
+    except OSError:
+        pass
+
+
+def _chat_mode(chat_id: str) -> str:
+    """本聊天生效的权限模式：聊天独立设置优先，否则全局默认。"""
+    return _modes.get(chat_id) or PERMISSION_MODE or "default"
+
+
 def save_sessions() -> None:
     with _sessions_lock:
         SESSION_FILE.write_text(json.dumps(_sessions, ensure_ascii=False, indent=1), "utf-8")
@@ -199,9 +241,9 @@ def _chat_label(chat_id: str) -> str:
     return f"[{proj}·{tag}]"
 
 
-def _mode_label() -> str:
-    """当前权限模式的简短标识（bypass 加警示）。"""
-    m = PERMISSION_MODE or "default"
+def _mode_label(chat_id: str) -> str:
+    """本聊天权限模式的简短标识（bypass 加警示）。"""
+    m = _chat_mode(chat_id)
     return f"⚠️{m}" if m == "bypassPermissions" else m
 
 
@@ -754,7 +796,7 @@ def run_task(chat_id: str, prompt: str) -> None:
         slot = {"chat_id": chat_id, "proc": None, "started": time.time(), "reason": None,
                 "wlock": threading.Lock(), "last_event": time.time(),
                 "turn_start": time.time(), "in_turn": False, "sid": _lookup_session(chat_id),
-                "mode": PERMISSION_MODE}   # 起进程时用的权限模式（/mode 切换后检测重建用）
+                "mode": _chat_mode(chat_id)}   # 起进程时用的权限模式（/mode 切换后检测重建用）
         try:
             proc = _spawn_claude(chat_id, slot["sid"])
         except FileNotFoundError:
@@ -767,7 +809,7 @@ def run_task(chat_id: str, prompt: str) -> None:
         _running[key] = slot
         _write_to_session(slot, prompt)
     label = _chat_label(chat_id)
-    tag = f"续接 {label} · {_mode_label()}" if label else f"新会话 · {_mode_label()}"
+    tag = f"续接 {label} · {_mode_label(chat_id)}" if label else f"新会话 · {_mode_label(chat_id)}"
     send_text(chat_id, f"🤖 收到（{tag}），开始执行…")
     threading.Thread(target=_session_reader, args=(chat_id, key, slot), daemon=True).start()
     threading.Thread(target=_session_watchdog, args=(chat_id, key, slot), daemon=True).start()
@@ -780,11 +822,12 @@ def _spawn_claude(chat_id: str, session_id):
     """
     cmd = [CLAUDE_PATH, "-p", "--input-format", "stream-json",
            "--output-format", "stream-json", "--verbose"]
-    if PERMISSION_MODE:
-        cmd += ["--permission-mode", PERMISSION_MODE]
+    mode = _chat_mode(chat_id)
+    if mode:
+        cmd += ["--permission-mode", mode]
     # 权限确认走飞书卡片：claude 遇到权限提示时调用 MCP 工具
     # （perm_mcp.py → 本地 socket → 卡片/文字回复）。bypassPermissions 不会产生提示，跳过。
-    if PERMISSION_MODE != "bypassPermissions":
+    if mode != "bypassPermissions":
         mcp_config = {"mcpServers": {"feishu": {
             "command": sys.executable, "args": [str(BASE_DIR / "perm_mcp.py")]}}}
         cmd += ["--permission-prompt-tool", "mcp__feishu__request_permission",
@@ -847,10 +890,10 @@ def _session_reader(chat_id: str, key: str, slot: dict) -> None:
                     btype = block.get("type")
                     if btype == "text" and (block.get("text") or "").strip():
                         # 静默模式不刷过程性文本：思考内容不打扰，最终结果由 result 事件兜底推送
-                        if not QUIET:
+                        if chat_id not in _quiet:
                             send_text(chat_id, block["text"].strip())
                             last_sent = block["text"].strip()
-                    elif btype == "tool_use" and FORWARD_TOOLS and not QUIET:
+                    elif btype == "tool_use" and FORWARD_TOOLS and chat_id not in _quiet:
                         send_text(chat_id, "🔧 " + _tool_summary(block.get("name", "?"), block.get("input")))
             elif etype == "result":
                 slot["in_turn"] = False
@@ -897,7 +940,7 @@ def _finish_turn(chat_id: str, result: dict, last_text: str, slot: dict) -> None
     cost = result.get("total_cost_usd") or 0
     turns = result.get("num_turns", "?")
     label = _chat_label(chat_id)
-    line = f"✅ {label + ' ' if label else ''}完成（{_mode_label()}） · 耗时 {dur:.1f}s · {turns} 轮对话"
+    line = f"✅ {label + ' ' if label else ''}完成（{_mode_label(chat_id)}） · 耗时 {dur:.1f}s · {turns} 轮对话"
     if cost:
         line += f" · ${cost:.3f}"
     if result.get("is_error"):
@@ -910,9 +953,9 @@ def _finish_turn(chat_id: str, result: dict, last_text: str, slot: dict) -> None
                            "如需放开：发 /mode bypassPermissions（机器人级设置，注意风险），"
                            "或把具体命令加进 Claude 设置的 allow 列表。")
 
-    # /mode 是机器人级设置，而驻留进程的模式在起进程时就固定了：模式变过的话
+    # /mode 按聊天独立设置，而驻留进程的模式在起进程时就固定了：本聊天的模式变过的话
     # 本回合结束后优雅退役（关 stdin），下一条消息用新模式重建
-    if slot.get("mode") and slot.get("mode") != PERMISSION_MODE:
+    if slot.get("mode") and slot.get("mode") != _chat_mode(chat_id):
         try:
             slot["reason"] = "recycle"
             if slot.get("proc") and slot["proc"].poll() is None:
@@ -1166,21 +1209,8 @@ def _session_tail(session_file: Path, n: int = 5):
 
 
 # ---------------- 命令处理 ----------------
-def _set_quiet(v: bool) -> None:
-    """切换静默模式（落盘 quiet.flag，重启后保持）。机器人级设置，对所有聊天生效。"""
-    global QUIET
-    QUIET = v
-    try:
-        if v:
-            QUIET_FILE.write_text(datetime.now().isoformat(timespec="seconds"), "utf-8")
-        else:
-            QUIET_FILE.unlink()
-    except OSError:
-        pass
-
-
 def handle_command(chat_id: str, text: str) -> None:
-    global WORK_DIR, PERMISSION_MODE
+    global WORK_DIR
     parts = text.split()
     cmd = parts[0].lower()
     arg = text[len(parts[0]):].strip()
@@ -1225,12 +1255,13 @@ def handle_command(chat_id: str, text: str) -> None:
         lines = [
             "📊 状态",
             "",
-            "⚙️ 机器人设置（所有聊天共用）",
-            f"· 权限模式：{_mode_label()}（/mode 切换，驻留进程会自动用新模式重建）",
-            "· 静默模式：" + ("开启——只推权限卡片/最终结果/异常（/unquiet 关闭）" if QUIET
+            "⚙️ 本聊天设置",
+            "· 权限模式：" + (f"{_mode_label(chat_id)}（本聊天独立，/mode 切换）" if chat_id in _modes
+                            else f"{_mode_label(chat_id)}（全局默认，/mode 可单独设置本聊天）"),
+            "· 静默模式：" + ("开启——只推权限卡片/最终结果/异常（/unquiet 关闭）" if chat_id in _quiet
                              else "关闭（/quiet 开启：不刷思考/工具过程）"),
-            "· 桌面事件推送：" + ("已静音（/unmute 恢复）" if (BASE_DIR / "mute.flag").exists()
-                                else "正常（/mute 静音）"),
+            "· 桌面事件推送：" + ("已静音" if (BASE_DIR / "mute.flag").exists() else "正常")
+                             + "（全局：桌面通知只有唯一目标聊天，/mute /unmute 切换）",
         ]
         if listening:
             lines.append("· 群免 @：本群已开启（/listen 关闭）")
@@ -1467,13 +1498,15 @@ def handle_command(chat_id: str, text: str) -> None:
             pass
         send_text(chat_id, "🔔 桌面事件推送已恢复。")
     elif cmd == "/quiet":
-        _set_quiet(True)
-        send_text(chat_id, "🔕 静默模式已开启：思考过程和工具调用不再实时转发，"
+        _quiet.add(chat_id)
+        save_quiet()
+        send_text(chat_id, "🔕 本聊天已开启静默模式：思考过程和工具调用不再实时转发，"
                            "只在需要你拍板时通知——权限确认卡片、每回合的最终结果、异常。"
-                           "/unquiet 恢复实时转发。")
+                           "/unquiet 恢复实时转发（仅本聊天生效，其他聊天不受影响）。")
     elif cmd == "/unquiet":
-        _set_quiet(False)
-        send_text(chat_id, "🔔 静默模式已关闭，回复和工具调用恢复实时转发。")
+        _quiet.discard(chat_id)
+        save_quiet()
+        send_text(chat_id, "🔔 本聊天静默模式已关闭，回复和工具调用恢复实时转发。")
     elif cmd == "/cwd":
         if not arg:
             send_text(chat_id, f"当前工作目录:{_chat_work_dir(chat_id)}\n用法:/cwd D:\\path\\to\\project")
@@ -1490,16 +1523,20 @@ def handle_command(chat_id: str, text: str) -> None:
                 send_text(chat_id, f"📁 工作目录已切换：{WORK_DIR}\n（本聊天的历史会话已重置）")
     elif cmd == "/mode":
         if not arg:
-            send_text(chat_id, f"当前权限模式：{PERMISSION_MODE or 'default'}\n"
+            cur = _chat_mode(chat_id)
+            src = "本聊天独立设置" if chat_id in _modes else "全局默认（.env CLAUDE_PERMISSION_MODE）"
+            send_text(chat_id, f"当前权限模式：{cur}（{src}）\n"
                                f"切换：/mode <{' | '.join(sorted(PERMISSION_MODES))}>\n"
-                               "对下一条消息生效（机器人级设置，对所有聊天生效）。")
+                               "对下一条消息生效，仅本聊天（其他聊天不受影响）。")
         elif arg in PERMISSION_MODES:
-            PERMISSION_MODE = arg
-            # 驻留进程的模式在起进程时就固定：空闲的旧模式进程立即退役
-            # （工作中的等本回合结束自动退役，见 _finish_turn），下条消息都用新模式重建
+            _modes[chat_id] = arg
+            save_modes()
+            # 驻留进程的模式在起进程时就固定：本聊天空闲的旧模式进程立即退役
+            # （工作中的等本回合结束自动退役，见 _finish_turn），下条消息用新模式重建
             with _running_lock:
                 stale = [s for s in _running.values()
-                         if s.get("mode") != PERMISSION_MODE and not s.get("in_turn")]
+                         if s.get("chat_id") == chat_id
+                         and s.get("mode") != _chat_mode(chat_id) and not s.get("in_turn")]
             for s in stale:
                 s["reason"] = "recycle"
                 try:
@@ -1509,7 +1546,7 @@ def handle_command(chat_id: str, text: str) -> None:
                     pass
             warn = "\n⚠️ bypassPermissions = 白名单里的人可让 Claude 做任何事，风险自负。" \
                 if arg == "bypassPermissions" else ""
-            send_text(chat_id, f"✅ 权限模式已切换：{arg}（下一条消息生效；正在执行的任务"
+            send_text(chat_id, f"✅ 权限模式已切换：{arg}（下一条消息生效，仅本聊天；正在执行的任务"
                                "会在本回合结束后用新模式重建）{warn}")
         else:
             send_text(chat_id, f"❌ 无效模式 {arg}\n可选：{' | '.join(sorted(PERMISSION_MODES))}")
@@ -1719,7 +1756,7 @@ def main() -> None:
     print("✅ 飞书机器人已启动（WebSocket 长连接，无需公网 IP）")
     print(f"   Claude：{CLAUDE_PATH}")
     print(f"   工作目录：{WORK_DIR}")
-    print(f"   权限模式：{PERMISSION_MODE or 'default'}｜超时：{CLAUDE_TIMEOUT if CLAUDE_TIMEOUT > 0 else '不限时'}｜转发工具调用：{'开' if FORWARD_TOOLS else '关'}")
+    print(f"   权限模式（全局默认）：{PERMISSION_MODE or 'default'}｜超时：{CLAUDE_TIMEOUT if CLAUDE_TIMEOUT > 0 else '不限时'}｜转发工具调用：{'开' if FORWARD_TOOLS else '关'}")
     print(f"   白名单：{len(ALLOWED_USERS)} 人" + ("" if ALLOWED_USERS else "（未配置，首条消息会提示如何配置）"))
     # 权限确认通道：perm_mcp.py（claude 的 MCP 权限回调）连回本进程
     threading.Thread(target=_perm_server, daemon=True).start()
