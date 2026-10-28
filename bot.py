@@ -1776,7 +1776,17 @@ def handle_command(chat_id: str, text: str) -> None:
         if name:
             head += f" 📛{name}"
         lines = [head, "最近动态："] + [f"  {t} {who} {txt}" for t, who, txt in _session_tail(sf)]
-        lines.append(f"\n/takeover {sid} ← 接管（正在跑的会话会自动排队，跑完接续）")
+        # 尾部提示按会话归属区分：自己的会话别喊"接管"，别人的要注明会挤掉对方
+        with _sessions_lock:
+            owner = next((c for c, v in _sessions.items()
+                          if isinstance(v, dict) and v.get("session_id") == sid), None)
+        if owner == chat_id:
+            lines.append("\nℹ️ 这是本聊天当前绑定的会话——直接发消息即可继续（/peek 只旁观，不打扰）。")
+        elif owner:
+            lines.append(f"\n/takeover {sid} ← 接管（注意：该会话正绑定在另一个飞书聊天，"
+                         "接管会转移所有权，对方会收到通知）")
+        else:
+            lines.append(f"\n/takeover {sid} ← 接管（正在跑的会话会自动排队，跑完接续）")
         send_text(chat_id, "\n".join(lines))
     elif cmd == "/unqueue":
         with _msg_queue_lock:
