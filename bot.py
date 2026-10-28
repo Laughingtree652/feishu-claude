@@ -91,6 +91,7 @@ SHELL_TIMEOUT = 120  # 飞书 ! 命令直通 shell 的超时（秒）
 # 权限确认卡片（--permission-prompt-tool → perm_mcp.py → 本地 socket → 飞书卡片）
 PERM_PORT = int(os.environ.get("FEISHU_PERM_PORT", "37921"))     # 与 perm_mcp.py 约定的本地端口
 PERM_TIMEOUT = int(os.environ.get("PERM_TIMEOUT_SECONDS", "0"))  # 等用户确认权限的上限（秒），0=不限时（与桌面终端一致）
+PERM_GATE_WAIT = int(os.environ.get("PERM_GATE_WAIT", "300"))    # 桌面权限卡等待上限（秒）；超时不答复，回退桌面终端弹框
 TAKEOVER_ASK_TIMEOUT = 60  # 接管运行中会话时等用户选卡片选项的上限（秒），超时默认排队
 
 SESSION_FILE = BASE_DIR / "sessions.json"
@@ -841,6 +842,73 @@ def _perm_input_display(tool: str, inp) -> str:
     return _safe_md(json.dumps(inp, ensure_ascii=False))[:600]
 
 
+# ---------------- 桌面权限等待标记（perm_gate.py 转来的确认，/peek 与 /observe 显示） ----------------
+PENDING_PERM_FILE = BASE_DIR / "pending_perm.json"
+_pending_perm_lock = threading.Lock()
+_pending_perm: dict = {}    # sid -> {"ts": float, "tool": str}
+if PENDING_PERM_FILE.exists():
+    try:
+        _pending_perm = json.loads(PENDING_PERM_FILE.read_text("utf-8"))
+    except Exception:
+        _pending_perm = {}
+
+
+def _save_pending_perm() -> None:
+    with _pending_perm_lock:
+        data = dict(_pending_perm)
+    try:
+        PENDING_PERM_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=1), "utf-8")
+    except OSError:
+        pass
+
+
+def _note_pending_perm(sid: str, tool: str) -> None:
+    if not sid:
+        return
+    with _pending_perm_lock:
+        _pending_perm[sid] = {"ts": time.time(), "tool": tool}
+    _save_pending_perm()
+
+
+def _clear_pending_perm(sid: str) -> None:
+    if not sid:
+        return
+    with _pending_perm_lock:
+        existed = _pending_perm.pop(sid, None) is not None
+    if existed:
+        _save_pending_perm()
+
+
+def _pending_perm_line(sid: str, sf: Path) -> str:
+    """该会话是否卡在桌面权限确认（perm_gate 发起了转发且转录尚未恢复写入）。
+    转录恢复写入（权限已解决、工具开始跑）或超过 30 分钟即自动清理。
+    返回展示行；无等待/已过期返回空串。"""
+    with _pending_perm_lock:
+        pp = _pending_perm.get(sid)
+    if not pp:
+        return ""
+    if time.time() - pp.get("ts", 0) > 1800:
+        _clear_pending_perm(sid)
+        return ""
+    try:
+        if sf.stat().st_mtime > pp.get("ts", 0) + 2:   # 标记后转录又动过 = 卡已解除
+            _clear_pending_perm(sid)
+            return ""
+    except OSError:
+        pass
+    mins = int(time.time() - pp.get("ts", 0)) // 60
+    wait = f"已等 {mins} 分钟" if mins >= 1 else "刚刚"
+    return f"⏸ 桌面端在等你确认权限（{pp.get('tool', '?')}，{wait}）——确认卡已推到飞书，点 ✅ 放行 / ❌ 拒绝"
+
+
+def _desktop_perm_target() -> str:
+    """桌面事件的推送目标聊天（notify_target.json，与 notify.py 同源）。"""
+    try:
+        return json.loads((BASE_DIR / "notify_target.json").read_text("utf-8")).get("chat_id") or ""
+    except Exception:
+        return ""
+
+
 def _perm_server() -> None:
     """本地 TCP 通道：perm_mcp.py（claude 的权限回调 MCP 服务器）把请求转过来。"""
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -902,14 +970,49 @@ def _perm_conn(conn) -> None:
                                        f"可用 /mode 调整权限模式后重发。")
         elif payload and payload.get("type") == "perm":
             result = {"behavior": "deny", "message": "权限确认缺少聊天上下文"}
+        elif payload and payload.get("type") == "desktop_perm":
+            # 桌面终端会话的权限确认（perm_gate.py hook 转来）：卡片推给桌面通知目标聊天
+            chat_id = _desktop_perm_target()
+            sid = str(payload.get("sid") or "")
+            tool = str(payload.get("tool_name") or "?")
+            if not chat_id:
+                result = None   # bot 还没收过消息（无通知目标）：不答复，hook 让路终端
+            else:
+                disp = _perm_input_display(tool, payload.get("tool_input"))
+                _note_pending_perm(sid, tool)
+                kind, val = _ask_choice(
+                    chat_id, "🖥️ 桌面会话请求权限",
+                    f"**工具**：`{tool}`\n**内容**：\n{disp}",
+                    [{"label": "✅ 允许", "value": "allow", "style": "primary"},
+                     {"label": "❌ 拒绝", "value": "deny", "style": "danger"}],
+                    timeout=PERM_GATE_WAIT, template="orange", tag="desktop_perm",
+                    note="桌面终端上跑的会话在等这个确认。也可以回复文字：`允许` / `拒绝` /"
+                         " 任意说明（说明会作为拒绝原因转给桌面 Claude）。\n"
+                         "超时未应答则回退到桌面终端弹框（人回电脑上点）。")
+                _clear_pending_perm(sid)
+                if kind == "choice":
+                    result = ({"behavior": "allow"} if val == "allow" else
+                              {"behavior": "deny", "message": "用户在飞书上拒绝了本次操作"})
+                elif kind == "text":
+                    t = (val or "").strip().lower()
+                    if t in PERM_ALLOW_WORDS:
+                        result = {"behavior": "allow"}
+                    elif t in PERM_DENY_WORDS:
+                        result = {"behavior": "deny", "message": "用户在飞书上拒绝了本次操作"}
+                    else:
+                        result = {"behavior": "deny", "message": f"用户回复：{val}"}
+                else:
+                    result = None   # 超时/被顶替：不答复，桌面终端弹框接手
+                    send_text(chat_id, f"⏳ 桌面权限确认（{tool}）超时未应答，已回退桌面终端弹框。")
     except Exception as e:
         log(f"[权限确认处理出错] {e!r}")
         result = {"behavior": "deny", "message": "权限确认处理内部错误"}
     finally:
-        try:
-            conn.sendall((json.dumps(result, ensure_ascii=False) + "\n").encode("utf-8"))
-        except OSError:
-            pass
+        if result is not None:   # None = 不答复（超时/无目标）：hook 读到 EOF 让路终端
+            try:
+                conn.sendall((json.dumps(result, ensure_ascii=False) + "\n").encode("utf-8"))
+            except OSError:
+                pass
         try:
             conn.close()
         except OSError:
@@ -1605,6 +1708,9 @@ def _peek_lines(chat_id: str, sid: str, sf: Path, cwd, eye: str = "👀") -> lis
     if name:
         head += f" 📛{name}"
     lines = [head, "最近动态："] + [f"  {t} {who} {txt}" for t, who, txt in _session_tail(sf)]
+    pp_line = _pending_perm_line(sid, sf)
+    if pp_line:
+        lines.insert(1, pp_line)
     # 尾部提示按会话归属区分：自己的会话别喊"接管"，别人的要注明会挤掉对方
     with _sessions_lock:
         owner = next((c for c, v in _sessions.items()

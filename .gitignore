@@ -11,6 +11,7 @@ quiet.json
 modes.json
 summaries.json
 observe.json
+pending_perm.json
 bot.log
 
 # Python

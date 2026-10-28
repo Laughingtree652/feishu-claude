@@ -144,9 +144,17 @@ Claude Code 的会话存在 `~/.claude/projects/` 下的转录文件里，不绑
 `notify.py` 配合 Claude Code 的 hooks：桌面会话**完成回合**或**等你确认权限**时，
 自动推送提醒到飞书（含回复摘要、项目名和可复制的 `/takeover` 命令）。
 
+**桌面权限远程确认（`perm_gate.py`，PermissionRequest hook）**：桌面终端跑的任务
+卡在权限确认、而人不在电脑前时，确认卡直接推到飞书——手机点 **✅ 允许** 即放行
+桌面进程继续跑（❌ 拒绝亦可，回复文字则作为拒绝原因转给桌面 Claude）。人在电脑前
+时自动让路（终端照常弹框，零打扰）；超时未应答回退桌面终端弹框。此时 `/peek`、
+`/observe` 会显示 **⏸ 桌面端在等你确认权限**，一眼看出"该你输入了"。
+（需在 `~/.claude/settings.json` 的 hooks 里挂 `PermissionRequest` → `perm_gate.py`，
+timeout 建议 600；确认卡推送到桌面通知目标聊天，等待上限 `PERM_GATE_WAIT` 默认 300 秒。）
+
 **免打扰（双保险）：**
 - 自动：检测键鼠活动 —— 你在电脑前（3 分钟内有操作）不推送，离开后才推
-  （阈值可在 `.env` 用 `NOTIFY_IDLE_SECONDS` 调整，0=总是推送）
+  （阈值可在 `.env` 用 `NOTIFY_IDLE_SECONDS` 调整，0=总是推送；权限远程确认同用此阈值）
 - 手动：飞书里发 `/mute` 全部暂停，`/unmute` 恢复
 
 其他：
@@ -172,7 +180,8 @@ Claude Code 的会话存在 `~/.claude/projects/` 下的转录文件里，不绑
 | 长任务被中断 | 默认不限时；若设过 `CLAUDE_TIMEOUT`，调大或设 0（不限时），挂死用 `/stop` 远程杀 |
 
 本地状态文件（都在机器人目录，删掉即重置）：会话绑定 `sessions.json`、会话名 `names.json`、
-会话摘要 `summaries.json`、实时观察 `observe.json`、免 @ 群 `listen.json`、各聊天独立的权限模式 `modes.json` / 静默模式 `quiet.json`。
+会话摘要 `summaries.json`、实时观察 `observe.json`、桌面权限等待标记 `pending_perm.json`、
+免 @ 群 `listen.json`、各聊天独立的权限模式 `modes.json` / 静默模式 `quiet.json`。
 
 ## 八、从 GitHub 拉取部署
 
