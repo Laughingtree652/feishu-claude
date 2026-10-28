@@ -158,6 +158,7 @@ Claude Code 的会话存在 `~/.claude/projects/` 下的转录文件里，不绑
 | 现象 | 处理 |
 |------|------|
 | 提示找不到 claude | `.env` 里设 `CLAUDE_PATH=<claude 的完整路径>` |
+| 飞书端 Claude 的命令总弹权限卡（白名单 `Bash(...)` 规则不生效） | Windows 非交互启动的 claude 默认用 PowerShell 工具，`Bash` 规则匹配不到它。机器人会自动探测 Git Bash 并注入 `CLAUDE_CODE_GIT_BASH_PATH` 让飞书端与终端一致；启动日志提示探测失败时，在 `.env` 设 `GIT_BASH_PATH` |
 | 收不到消息 | 检查第 2 步：长连接模式是否开启、`im.message.receive_v1` 是否订阅、权限是否开通并重新发布 |
 | 会话失效 | 机器人会自动开新会话重试；`/cwd` 切目录会重置会话 |
 | 长任务被中断 | 默认不限时；若设过 `CLAUDE_TIMEOUT`，调大或设 0（不限时），挂死用 `/stop` 远程杀 |

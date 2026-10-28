@@ -50,6 +50,34 @@ FORWARD_TOOLS = os.environ.get("FORWARD_TOOLS", "1").strip().lower() not in ("0"
 CLAUDE_EXTRA_ARGS = os.environ.get("CLAUDE_EXTRA_ARGS", "").strip()
 CLAUDE_PATH = os.environ.get("CLAUDE_PATH") or shutil.which("claude")
 
+
+def _detect_git_bash() -> str:
+    r"""定位 Git Bash 的 bash.exe（.env 显式指定 > git 安装位置反推 > PATH 兜底）。
+
+    用途：Windows 上非交互 spawn 的 claude 默认拿 PowerShell 工具，settings 里
+    Bash(git *) 等白名单规则全部不命中（每条命令都弹权限卡）。注入官方变量
+    CLAUDE_CODE_GIT_BASH_PATH 可强制分身切回 Bash 工具——实测 v2.1.310 只认
+    这个变量（SHELL/MSYSTEM/PATH 上有 bash 均无效），且 Git 装在非标准位置
+    （如 D:\tools\Git）时 CLI 自身探测也找不到。"""
+    if sys.platform != "win32":
+        return ""
+    manual = os.environ.get("GIT_BASH_PATH", "").strip()
+    if manual:
+        return manual
+    git_exe = shutil.which("git")
+    if git_exe:
+        root = Path(git_exe).resolve().parent.parent   # git.exe 在 <根>\cmd 或 <根>\bin
+        for cand in (root / "bin" / "bash.exe", root / "usr" / "bin" / "bash.exe"):
+            if cand.is_file():
+                return str(cand)
+    bash_exe = shutil.which("bash")   # 兜底；System32\bash.exe 是 WSL 的，不能用
+    if bash_exe and "system32" not in bash_exe.lower():
+        return str(Path(bash_exe).resolve())
+    return ""
+
+
+GIT_BASH = _detect_git_bash()
+
 # 权限模式全集（/mode 运行时切换 + 启动校验共用）
 PERMISSION_MODES = {"default", "acceptEdits", "auto", "bypassPermissions", "manual", "dontAsk", "plan"}
 SHELL_TIMEOUT = 120  # 飞书 ! 命令直通 shell 的超时（秒）
@@ -995,8 +1023,12 @@ def _spawn_claude(chat_id: str, session_id):
 
     # FEISHU_BOT_CHILD=1：让 notify.py 跳过机器人自己的 claude 子进程，避免重复通知
     # FEISHU_CHAT_ID/FEISHU_PERM_PORT：perm_mcp.py 借此路由卡片和连回本进程
+    # CLAUDE_CODE_GIT_BASH_PATH：强制分身用 Bash 工具（Git Bash），白名单里的
+    #   Bash(...) 规则才能命中——否则 Windows 非交互 spawn 默认 PowerShell 工具
     child_env = {**os.environ, "FEISHU_BOT_CHILD": "1",
                  "FEISHU_CHAT_ID": chat_id, "FEISHU_PERM_PORT": str(PERM_PORT)}
+    if GIT_BASH:
+        child_env["CLAUDE_CODE_GIT_BASH_PATH"] = GIT_BASH
     return subprocess.Popen(
         cmd,
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -1945,6 +1977,11 @@ def main() -> None:
     if PERMISSION_MODE not in valid_modes:
         sys.exit(f"❌ CLAUDE_PERMISSION_MODE 无效：{PERMISSION_MODE}\n"
                  f"   可选值：{', '.join(sorted(PERMISSION_MODES))}")
+    if GIT_BASH:
+        log(f"[Git Bash] 已锁定 {GIT_BASH} → 分身将使用 Bash 工具（白名单 Bash 规则可命中）")
+    else:
+        log("[Git Bash] 未定位到 bash.exe，分身将使用 PowerShell 工具"
+            "（可用 .env 的 GIT_BASH_PATH 指定）")
 
     # 启动自愈：清理旧版遗留的「同一会话绑多个聊天」脏状态（会话独占规则，
     # 运行期由 _bind_session 的抢占维持）。保留 updated 最新的绑定，其余解绑并通知。
