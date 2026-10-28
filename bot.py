@@ -1728,7 +1728,6 @@ def _peek_lines(chat_id: str, sid: str, sf: Path, cwd, eye: str = "👀") -> lis
 # ---------------- 实时观察（/observe：盯转录文件，新动静时节流刷新快照卡片） ----------------
 OBSERVE_FILE = BASE_DIR / "observe.json"
 OBSERVE_REFRESH = int(os.environ.get("OBSERVE_REFRESH_SECONDS", "15"))      # 快照刷新最小间隔（秒）
-OBSERVE_IDLE_STOP = int(os.environ.get("OBSERVE_IDLE_STOP_SECONDS", "300")) # 闲置自动结束（秒）
 _observers_lock = threading.Lock()
 _observers: dict = {}    # chat_id -> {"sid": str, "stop": threading.Event}
 _observe_saved: dict = {}
@@ -1767,8 +1766,8 @@ def _observe_loop(chat_id: str, sid: str, stop: threading.Event) -> None:
     """观察线程：盯会话转录文件，有新动静且距上帧够久 → 整卡刷新快照卡片。
 
     卡片内容 = /peek 的完整渲染，一张卡反复 patch（patch 失败重建新卡，再失败
-    退回文本消息，内容不丢）。闲置 OBSERVE_IDLE_STOP 秒定格最后一帧自动结束，
-    转录文件消失也结束。观察是纯只读旁观——不占用会话，多个聊天可以各自观察
+    退回文本消息，内容不丢）。转录文件消失也结束；闲置不自动停（挂监控场景
+    可以长期盯）。观察是纯只读旁观——不占用会话，多个聊天可以各自观察
     同一个会话，与排队接管、驻留进程的流式卡片互不干扰。"""
     sf, cwd = _find_session_file(sid)
     if sf is None:
@@ -1829,16 +1828,9 @@ def _observe_loop(chat_id: str, sid: str, stop: threading.Event) -> None:
             send_text(chat_id, f"📡 会话 {sid[:8]}… 的转录文件已消失，观察结束。")
             _cleanup()
             return
-        fresh = time.time() - st.st_mtime
         if st.st_size != last_size:
             if time.time() - last_push >= OBSERVE_REFRESH:
                 _frame("📡 实时观察中 · /unobserve 停止")
-        elif fresh >= OBSERVE_IDLE_STOP:
-            # 闲置已久：定格最终状态后自动结束（一张"直播卡"不该永远躺着）
-            _frame(f"💤 会话已闲置 {int(fresh // 60)} 分钟，观察自动结束"
-                   "（再有动静可重新 /observe）")
-            _cleanup()
-            return
 
 
 def _start_observer(chat_id: str, sid: str) -> None:
@@ -2079,7 +2071,7 @@ def handle_command(chat_id: str, text: str) -> None:
         extra = f"\n（观察目标已从 {cur[:8]}… 切换）" if cur else ""
         send_text(chat_id, f"📡 开始实时观察会话 {sid[:8]}…{extra}\n"
                            f"· 快照卡片随转录动静自动刷新（约 {OBSERVE_REFRESH} 秒一帧）\n"
-                           f"· 闲置 {OBSERVE_IDLE_STOP // 60} 分钟自动结束，/unobserve 随时停\n"
+                           "· 长期闲置也不自动结束（挂监控场景可长期盯），/unobserve 停止\n"
                            "· 只读旁观：不占用会话，跟排队接管、其他聊天的观察互不干扰")
     elif cmd == "/unobserve":
         if not _stop_observer(chat_id, note="📴 已停止实时观察。"):
