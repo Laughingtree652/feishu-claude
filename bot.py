@@ -20,6 +20,12 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+# 闲置回收的子进程检测用；未安装（没跑 uv sync）时自动退回纯时间判定
+try:
+    import psutil
+except ImportError:
+    psutil = None
+
 import lark_oapi as lark
 from lark_oapi.api.im.v1 import (
     CreateMessageRequest,
@@ -98,7 +104,7 @@ HELP_TEXT = """📖 命令列表
 /stop — 中断当前任务（排队的消息一并取消）
 /status — 状态面板：机器人设置（权限/静默/免@）+ 会话绑定与进程工作状态
 /session — 查看当前会话 ID（在电脑上 claude --resume <id> 可接续）
-/sessions [条数] — 列出电脑上最近的会话（含当前绑定的）
+/sessions [条数] — 列出电脑上最近的会话（含当前绑定的；用过一段的自动带一行摘要）
 /takeover [序号|会话ID|latest] — 接管电脑上的会话（在跑的发卡片选：排队/强制/取消）
 /exit — 退出当前接管的会话（解绑+回收驻留进程；历史保留，可再 /takeover）
 /peek [序号|会话ID|latest] — 旁观会话当前进度（正在干什么、最新输出）
@@ -150,6 +156,22 @@ def save_names() -> None:
             NAMES_FILE.write_text(json.dumps(_names, ensure_ascii=False, indent=1), "utf-8")
         except OSError:
             pass
+
+# ---------------- 会话摘要（session_id -> 一行总结，驻留进程收尾时后台生成） ----------------
+SUMMARY_FILE = BASE_DIR / "summaries.json"
+_summaries: dict = {}
+if SUMMARY_FILE.exists():
+    try:
+        _summaries = json.loads(SUMMARY_FILE.read_text("utf-8"))
+    except Exception:
+        _summaries = {}
+
+
+def save_summaries() -> None:
+    try:
+        SUMMARY_FILE.write_text(json.dumps(_summaries, ensure_ascii=False, indent=1), "utf-8")
+    except OSError:
+        pass
 
 # ---------------- 快捷命令（卡片按钮面板，/addcmd 维护） ----------------
 COMMANDS_FILE = BASE_DIR / "commands.json"
@@ -435,6 +457,29 @@ def kill_task(proc: subprocess.Popen) -> None:
             proc.kill()
     except Exception:
         pass
+
+
+def _active_child_count(proc: subprocess.Popen) -> int:
+    """数 claude 驻留进程名下还在跑的工具子进程（后台编译/巡检之类）。
+
+    排除常驻"脊柱"：claude.cmd 垫片 → node(cli.js) → perm_mcp.py——它们随主进程
+    生灭，不算活跃工作。psutil 不可用/查询失败返回 0（退回纯时间判定）。"""
+    if psutil is None:
+        return 0
+    try:
+        kids = psutil.Process(proc.pid).children(recursive=True)
+    except Exception:
+        return 0
+    active = 0
+    for k in kids:
+        try:
+            cl = " ".join(k.cmdline()).lower()
+        except Exception:
+            cl = ""
+        if "cli.js" in cl or "perm_mcp" in cl or "claude.cmd" in cl:
+            continue
+        active += 1
+    return active
 
 
 # ---------------- 运行日志（打印 + 落盘 bot.log，机器人窗口看不到时远程排障用） ----------------
@@ -1144,6 +1189,10 @@ def _session_reader(chat_id: str, key: str, slot: dict) -> None:
         else:
             send_text(chat_id, f"❌ Claude 进程异常退出（code={returncode}）\n"
                                f"{tail[-800:] or '（无错误输出）'}")
+    # 会话暂告一段落（闲置回收/主动退出）：补一份摘要供 /sessions 列表用。
+    # 不含 recycle（换绑/模式重建时会话还在继续）——等真正闲置了再总结。
+    if reason in ("idle", "exit") and slot.get("sid"):
+        _maybe_summarize(slot.get("sid"))
 
 
 def _finish_turn(chat_id: str, result: dict, last_text: str, slot: dict) -> None:
@@ -1199,6 +1248,15 @@ def _session_watchdog(chat_id: str, key: str, slot: dict) -> None:
         # 闲置回收只在该回合已结束时做：长工具执行期间可能长时间无输出，
         # 但回合没结束就不算闲置（in_turn 保护）
         if not slot.get("in_turn") and now - slot.get("last_event", now) > SESSION_IDLE_TIMEOUT:
+            # 智能回收：回合虽已结束，但 claude 名下还有活跃子进程（后台编译/巡检
+            # 等 run_in_background 任务）时推迟回收，长任务不误杀
+            active = _active_child_count(proc)
+            if active:
+                if not slot.get("defer_log"):
+                    slot["defer_log"] = True
+                    log(f"[闲置回收] 检测到 {active} 个活跃子进程，推迟回收"
+                        f"（子进程结束后再收）chat={chat_id[-6:]}")
+                continue
             slot["reason"] = "idle"
             try:
                 proc.stdin.close()   # 优雅退出：claude 收到 EOF，跑完当前回合自然退出
@@ -1307,6 +1365,97 @@ def _find_session_file(sid: str):
     for f in root.glob(f"*/{sid}.jsonl"):
         return f, _session_cwd(f)
     return None, None
+
+
+# ---------------- 会话摘要（后台小模型生成，/sessions 列表展示） ----------------
+SUMMARY_MODEL = os.environ.get("SUMMARY_MODEL", "haiku").strip()   # 摘要用的模型
+_summarizing: set = set()            # 生成中的 session_id，防并发重复
+_summarize_lock = threading.Lock()
+
+
+def _session_digest(session_file: Path, max_items: int = 40, max_chars: int = 100) -> str:
+    """从转录提取对话时间线（用户消息 + 助手正文，逐条截断），喂给摘要模型。
+
+    工具调用/工具结果/思考块都不取——摘要只要"人说了什么、Claude 答了什么"。"""
+    out: list = []
+    try:
+        with session_file.open("r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if len(out) >= max_items:
+                    break
+                try:
+                    d = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if d.get("isMeta") or d.get("isSidechain"):
+                    continue
+                m = d.get("message") or {}
+                who = {"user": "用户", "assistant": "助手"}.get(m.get("role"))
+                if not who:
+                    continue
+                content = m.get("content")
+                texts = [content] if isinstance(content, str) else (
+                    [b.get("text", "") for b in content
+                     if isinstance(b, dict) and b.get("type") == "text"]
+                    if isinstance(content, list) else [])
+                t = " ".join(x.strip() for x in texts if x and x.strip())
+                if t:
+                    entry = f"{who}: {t[:max_chars]}"
+                    if not out or out[-1] != entry:   # 转录双写会产生相邻重复行，去重省 token
+                        out.append(entry)
+    except OSError:
+        pass
+    return "\n".join(out)
+
+
+def _generate_summary(sid: str, session_file: Path) -> None:
+    """起小模型把会话压成一行摘要。--max-turns 1：纯文本应答，不给它动工具的机会。"""
+    digest = _session_digest(session_file)
+    if len(digest) < 80:    # 没有实质对话，不值得生成
+        return
+    prompt = ("下面是一段 Claude Code 会话的对话时间线摘录。用一句中文总结这个会话"
+              "主要做了什么（不超过 50 个字，说清对象与结果，不要客套），"
+              "直接输出这一句：\n\n" + digest)
+    env = {**os.environ, "FEISHU_BOT_CHILD": "1"}   # 别触发桌面通知 hook
+    if GIT_BASH:
+        env["CLAUDE_CODE_GIT_BASH_PATH"] = GIT_BASH
+    try:
+        r = subprocess.run(
+            [CLAUDE_PATH, "-p", "--model", SUMMARY_MODEL, "--max-turns", "1"],
+            input=prompt, capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=120, env=env, cwd=str(BASE_DIR))
+    except (OSError, subprocess.TimeoutExpired) as e:
+        log(f"[摘要] 生成失败 sid={sid[:8]}… {e!r}")
+        return
+    first = (r.stdout or "").strip().strip('"').splitlines()
+    text = first[0].strip() if first else ""
+    if r.returncode != 0 or not text:
+        log(f"[摘要] 生成失败 sid={sid[:8]}… rc={r.returncode} {(r.stderr or '')[:200]}")
+        return
+    _summaries[sid] = text[:120]
+    save_summaries()
+    log(f"[摘要] 已生成 sid={sid[:8]}… {text[:60]}")
+
+
+def _maybe_summarize(sid) -> None:
+    """驻留进程收尾时调用：该会话还没有摘要就后台补一份（每个会话只做一次）。"""
+    if not sid or sid in _summaries:
+        return
+    with _summarize_lock:
+        if sid in _summarizing:
+            return
+        _summarizing.add(sid)
+    session_file, _cwd = _find_session_file(sid)
+
+    def _run() -> None:
+        try:
+            if session_file is not None:
+                _generate_summary(sid, session_file)
+        finally:
+            with _summarize_lock:
+                _summarizing.discard(sid)
+
+    threading.Thread(target=_run, daemon=True).start()
 
 
 def _latest_desktop_session():
@@ -1715,6 +1864,9 @@ def handle_command(chat_id: str, text: str) -> None:
             lines.append(f"{i}. [{proj}] {_rel_time(it['mtime'])} · {it['session_id'][:8]}…{active}{mine}")
             if name:
                 lines.append(f"   📛 {name}")
+            summary = _summaries.get(it["session_id"])
+            if summary:
+                lines.append(f"   📝 {summary}")
             elif it["preview"]:
                 lines.append(f"   「{it['preview']}」")
         send_text(chat_id, "\n".join(lines))
@@ -1982,6 +2134,10 @@ def main() -> None:
     else:
         log("[Git Bash] 未定位到 bash.exe，分身将使用 PowerShell 工具"
             "（可用 .env 的 GIT_BASH_PATH 指定）")
+    if psutil is not None:
+        log(f"[智能回收] psutil {psutil.__version__} 已加载（闲置回收前检查活跃子进程）")
+    else:
+        log("[智能回收] psutil 未安装，退回纯时间判定（请跑 uv sync 安装依赖）")
 
     # 启动自愈：清理旧版遗留的「同一会话绑多个聊天」脏状态（会话独占规则，
     # 运行期由 _bind_session 的抢占维持）。保留 updated 最新的绑定，其余解绑并通知。
