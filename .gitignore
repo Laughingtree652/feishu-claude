@@ -10,6 +10,7 @@ mute.flag
 quiet.json
 modes.json
 summaries.json
+observe.json
 bot.log
 
 # Python

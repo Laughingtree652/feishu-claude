@@ -108,6 +108,8 @@ HELP_TEXT = """📖 命令列表
 /takeover [序号|会话ID|latest] — 接管电脑上的会话（在跑的发卡片选：排队/强制/取消）
 /exit — 退出当前接管的会话（解绑+回收驻留进程；历史保留，可再 /takeover）
 /peek [序号|会话ID|latest] — 旁观会话当前进度（正在干什么、最新输出）
+/observe [序号|会话ID|latest] — 实时观察：转录有动静自动刷新快照卡片（远程看终端直播）
+/unobserve — 停止实时观察
 /unqueue — 取消排队接管
 /rename [名字] — 给当前会话起名（/sessions 列表优先显示名字）
 /addcmd 标签 消息 · /delcmd 序号 · /cmds · /panel — 快捷命令按钮面板
@@ -350,6 +352,9 @@ def _bind_session(chat_id: str, sid: str, cwd) -> list:
             "updated": datetime.now().isoformat(timespec="seconds"),
         }
     save_sessions()
+    # 本聊天若在观察这个会话：会话归你了，实时进度走流式卡片，观察自动关闭
+    _stop_observer(chat_id, f"📡 已接管会话 {sid[:8]}…，实时进度走流式卡片，观察自动关闭。",
+                   sid=sid)
     for other in evicted:
         _recycle_chat_sessions(other, reason="takeover")
         send_text(other, f"↪️ 会话 {sid[:8]}… 已被另一个聊天接管，本聊天已解绑"
@@ -1586,6 +1591,163 @@ def _session_tail(session_file: Path, n: int = 14):
         return []
 
 
+def _peek_lines(chat_id: str, sid: str, sf: Path, cwd, eye: str = "👀") -> list:
+    """/peek 与 /observe 共用的进度渲染：状态头 + 最近动态 + 归属提示。"""
+    state, age = _session_state(sf)
+    proj = Path(cwd).name if cwd else "?"
+    name = _names.get(sid)
+    if state == "running":
+        head = f"{eye} [{proj}] {sid[:8]}… ⚡回合进行中（{int(age)} 秒前仍在写入）"
+    elif state == "idle":
+        head = f"{eye} [{proj}] {sid[:8]}… 💤空闲（最后活动 {_rel_time(sf.stat().st_mtime)}）"
+    else:
+        head = f"{eye} [{proj}] {sid[:8]}…（状态未知）"
+    if name:
+        head += f" 📛{name}"
+    lines = [head, "最近动态："] + [f"  {t} {who} {txt}" for t, who, txt in _session_tail(sf)]
+    # 尾部提示按会话归属区分：自己的会话别喊"接管"，别人的要注明会挤掉对方
+    with _sessions_lock:
+        owner = next((c for c, v in _sessions.items()
+                      if isinstance(v, dict) and v.get("session_id") == sid), None)
+    if owner == chat_id:
+        lines.append("\nℹ️ 这是本聊天当前绑定的会话——直接发消息即可继续（旁观不打扰）。")
+    elif owner:
+        lines.append(f"\n/takeover {sid} ← 接管（注意：该会话正绑定在另一个飞书聊天，"
+                     "接管会转移所有权，对方会收到通知）")
+    else:
+        lines.append(f"\n/takeover {sid} ← 接管（正在跑的会话会自动排队，跑完接续）")
+    return lines
+
+
+# ---------------- 实时观察（/observe：盯转录文件，新动静时节流刷新快照卡片） ----------------
+OBSERVE_FILE = BASE_DIR / "observe.json"
+OBSERVE_REFRESH = int(os.environ.get("OBSERVE_REFRESH_SECONDS", "15"))      # 快照刷新最小间隔（秒）
+OBSERVE_IDLE_STOP = int(os.environ.get("OBSERVE_IDLE_STOP_SECONDS", "300")) # 闲置自动结束（秒）
+_observers_lock = threading.Lock()
+_observers: dict = {}    # chat_id -> {"sid": str, "stop": threading.Event}
+_observe_saved: dict = {}
+if OBSERVE_FILE.exists():
+    try:
+        _observe_saved = json.loads(OBSERVE_FILE.read_text("utf-8"))
+    except Exception:
+        _observe_saved = {}
+
+
+def _save_observers() -> None:
+    with _observers_lock:
+        data = {c: v["sid"] for c, v in _observers.items() if isinstance(v, dict)}
+    try:
+        OBSERVE_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=1), "utf-8")
+    except OSError:
+        pass
+
+
+def _stop_observer(chat_id: str, note: str = "", sid: str = None) -> bool:
+    """停止本聊天的观察（幂等）。sid 非空时只停对该会话的观察（换绑别的会话不动它）。
+    note 非空则给聊天回执一条。返回 True=确实在观察且已停。"""
+    with _observers_lock:
+        obs = _observers.get(chat_id)
+        if obs is None or (sid is not None and obs.get("sid") != sid):
+            return False
+        del _observers[chat_id]
+        obs["stop"].set()
+    _save_observers()
+    if note:
+        send_text(chat_id, note)
+    return True
+
+
+def _observe_loop(chat_id: str, sid: str, stop: threading.Event) -> None:
+    """观察线程：盯会话转录文件，有新动静且距上帧够久 → 整卡刷新快照卡片。
+
+    卡片内容 = /peek 的完整渲染，一张卡反复 patch（patch 失败重建新卡，再失败
+    退回文本消息，内容不丢）。闲置 OBSERVE_IDLE_STOP 秒定格最后一帧自动结束，
+    转录文件消失也结束。观察是纯只读旁观——不占用会话，多个聊天可以各自观察
+    同一个会话，与排队接管、驻留进程的流式卡片互不干扰。"""
+    sf, cwd = _find_session_file(sid)
+    if sf is None:
+        send_text(chat_id, f"📡 找不到会话 {sid[:8]}… 的转录文件，观察未开始。")
+        with _observers_lock:
+            _observers.pop(chat_id, None)
+        _save_observers()
+        return
+    msg_id = None
+    last_size = -1
+    last_push = 0.0
+
+    def _cleanup() -> None:
+        with _observers_lock:
+            _observers.pop(chat_id, None)
+        _save_observers()
+
+    def _frame(note: str) -> None:
+        """推一帧快照：记下文件水位，渲染 /peek 式内容并整卡更新。"""
+        nonlocal msg_id, last_size, last_push
+        try:
+            last_size = sf.stat().st_size
+        except OSError:
+            pass
+        last_push = time.time()
+        content = "\n".join(_peek_lines(chat_id, sid, sf, cwd, eye="📡"))
+        card = {"config": {"wide_screen_mode": True},
+                "elements": [
+                    {"tag": "div", "text": {"tag": "lark_md", "content": content or "…"}},
+                    {"tag": "note", "elements": [
+                        {"tag": "plain_text", "content": note}]}]}
+        if msg_id:   # 常规路径：整卡刷新；失败降级为重建新卡
+            try:
+                req = PatchMessageRequest.builder() \
+                    .message_id(msg_id) \
+                    .request_body(PatchMessageRequestBody.builder()
+                                  .content(json.dumps(card, ensure_ascii=False))
+                                  .build()).build()
+                resp = api.im.v1.message.patch(req)
+                if resp.success():
+                    return
+                log(f"[观察卡片更新失败] code={resp.code} msg={resp.msg}")
+            except Exception as e:
+                log(f"[观察卡片更新异常] {e!r}")
+            msg_id = None
+        msg_id = _send_card(chat_id, card)
+        if msg_id is None:
+            send_text(chat_id, content)   # 卡片通道不可用：文本兜底，内容不丢
+
+    _frame(f"📡 实时观察中 · 有动静约每 {OBSERVE_REFRESH} 秒刷新一帧 · /unobserve 停止")
+    while not stop.is_set():
+        stop.wait(3)
+        if stop.is_set():
+            return   # /unobserve、换目标或接管自动停：回执由发起方发
+        try:
+            st = sf.stat()
+        except OSError:
+            send_text(chat_id, f"📡 会话 {sid[:8]}… 的转录文件已消失，观察结束。")
+            _cleanup()
+            return
+        fresh = time.time() - st.st_mtime
+        if st.st_size != last_size:
+            if time.time() - last_push >= OBSERVE_REFRESH:
+                _frame("📡 实时观察中 · /unobserve 停止")
+        elif fresh >= OBSERVE_IDLE_STOP:
+            # 闲置已久：定格最终状态后自动结束（一张"直播卡"不该永远躺着）
+            _frame(f"💤 会话已闲置 {int(fresh // 60)} 分钟，观察自动结束"
+                   "（再有动静可重新 /observe）")
+            _cleanup()
+            return
+
+
+def _start_observer(chat_id: str, sid: str) -> None:
+    """开始/切换观察目标：停旧的，落盘 observe.json，起观察线程（首帧立即推）。"""
+    with _observers_lock:
+        old = _observers.pop(chat_id, None)
+        if old:
+            old["stop"].set()
+        stop = threading.Event()
+        _observers[chat_id] = {"sid": sid, "stop": stop}
+    _save_observers()
+    threading.Thread(target=_observe_loop, args=(chat_id, sid, stop), daemon=True).start()
+    log(f"[实时观察] chat={chat_id[-6:]} → 会话 {sid[:8]}…")
+
+
 # ---------------- 命令处理 ----------------
 def handle_command(chat_id: str, text: str) -> None:
     global WORK_DIR
@@ -1683,6 +1845,9 @@ def handle_command(chat_id: str, text: str) -> None:
             lines.append(f"· 📥 排队中：{qn} 条消息（自动依次执行）")
         if pend:
             lines.append(f"· ⏳ 排队接管：等会话 {pend['sid'][:8]}… 空闲（已积 {len(pend['queue'])} 条；/unqueue 取消）")
+        obs_sid = (_observers.get(chat_id) or {}).get("sid")
+        if obs_sid:
+            lines.append(f"· 📡 实时观察：会话 {obs_sid[:8]}…（快照卡片自动刷新，/unobserve 停止）")
         send_text(chat_id, "\n".join(lines))
     elif cmd == "/session":
         sess = _sessions.get(chat_id) or {}
@@ -1777,30 +1942,42 @@ def handle_command(chat_id: str, text: str) -> None:
         if not sf:
             send_text(chat_id, f"❌ 找不到会话 {sid[:8]}… 的转录文件")
             return
-        state, age = _session_state(sf)
-        proj = Path(cwd2).name if cwd2 else "?"
-        name = _names.get(sid)
-        if state == "running":
-            head = f"👀 [{proj}] {sid[:8]}… ⚡回合进行中（{int(age)} 秒前仍在写入）"
-        elif state == "idle":
-            head = f"👀 [{proj}] {sid[:8]}… 💤空闲（最后活动 {_rel_time(sf.stat().st_mtime)}）"
+        send_text(chat_id, "\n".join(_peek_lines(chat_id, sid, sf, cwd2)))
+    elif cmd == "/observe":
+        want = arg.strip()
+        sid = None
+        if not want:
+            sid = (_sessions.get(chat_id) or {}).get("session_id")
+            if not sid:
+                send_text(chat_id, "当前聊天没有绑定会话。用法：/observe <序号|会话ID|latest>")
+                return
+        elif want.lower() == "latest":
+            sid, _ = _latest_desktop_session()
+        elif want.isdigit():
+            items = _recent_sessions(8, include_managed=True)
+            idx = int(want) - 1
+            if 0 <= idx < len(items):
+                sid = items[idx]["session_id"]
         else:
-            head = f"👀 [{proj}] {sid[:8]}…（状态未知）"
-        if name:
-            head += f" 📛{name}"
-        lines = [head, "最近动态："] + [f"  {t} {who} {txt}" for t, who, txt in _session_tail(sf)]
-        # 尾部提示按会话归属区分：自己的会话别喊"接管"，别人的要注明会挤掉对方
-        with _sessions_lock:
-            owner = next((c for c, v in _sessions.items()
-                          if isinstance(v, dict) and v.get("session_id") == sid), None)
-        if owner == chat_id:
-            lines.append("\nℹ️ 这是本聊天当前绑定的会话——直接发消息即可继续（/peek 只旁观，不打扰）。")
-        elif owner:
-            lines.append(f"\n/takeover {sid} ← 接管（注意：该会话正绑定在另一个飞书聊天，"
-                         "接管会转移所有权，对方会收到通知）")
-        else:
-            lines.append(f"\n/takeover {sid} ← 接管（正在跑的会话会自动排队，跑完接续）")
-        send_text(chat_id, "\n".join(lines))
+            sid, _ = _find_session_file(want)
+        if not sid:
+            send_text(chat_id, f"❌ 找不到会话 {want}")
+            return
+        with _observers_lock:
+            cur = (_observers.get(chat_id) or {}).get("sid")
+        if cur == sid:
+            send_text(chat_id, f"📡 本聊天已在观察会话 {sid[:8]}…（快照卡片持续刷新中），"
+                               "/unobserve 停止。")
+            return
+        _start_observer(chat_id, sid)   # 首帧由观察线程立即推出
+        extra = f"\n（观察目标已从 {cur[:8]}… 切换）" if cur else ""
+        send_text(chat_id, f"📡 开始实时观察会话 {sid[:8]}…{extra}\n"
+                           f"· 快照卡片随转录动静自动刷新（约 {OBSERVE_REFRESH} 秒一帧）\n"
+                           f"· 闲置 {OBSERVE_IDLE_STOP // 60} 分钟自动结束，/unobserve 随时停\n"
+                           "· 只读旁观：不占用会话，跟排队接管、其他聊天的观察互不干扰")
+    elif cmd == "/unobserve":
+        if not _stop_observer(chat_id, note="📴 已停止实时观察。"):
+            send_text(chat_id, "本聊天当前没有在观察任何会话（/observe <序号|ID|latest> 开始）。")
     elif cmd == "/unqueue":
         with _msg_queue_lock:
             msgs = _msg_queue.pop(chat_id, [])
@@ -2185,6 +2362,18 @@ def main() -> None:
             send_text(chat, f"↪️ 启动检查：会话 {sid[:8]}… 此前同时绑定了多个聊天"
                             "（会话独占规则），本聊天已解绑；"
                             f"/takeover {sid[:8]} 可重新接管。")
+
+    # 恢复重启前的实时观察（先清盘再逐个重启，转录已不存在的记录会被观察线程
+    # 首帧回执并自然剔除；成功的由 _start_observer 重新落盘）
+    if _observe_saved:
+        saved = {c: s for c, s in _observe_saved.items() if isinstance(s, str) and s}
+        _observe_saved.clear()
+        try:
+            OBSERVE_FILE.unlink()
+        except OSError:
+            pass
+        for chat, sid in saved.items():
+            _start_observer(chat, sid)
 
     handler = lark.EventDispatcherHandler.builder("", "") \
         .register_p2_im_message_receive_v1(on_message) \
