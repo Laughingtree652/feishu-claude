@@ -1525,8 +1525,11 @@ def _session_state(session_file: Path):
         return None, None
 
 
-def _session_tail(session_file: Path, n: int = 5):
-    """转录尾部最近的对话动态 [(时间, 角色, 摘要)]，用于 /peek 旁观。"""
+def _session_tail(session_file: Path, n: int = 14):
+    """转录尾部最近的对话动态 [(时间, 角色, 摘要)]，用于 /peek 旁观。
+
+    工具结果（📤）也展示——桌面会话的大量活动是命令输出，不展示等于丢内容。
+    文本截 200 字、输出截 150 字：/peek 看进度，要全文就 /takeover 接过去。"""
     out = []
     try:
         st = session_file.stat()
@@ -1548,24 +1551,34 @@ def _session_tail(session_file: Path, n: int = 5):
             if t == "user":
                 if d.get("isMeta"):
                     continue
-                txt = ""
                 if isinstance(c, str):
-                    txt = c.strip()
+                    if c.strip():
+                        out.append((ts, "👤", c.strip().replace("\n", " ")[:200]))
                 elif isinstance(c, list):
                     if any(isinstance(b, dict) and b.get("type") == "tool_result" for b in c):
-                        continue
-                    for b in c:
-                        if isinstance(b, dict) and b.get("type") == "text" and (b.get("text") or "").strip():
-                            txt = b["text"].strip()
-                            break
-                if txt:
-                    out.append((ts, "👤", txt.replace("\n", " ")[:60]))
+                        for b in c:   # 工具结果：桌面会话的主要"输出"
+                            if isinstance(b, dict) and b.get("type") == "tool_result":
+                                rc = b.get("content")
+                                texts = [rc] if isinstance(rc, str) else (
+                                    [x.get("text", "") for x in rc
+                                     if isinstance(x, dict) and x.get("type") == "text"]
+                                    if isinstance(rc, list) else [])
+                                txt = " ".join(x.strip() for x in texts if x and x.strip())
+                                if txt:
+                                    mark = "📤❌" if b.get("is_error") else "📤"
+                                    out.append((ts, mark, txt.replace("\n", " ")[:150]))
+                    else:
+                        txts = [b["text"].strip() for b in c
+                                if isinstance(b, dict) and b.get("type") == "text"
+                                and (b.get("text") or "").strip()]
+                        if txts:
+                            out.append((ts, "👤", " ".join(txts).replace("\n", " ")[:200]))
             elif isinstance(c, list):
                 for b in c:
                     if not isinstance(b, dict):
                         continue
                     if b.get("type") == "text" and (b.get("text") or "").strip():
-                        out.append((ts, "🤖", b["text"].strip().replace("\n", " ")[:60]))
+                        out.append((ts, "🤖", b["text"].strip().replace("\n", " ")[:200]))
                     elif b.get("type") == "tool_use":
                         out.append((ts, "🔧", _tool_summary(b.get("name", ""), b.get("input"))))
         return out[-n:]
