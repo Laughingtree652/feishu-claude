@@ -1633,17 +1633,30 @@ def _session_state(session_file: Path):
         return None, None
 
 
-def _session_tail(session_file: Path, n: int = 14):
+def _session_tail(session_file: Path, n: int = 14, since: int = -1):
     """转录尾部最近的对话动态 [(时间, 角色, 摘要)]，用于 /peek 旁观。
 
     工具结果（📤）也展示——桌面会话的大量活动是命令输出，不展示等于丢内容。
-    文本截 200 字、输出截 150 字：/peek 看进度，要全文就 /takeover 接过去。"""
+    🤖 文字回复全显不截（观察挂监控就是看它说话）；工具类保持简略：
+    输出截 600 字、用户文本截 1000 字，帧内条目多时工具类自适应收紧防超卡。
+    /peek 看进度，要全文就 /takeover 接过去。
+    since >= 0 为增量模式：只收集该字节偏移之后新增的条目（观察帧防丢——
+    高速回合里固定 14 条窗口会把中间条目挤出视野，增量保证每条都出现），
+    新增不足 n 条时退回尾部快照保持上下文感。"""
     out = []
     try:
         st = session_file.stat()
         with session_file.open("rb") as fh:
-            fh.seek(max(0, st.st_size - 262144))
-            data = fh.read().decode("utf-8", "replace")
+            if since >= 0:
+                # 回退少许再跳过第一行：偏移点可能落在某行中间，首行可能是
+                # 截半的（解析自然失败）；即便是完整行也属上帧已见范围
+                fh.seek(max(0, since - 64))
+                data = fh.read().decode("utf-8", "replace")
+                nl = data.find("\n")
+                data = data[nl + 1:] if nl >= 0 else ""
+            else:
+                fh.seek(max(0, st.st_size - 262144))
+                data = fh.read().decode("utf-8", "replace")
         for line in data.splitlines():
             if '"type"' not in line:
                 continue
@@ -1661,7 +1674,7 @@ def _session_tail(session_file: Path, n: int = 14):
                     continue
                 if isinstance(c, str):
                     if c.strip():
-                        out.append((ts, "👤", c.strip().replace("\n", " ")[:200]))
+                        out.append((ts, "👤", c.strip().replace("\n", " ")[:1000]))
                 elif isinstance(c, list):
                     if any(isinstance(b, dict) and b.get("type") == "tool_result" for b in c):
                         for b in c:   # 工具结果：桌面会话的主要"输出"
@@ -1674,28 +1687,38 @@ def _session_tail(session_file: Path, n: int = 14):
                                 txt = " ".join(x.strip() for x in texts if x and x.strip())
                                 if txt:
                                     mark = "📤❌" if b.get("is_error") else "📤"
-                                    out.append((ts, mark, txt.replace("\n", " ")[:150]))
+                                    out.append((ts, mark, txt.replace("\n", " ")[:600]))
                     else:
                         txts = [b["text"].strip() for b in c
                                 if isinstance(b, dict) and b.get("type") == "text"
                                 and (b.get("text") or "").strip()]
                         if txts:
-                            out.append((ts, "👤", " ".join(txts).replace("\n", " ")[:200]))
+                            out.append((ts, "👤", " ".join(txts).replace("\n", " ")[:1000]))
             elif isinstance(c, list):
                 for b in c:
                     if not isinstance(b, dict):
                         continue
                     if b.get("type") == "text" and (b.get("text") or "").strip():
-                        out.append((ts, "🤖", b["text"].strip().replace("\n", " ")[:200]))
+                        out.append((ts, "🤖", b["text"].strip().replace("\n", " ")))   # 文字回复全显
                     elif b.get("type") == "tool_use":
                         out.append((ts, "🔧", _tool_summary(b.get("name", ""), b.get("input"))))
+        if since >= 0 and len(out) < n:
+            return _session_tail(session_file, n)   # 新增不足一屏：退回快照
+        if since >= 0:
+            # 增量帧可能攒了很多条：工具类条目越多截越紧防卡片超限，🤖 文字回复全显不收
+            per = 600 if len(out) <= 30 else 300
+            out = [(t, w, txt[:per] + "…" if w != "🤖" and len(txt) > per else txt)
+                   for t, w, txt in out]
+            return out
         return out[-n:]
     except OSError:
         return []
 
 
-def _peek_lines(chat_id: str, sid: str, sf: Path, cwd, eye: str = "👀") -> list:
-    """/peek 与 /observe 共用的进度渲染：状态头 + 最近动态 + 归属提示。"""
+def _peek_lines(chat_id: str, sid: str, sf: Path, cwd, eye: str = "👀",
+                since: int = -1) -> list:
+    """/peek 与 /observe 共用的进度渲染：状态头 + 最近动态 + 归属提示。
+    since >= 0 时动态区改增量渲染（上帧水位之后的新条目全显，防丢帧）。"""
     state, age = _session_state(sf)
     proj = Path(cwd).name if cwd else "?"
     name = _names.get(sid)
@@ -1707,7 +1730,7 @@ def _peek_lines(chat_id: str, sid: str, sf: Path, cwd, eye: str = "👀") -> lis
         head = f"{eye} [{proj}] {sid[:8]}…（状态未知）"
     if name:
         head += f" 📛{name}"
-    lines = [head, "最近动态："] + [f"  {t} {who} {txt}" for t, who, txt in _session_tail(sf)]
+    lines = [head, "最近动态："] + [f"  {t} {who} {txt}" for t, who, txt in _session_tail(sf, since=since)]
     pp_line = _pending_perm_line(sid, sf)
     if pp_line:
         lines.insert(1, pp_line)
@@ -1786,14 +1809,17 @@ def _observe_loop(chat_id: str, sid: str, stop: threading.Event) -> None:
         _save_observers()
 
     def _frame(note: str) -> None:
-        """推一帧快照：记下文件水位，渲染 /peek 式内容并整卡更新。"""
+        """推一帧快照：记下文件水位，渲染 /peek 式内容并整卡更新。
+        动态区增量渲染（since=上帧水位）：高速回合 15 秒节流窗内写出的
+        全部条目都会进这一帧，不再被 14 条快照窗口挤丢。"""
         nonlocal msg_id, last_size, last_push
+        prev = last_size
         try:
             last_size = sf.stat().st_size
         except OSError:
             pass
         last_push = time.time()
-        content = "\n".join(_peek_lines(chat_id, sid, sf, cwd, eye="📡"))
+        content = "\n".join(_peek_lines(chat_id, sid, sf, cwd, eye="📡", since=prev))
         card = {"config": {"wide_screen_mode": True},
                 "elements": [
                     {"tag": "div", "text": {"tag": "lark_md", "content": content or "…"}},
