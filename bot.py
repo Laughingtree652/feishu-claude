@@ -111,7 +111,7 @@ HELP_TEXT = """📖 命令列表
 /takeover [序号|会话ID|latest] — 接管电脑上的会话（在跑的发卡片选：排队/强制/取消）
 /exit — 退出当前接管的会话（解绑+回收驻留进程；历史保留，可再 /takeover）
 /peek [序号|会话ID|latest] — 旁观会话当前进度（正在干什么、最新输出）
-/observe [序号|会话ID|latest] — 实时观察：转录有动静自动刷新快照卡片（远程看终端直播）
+/observe [序号|会话ID|latest] — 实时观察：转录有动静自动刷新快照卡片（远程看终端直播；观察中再 /ob 同一会话 = 重发新卡刷回底部）
 /unobserve — 停止实时观察
 /provider [序号|名称] — 查看/切换 Claude 供应商（cc-switch 库；切换即换 key，新起进程生效）
 /unqueue — 取消排队接管
@@ -2358,8 +2358,10 @@ def handle_command(chat_id: str, text: str) -> None:
         with _observers_lock:
             cur = (_observers.get(chat_id) or {}).get("sid")
         if cur == sid:
-            send_text(chat_id, f"📡 本聊天已在观察会话 {sid[:8]}…（快照卡片持续刷新中），"
-                               "/unobserve 停止。")
+            # 重复观察同一会话 = 重发新卡：中途聊天把观察卡顶远了，/ob 一下
+            # 让最新的快照卡落回聊天底部（旧卡定格保留，刷新转移到新卡）
+            _start_observer(chat_id, sid)   # 停旧线程起新的，新线程立即推首帧
+            send_text(chat_id, f"🔄 观察卡已重发：会话 {sid[:8]}…（最新动态见新卡，/unobserve 停止）")
             return
         _start_observer(chat_id, sid)   # 首帧由观察线程立即推出
         extra = f"\n（观察目标已从 {cur[:8]}… 切换）" if cur else ""
