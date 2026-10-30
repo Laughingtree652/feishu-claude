@@ -15,6 +15,7 @@ import shutil
 import socket
 import sqlite3
 import subprocess
+import urllib.request
 import sys
 import threading
 import time
@@ -118,6 +119,7 @@ HELP_TEXT = """📖 命令列表
 /addcmd 标签 消息 · /delcmd 序号 · /cmds · /panel — 快捷命令按钮面板
 /cwd [路径] — 查看 / 切换 Claude 的工作目录
 /mode [模式] — 查看 / 切换本聊天的权限模式（manual、auto、acceptEdits…，未设置时用全局默认）
+/model [序号|名称|reset] — 查看/切换本聊天的模型（网关可用模型实时列出；reset 回退全局默认）
 /listen — 群聊免 @ 模式：本群所有消息直接发给机器人（适合只有你+机器人的群）
 /mute · /unmute — 暂停/恢复桌面事件推送（全局）
 /quiet · /unquiet — 静默模式（本聊天）：不刷思考/工具过程，只推最终结果和权限确认
@@ -162,6 +164,25 @@ def save_names() -> None:
             NAMES_FILE.write_text(json.dumps(_names, ensure_ascii=False, indent=1), "utf-8")
         except OSError:
             pass
+
+# ---------------- 聊天级模型设置（chat_id -> 模型名，/model 维护；分身 spawn 时 --model 显式指定） ----------------
+MODELS_FILE = BASE_DIR / "models.json"
+_models_lock = threading.Lock()
+_chat_models: dict = {}
+if MODELS_FILE.exists():
+    try:
+        _chat_models = json.loads(MODELS_FILE.read_text("utf-8"))
+    except Exception:
+        _chat_models = {}
+
+
+def save_models() -> None:
+    with _models_lock:
+        try:
+            MODELS_FILE.write_text(json.dumps(_chat_models, ensure_ascii=False, indent=1), "utf-8")
+        except OSError:
+            pass
+
 
 # ---------------- 会话摘要（session_id -> 一行总结，驻留进程收尾时后台生成） ----------------
 SUMMARY_FILE = BASE_DIR / "summaries.json"
@@ -1175,6 +1196,10 @@ def _spawn_claude(chat_id: str, session_id):
                 "--mcp-config", json.dumps(mcp_config, separators=(",", ":"))]
     if CLAUDE_EXTRA_ARGS:
         cmd += shlex.split(CLAUDE_EXTRA_ARGS)
+    # 聊天级模型（/model 设置）：显式指定优先级最高，压过 settings.json 与 env 别名
+    _m = _chat_models.get(chat_id)
+    if _m:
+        cmd += ["--model", _m]
     if session_id:
         cmd += ["--resume", session_id]
 
@@ -1951,6 +1976,67 @@ def _session_model(sf: Path) -> str:
     return "?"
 
 
+def _gateway_models(base: str, key: str) -> list:
+    """网关 /v1/models 模型清单（5 秒超时；失败返回空，调用方降级提示）。"""
+    if not base:
+        return []
+    req = urllib.request.Request(base.rstrip("/") + "/v1/models",
+                                 headers={"Authorization": f"Bearer {key}"})
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+        return [m.get("id") for m in (data.get("data") or []) if m.get("id")]
+    except Exception:
+        return []
+
+
+def _current_endpoint() -> tuple:
+    """settings.json 生效中的 (base_url, key)——网关模型查询用。"""
+    try:
+        env = json.loads(CLAUDE_SETTINGS.read_text("utf-8")).get("env") or {}
+        return env.get("ANTHROPIC_BASE_URL") or "", str(env.get("ANTHROPIC_API_KEY") or "")
+    except Exception:
+        return "", ""
+
+
+def _model_chain() -> list:
+    """模型决定链（settings.json）：顶层 model（别名展开）→ env 默认，一层一条。"""
+    try:
+        s = json.loads(CLAUDE_SETTINGS.read_text("utf-8"))
+    except Exception:
+        return []
+    env = s.get("env") or {}
+    out = []
+    m = s.get("model")
+    if m:
+        if str(m).lower() in ("opus", "sonnet", "haiku"):
+            real = env.get(f"ANTHROPIC_DEFAULT_{str(m).upper()}_MODEL") or "?"
+            out.append(f'model="{m}" → 别名映射 {real}')
+        else:
+            out.append(f'model="{m}"（直接指定）')
+    if env.get("ANTHROPIC_MODEL"):
+        out.append(f"env 默认 {env['ANTHROPIC_MODEL']}")
+    return out
+
+
+def _recycle_idle_children() -> tuple:
+    """回收所有空闲分身（换 provider/模型后，新配置只对起新进程生效；
+    空闲分身内存里揣着旧配置）。返回 (已回收数, 忙碌保留数)。"""
+    idle = []
+    busy = 0
+    with _running_lock:
+        for v in list(_running.values()):
+            if v.get("in_turn"):
+                busy += 1
+            else:
+                idle.append(v)
+    for v in idle:
+        v["reason"] = "recycle"
+        if v.get("proc"):
+            kill_task(v["proc"])
+    return len(idle), busy
+
+
 def _switch_provider(chat_id: str, arg: str) -> None:
     """切换供应商：整块换 settings.json 的 env（其余配置不动）+ 同步 cc-switch 两处
     状态保持 GUI 一致；回收空闲分身（内存里揣着旧 key；绑定保留，下条消息自动
@@ -1998,22 +2084,18 @@ def _switch_provider(chat_id: str, arg: str) -> None:
         CCSWITCH_SETTINGS.write_text(json.dumps(cs, ensure_ascii=False, indent=2), "utf-8")
     except Exception as e:
         log(f"[Provider 状态同步失败，settings.json 已切换] {e!r}")
-    # 3) 回收空闲分身（揣着旧 key）；绑定保留，下条消息自动起新进程
-    idle_slots, busy = [], 0
-    with _running_lock:
-        for v in list(_running.values()):
-            if v.get("in_turn"):
-                busy += 1
-            else:
-                idle_slots.append(v)
-    for v in idle_slots:
-        v["reason"] = "recycle"
-        if v.get("proc"):
-            kill_task(v["proc"])
+    # 3) 清聊天级模型（模型名跨网关不通用）+ 回收空闲分身（揣着旧 key）
+    with _models_lock:
+        cleared = len(_chat_models)
+        _chat_models.clear()
+    save_models()
+    idle, busy = _recycle_idle_children()
     tips = [f"🔄 供应商已切换：{target['name']}（{target['base']}）",
             "· 新起进程立即用新 key；终端里的活会话需重启 resume 才换"]
-    if idle_slots:
-        tips.append(f"· 已回收空闲分身 {len(idle_slots)} 个（绑定保留，发消息自动续接）")
+    if cleared:
+        tips.append(f"· 已清除 {cleared} 个聊天的模型设置（模型名跨网关不通用，/model 重选）")
+    if idle:
+        tips.append(f"· 已回收空闲分身 {idle} 个（绑定保留，发消息自动续接）")
     if busy:
         tips.append(f"· ⚠️ {busy} 个分身正在跑回合，这轮跑完仍是旧 key")
     send_text(chat_id, "\n".join(tips))
@@ -2022,7 +2104,7 @@ def _switch_provider(chat_id: str, arg: str) -> None:
 # ---------------- 命令缩写（/ob → /observe：唯一前缀展开，歧义则提示补全） ----------------
 COMMANDS = ["/help", "/new", "/exit", "/stop", "/status", "/session", "/sessions",
             "/takeover", "/peek", "/observe", "/unobserve", "/unqueue", "/rename",
-            "/cwd", "/mode", "/mute", "/unmute", "/quiet", "/unquiet",
+            "/cwd", "/mode", "/model", "/mute", "/unmute", "/quiet", "/unquiet",
             "/addcmd", "/delcmd", "/cmds", "/panel", "/listen", "/provider"]
 
 
@@ -2149,6 +2231,8 @@ def handle_command(chat_id: str, text: str) -> None:
             lines.append(f"· 📡 实时观察：会话 {obs_sid[:8]}…（快照卡片自动刷新，/unobserve 停止）")
         lines += ["", "🔑 Provider",
                   f"· 全局生效：{_provider_now()}"]
+        m_set = _chat_models.get(chat_id)
+        lines.append(f"· 本聊天模型：{m_set}（显式）" if m_set else "· 本聊天模型：跟随全局")
         sess = _sessions.get(chat_id) or {}
         if sess.get("session_id"):
             sf, _cwd2 = _find_session_file(sess["session_id"])
@@ -2305,6 +2389,74 @@ def handle_command(chat_id: str, text: str) -> None:
                 lines.append(f"{i}. {p['name']} · {p['base']} · key …{p['key_tail']}{mark}")
             lines += ["", f"当前生效：{_provider_now()}",
                       "切换：/provider <序号|名称关键字>（新起进程生效，终端活会话需重启）"]
+            send_text(chat_id, "\n".join(lines))
+    elif cmd == "/model":
+        a = arg.strip()
+        if a.lower() in ("reset", "default", "clear"):
+            with _models_lock:
+                old = _chat_models.pop(chat_id, None)
+            save_models()
+            if not old:
+                send_text(chat_id, "本聊天未单独设置模型（本来就在跟随全局）。")
+            else:
+                idle, busy = _recycle_idle_children()
+                tips = [f"↩️ 本聊天模型已重置：{old} → 跟随全局",
+                        "· 全局链路：" + (" ｜ ".join(_model_chain()) or "?")]
+                if idle:
+                    tips.append(f"· 已回收空闲分身 {idle} 个（绑定保留，发消息自动续接）")
+                if busy:
+                    tips.append(f"· ⚠️ {busy} 个分身正在跑回合，这轮跑完仍是旧模型")
+                send_text(chat_id, "\n".join(tips))
+        elif a:
+            # 目标：网关序号（需查询成功）或名称直接采纳（网关不支持列表时也能设）
+            target = None
+            base, key = _current_endpoint()
+            glist = _gateway_models(base, key)
+            if a.isdigit() and glist:
+                if 1 <= int(a) <= len(glist):
+                    target = glist[int(a) - 1]
+                else:
+                    send_text(chat_id, f"序号超出范围（网关列表共 {len(glist)} 个）。")
+                    return
+            if target is None:
+                target = a
+                if glist and target not in glist:
+                    send_text(chat_id, f"⚠️ {target} 不在网关列表中，仍按名称设置"
+                                       "（若模型名有误会由下一轮请求报错，届时 /model 重选）。")
+            with _models_lock:
+                _chat_models[chat_id] = target
+            save_models()
+            idle, busy = _recycle_idle_children()
+            tips = [f"🧬 本聊天模型已设置：{target}（分身显式 --model，优先于一切别名）",
+                    "· 新起分身立即生效；终端会话不受影响"]
+            if idle:
+                tips.append(f"· 已回收空闲分身 {idle} 个（绑定保留，发消息自动续接）")
+            if busy:
+                tips.append(f"· ⚠️ {busy} 个分身正在跑回合，这轮跑完仍是旧模型")
+            send_text(chat_id, "\n".join(tips))
+        else:
+            base, key = _current_endpoint()
+            glist = _gateway_models(base, key)
+            m_set = _chat_models.get(chat_id)
+            lines = ["🧬 模型"]
+            lines.append(f"· 本聊天设置：{m_set}（显式 --model）" if m_set
+                         else "· 本聊天设置：未设置（跟随全局链路）")
+            chain = _model_chain()
+            if chain:
+                lines.append("· 全局链路：" + " ｜ ".join(chain))
+            sess = _sessions.get(chat_id) or {}
+            if sess.get("session_id"):
+                sf, _cwd2 = _find_session_file(sess["session_id"])
+                if sf:
+                    lines.append(f"· 分身转录实测：{_session_model(sf)}")
+            if glist:
+                lines.append(f"· 网关可用模型（{base}）：")
+                for i, m in enumerate(glist, 1):
+                    mark = " ← 本聊天" if m == m_set else ""
+                    lines.append(f"  {i}. {m}{mark}")
+            else:
+                lines.append("· 网关模型清单查询失败（超时/不支持）——可 /model <模型名> 直接指定")
+            lines += ["", "切换：/model <序号|名称>  ·  重置：/model reset"]
             send_text(chat_id, "\n".join(lines))
     elif cmd == "/unqueue":
         with _msg_queue_lock:

@@ -9,6 +9,7 @@ notify.log
 mute.flag
 quiet.json
 modes.json
+models.json
 summaries.json
 observe.json
 pending_perm.json
