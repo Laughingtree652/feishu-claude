@@ -5,7 +5,7 @@
 飞书发消息给机器人 → 调用本地 claude CLI（多轮会话自动续接）→
 Claude 的回复与工具调用实时转发回飞书，实现远程操控。
 
-可用命令：/help /new /exit /stop /status /session /sessions /takeover /cwd /mode /mute /unmute
+可用命令：/help /new /exit /stop /status /session /sessions /takeover /cwd /mode /mute /unmute /provider
 （会话独占：同一会话只归一个聊天，后接管者优先，被挤掉的聊天会收到通知）
 """
 import json
@@ -13,6 +13,7 @@ import os
 import shlex
 import shutil
 import socket
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -111,6 +112,7 @@ HELP_TEXT = """📖 命令列表
 /peek [序号|会话ID|latest] — 旁观会话当前进度（正在干什么、最新输出）
 /observe [序号|会话ID|latest] — 实时观察：转录有动静自动刷新快照卡片（远程看终端直播）
 /unobserve — 停止实时观察
+/provider [序号|名称] — 查看/切换 Claude 供应商（cc-switch 库；切换即换 key，新起进程生效）
 /unqueue — 取消排队接管
 /rename [名字] — 给当前会话起名（/sessions 列表优先显示名字）
 /addcmd 标签 消息 · /delcmd 序号 · /cmds · /panel — 快捷命令按钮面板
@@ -124,6 +126,7 @@ HELP_TEXT = """📖 命令列表
 回复以流式卡片实时呈现（边生成边更新，超长自动分段不丢内容）。
 任务执行中发的消息会直接递给 Claude（工具间隙读取，边跑边回应，和桌面终端一致）。
 Claude 需要权限确认时会发卡片，点按钮或直接回复文字（允许/拒绝/自定义说明）。
+命令支持缩写：唯一前缀自动展开（如 /ob → /observe），歧义时提示候选。
 !命令 = 直接在本机 PowerShell 执行（不经 Claude），如 !git status"""
 
 # 用于发消息的 API 客户端（与收消息的 WebSocket 客户端相互独立）
@@ -1133,7 +1136,8 @@ def run_task(chat_id: str, prompt: str) -> None:
         slot = {"chat_id": chat_id, "proc": None, "started": time.time(), "reason": None,
                 "wlock": threading.Lock(), "last_event": time.time(),
                 "turn_start": time.time(), "in_turn": False, "sid": _lookup_session(chat_id),
-                "mode": _chat_mode(chat_id)}   # 起进程时用的权限模式（/mode 切换后检测重建用）
+                "mode": _chat_mode(chat_id),   # 起进程时用的权限模式（/mode 切换后检测重建用）
+                "provider": _provider_now()}   # 起进程时的供应商（/status 对比换没换 key）
         try:
             proc = _spawn_claude(chat_id, slot["sid"])
         except FileNotFoundError:
@@ -1295,8 +1299,12 @@ def _session_reader(chat_id: str, key: str, slot: dict) -> None:
             save_sessions()
             send_text(chat_id, "❌ 原会话已失效（绑定已清除），再发一次消息将自动开新会话。")
         else:
+            low = tail.lower()
+            hint = ("\n⚠️ 疑似供应商额度耗尽/限流——/provider 查看并切换。"
+                    if any(k in low for k in ("429", "rate limit", "quota",
+                                               "insufficient", "balance")) else "")
             send_text(chat_id, f"❌ Claude 进程异常退出（code={returncode}）\n"
-                               f"{tail[-800:] or '（无错误输出）'}")
+                               f"{tail[-800:] or '（无错误输出）'}{hint}")
     # 会话暂告一段落（闲置回收/主动退出）：补一份摘要供 /sessions 列表用。
     # 不含 recycle（换绑/模式重建时会话还在继续）——等真正闲置了再总结。
     if reason in ("idle", "exit") and slot.get("sid"):
@@ -1318,6 +1326,10 @@ def _finish_turn(chat_id: str, result: dict, last_text: str, slot: dict) -> None
         line += f" · ${cost:.3f}"
     if result.get("is_error"):
         line = "⚠️ 任务异常结束 · " + line
+        low = (final_text or "").lower()
+        if any(k in low for k in ("429", "rate limit", "quota",
+                                  "insufficient", "balance", "credit")):
+            line += "\n⚠️ 疑似供应商额度耗尽/限流——/provider 查看并切换。"
     send_text(chat_id, line)
 
     denials = result.get("permission_denials") or []
@@ -1872,9 +1884,172 @@ def _start_observer(chat_id: str, sid: str) -> None:
     log(f"[实时观察] chat={chat_id[-6:]} → 会话 {sid[:8]}…")
 
 
+# ---------------- Provider 供应商切换（cc-switch 库：额度耗尽时飞书直接换 key） ----------------
+CCSWITCH_DIR = Path.home() / ".cc-switch"
+CCSWITCH_DB = CCSWITCH_DIR / "cc-switch.db"
+CCSWITCH_SETTINGS = CCSWITCH_DIR / "settings.json"
+CLAUDE_SETTINGS = Path.home() / ".claude" / "settings.json"
+
+
+def _providers() -> list:
+    """cc-switch 库里的 Claude 供应商 [{"id","name","base","key_tail","is_current","env"}]。
+    env 为空 dict 表示官方 OAuth 等非 env 形态（bot 切不了，得走 cc-switch 界面）。"""
+    try:
+        db = sqlite3.connect(f"file:{CCSWITCH_DB.as_posix()}?mode=ro", uri=True)
+        rows = db.execute(
+            "select id,name,settings_config,is_current,sort_index from providers "
+            "where app_type='claude' order by sort_index").fetchall()
+        db.close()
+    except Exception:
+        return []
+    out = []
+    for pid, name, cfg, cur, _si in rows:
+        try:
+            env = (json.loads(cfg) or {}).get("env") or {}
+        except Exception:
+            env = {}
+        key = str(env.get("ANTHROPIC_API_KEY") or env.get("ANTHROPIC_AUTH_TOKEN") or "")
+        out.append({"id": pid, "name": (name or "?").strip(), "env": env,
+                    "base": env.get("ANTHROPIC_BASE_URL") or "?",
+                    "key_tail": key[-4:] if len(key) >= 8 else "?",
+                    "is_current": bool(cur)})
+    return out
+
+
+def _provider_now() -> str:
+    """settings.json 当前生效的供应商一行描述（key 只显尾号；db 里对不上时如实标注）。"""
+    try:
+        env = json.loads(CLAUDE_SETTINGS.read_text("utf-8")).get("env") or {}
+    except Exception:
+        return "未知（读不到 ~/.claude/settings.json）"
+    key = str(env.get("ANTHROPIC_API_KEY") or "")
+    base = str(env.get("ANTHROPIC_BASE_URL") or "?")
+    tail = key[-4:] if len(key) >= 8 else "?"
+    hit = next((p for p in _providers()
+                if p["key_tail"] == tail and p["base"] == base), None)
+    name = hit["name"] if hit else "(不在 cc-switch 库中)"
+    return f"{name} · {base} · 模型 {env.get('ANTHROPIC_MODEL') or '?'} · key …{tail}"
+
+
+def _session_model(sf: Path) -> str:
+    """转录里最近一次实际使用的模型（尾部 assistant 条目的 model 字段）。"""
+    try:
+        with sf.open("rb") as fh:
+            fh.seek(max(0, sf.stat().st_size - 262144))
+            for line in reversed(fh.read().decode("utf-8", "replace").splitlines()):
+                if '"model"' not in line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                m = (d.get("message") or {}).get("model")
+                if m:
+                    return m
+    except OSError:
+        pass
+    return "?"
+
+
+def _switch_provider(chat_id: str, arg: str) -> None:
+    """切换供应商：整块换 settings.json 的 env（其余配置不动）+ 同步 cc-switch 两处
+    状态保持 GUI 一致；回收空闲分身（内存里揣着旧 key；绑定保留，下条消息自动
+    --resume 起新进程用新 key）。正在跑回合的分身不硬杀，回执说明。"""
+    provs = _providers()
+    if not provs:
+        send_text(chat_id, "❌ 读不到 cc-switch 供应商库（~/.cc-switch/cc-switch.db）。")
+        return
+    a = arg.strip().lower()
+    target = provs[int(a) - 1] if a.isdigit() and 1 <= int(a) <= len(provs) else None
+    if target is None:
+        cands = [p for p in provs if a and a in p["name"].lower()]
+        if len(cands) == 1:
+            target = cands[0]
+    if target is None:
+        send_text(chat_id, "用法：/provider <序号|名称关键字>（不带参数列出全部供应商）。")
+        return
+    if not target["env"]:
+        send_text(chat_id, f"❌ {target['name']} 是官方 OAuth 等非 env 形态配置，"
+                           "bot 切不了，请在 cc-switch 界面切换。")
+        return
+    try:
+        settings = json.loads(CLAUDE_SETTINGS.read_text("utf-8"))
+    except Exception:
+        send_text(chat_id, "❌ 读不到 ~/.claude/settings.json，未做任何改动。")
+        return
+    old_env = settings.get("env") or {}
+    if target["base"] == old_env.get("ANTHROPIC_BASE_URL") and \
+            target["key_tail"] == str(old_env.get("ANTHROPIC_API_KEY") or "")[-4:]:
+        send_text(chat_id, f"✅ {target['name']} 已经是当前供应商，无需切换。")
+        return
+    # 1) ~/.claude/settings.json：整块换 env（hooks/permissions 等其余配置不动）
+    log(f"[Provider 切换] {old_env.get('ANTHROPIC_BASE_URL')} → {target['base']}")
+    settings["env"] = dict(target["env"])
+    CLAUDE_SETTINGS.write_text(json.dumps(settings, ensure_ascii=False, indent=2), "utf-8")
+    # 2) cc-switch 两处状态（GUI 显示一致；SQLite 短事务，与界面并发安全）
+    try:
+        db = sqlite3.connect(f"file:{CCSWITCH_DB.as_posix()}", uri=True)
+        db.execute("update providers set is_current=0 where app_type='claude'")
+        db.execute("update providers set is_current=1 where id=?", (target["id"],))
+        db.commit()
+        db.close()
+        cs = json.loads(CCSWITCH_SETTINGS.read_text("utf-8"))
+        cs["currentProviderClaude"] = target["id"]
+        CCSWITCH_SETTINGS.write_text(json.dumps(cs, ensure_ascii=False, indent=2), "utf-8")
+    except Exception as e:
+        log(f"[Provider 状态同步失败，settings.json 已切换] {e!r}")
+    # 3) 回收空闲分身（揣着旧 key）；绑定保留，下条消息自动起新进程
+    idle_slots, busy = [], 0
+    with _running_lock:
+        for v in list(_running.values()):
+            if v.get("in_turn"):
+                busy += 1
+            else:
+                idle_slots.append(v)
+    for v in idle_slots:
+        v["reason"] = "recycle"
+        if v.get("proc"):
+            kill_task(v["proc"])
+    tips = [f"🔄 供应商已切换：{target['name']}（{target['base']}）",
+            "· 新起进程立即用新 key；终端里的活会话需重启 resume 才换"]
+    if idle_slots:
+        tips.append(f"· 已回收空闲分身 {len(idle_slots)} 个（绑定保留，发消息自动续接）")
+    if busy:
+        tips.append(f"· ⚠️ {busy} 个分身正在跑回合，这轮跑完仍是旧 key")
+    send_text(chat_id, "\n".join(tips))
+
+
+# ---------------- 命令缩写（/ob → /observe：唯一前缀展开，歧义则提示补全） ----------------
+COMMANDS = ["/help", "/new", "/exit", "/stop", "/status", "/session", "/sessions",
+            "/takeover", "/peek", "/observe", "/unobserve", "/unqueue", "/rename",
+            "/cwd", "/mode", "/mute", "/unmute", "/quiet", "/unquiet",
+            "/addcmd", "/delcmd", "/cmds", "/panel", "/listen", "/provider"]
+
+
+def _expand_cmd(text: str):
+    """首词若是不完整的命令缩写则展开。返回 (text, note)：text=None 表示歧义终止，
+    note 是回执提示。完整命令与自定义命令原样放行。"""
+    parts = text.split(None, 1)
+    head = parts[0].lower()
+    rest = parts[1] if len(parts) > 1 else ""
+    if head in COMMANDS or not head.startswith("/") or len(head) < 2:
+        return text, ""
+    hits = [c for c in COMMANDS if c.startswith(head)]
+    if len(hits) == 1:
+        return hits[0] + ((" " + rest) if rest else ""), f"↔️ {head} → {hits[0]}"
+    if hits:
+        return None, f"❓ {head} 匹配多个命令：{' '.join(hits)}（多打几位消歧义）"
+    return text, ""   # 自定义命令（/addcmd 面板）或未知命令，交原逻辑
+
+
 # ---------------- 命令处理 ----------------
 def handle_command(chat_id: str, text: str) -> None:
     global WORK_DIR
+    text, note = _expand_cmd(text)
+    if note:
+        send_text(chat_id, note)
+    if text is None:
+        return
     parts = text.split()
     cmd = parts[0].lower()
     arg = text[len(parts[0]):].strip()
@@ -1972,6 +2147,15 @@ def handle_command(chat_id: str, text: str) -> None:
         obs_sid = (_observers.get(chat_id) or {}).get("sid")
         if obs_sid:
             lines.append(f"· 📡 实时观察：会话 {obs_sid[:8]}…（快照卡片自动刷新，/unobserve 停止）")
+        lines += ["", "🔑 Provider",
+                  f"· 全局生效：{_provider_now()}"]
+        sess = _sessions.get(chat_id) or {}
+        if sess.get("session_id"):
+            sf, _cwd2 = _find_session_file(sess["session_id"])
+            if sf:
+                born = next((v.get("provider") for k, v in slots if v.get("provider")), None)
+                extra = f"（驻留分身启动于 {born}）" if born else "（终端会话按其启动时刻的配置）"
+                lines.append(f"· 本会话最近模型：{_session_model(sf)} {extra}")
         send_text(chat_id, "\n".join(lines))
     elif cmd == "/session":
         sess = _sessions.get(chat_id) or {}
@@ -2102,6 +2286,26 @@ def handle_command(chat_id: str, text: str) -> None:
     elif cmd == "/unobserve":
         if not _stop_observer(chat_id, note="📴 已停止实时观察。"):
             send_text(chat_id, "本聊天当前没有在观察任何会话（/observe <序号|ID|latest> 开始）。")
+    elif cmd == "/provider":
+        provs = _providers()
+        if not provs:
+            send_text(chat_id, "❌ 读不到 cc-switch 供应商库（~/.cc-switch/cc-switch.db）。")
+        elif arg:
+            _switch_provider(chat_id, arg)
+        else:
+            try:
+                cur_env = json.loads(CLAUDE_SETTINGS.read_text("utf-8")).get("env") or {}
+                cur_tail = str(cur_env.get("ANTHROPIC_API_KEY") or "")[-4:]
+                cur_base = cur_env.get("ANTHROPIC_BASE_URL")
+            except Exception:
+                cur_tail, cur_base = None, None
+            lines = ["🔑 Claude 供应商（cc-switch 库）："]
+            for i, p in enumerate(provs, 1):
+                mark = " ← 生效中" if (p["key_tail"] == cur_tail and p["base"] == cur_base) else ""
+                lines.append(f"{i}. {p['name']} · {p['base']} · key …{p['key_tail']}{mark}")
+            lines += ["", f"当前生效：{_provider_now()}",
+                      "切换：/provider <序号|名称关键字>（新起进程生效，终端活会话需重启）"]
+            send_text(chat_id, "\n".join(lines))
     elif cmd == "/unqueue":
         with _msg_queue_lock:
             msgs = _msg_queue.pop(chat_id, [])
