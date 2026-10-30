@@ -15,6 +15,8 @@ pending_perm.json
 bot.log
 bot_console.log
 bot_console.old.log
+bot_err.log
+bot_err.old.log
 
 # Python
 .venv/
