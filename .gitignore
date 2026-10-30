@@ -13,6 +13,8 @@ summaries.json
 observe.json
 pending_perm.json
 bot.log
+bot_console.log
+bot_console.old.log
 
 # Python
 .venv/

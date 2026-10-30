@@ -13,6 +13,11 @@ Get-CimInstance Win32_Process -Filter "Name='python.exe'" |
     }
 Start-Sleep -Seconds 2
 
-Write-Host "启动机器人…（新窗口，保持开着）"
-Start-Process -FilePath $py -ArgumentList "$base\bot.py" -WorkingDirectory $base
-Write-Host "完成。看到 ✅ 飞书机器人已启动 即为正常。"
+Write-Host "启动机器人…（隐藏窗口，输出落 bot_console.log）"
+# 隐藏 cmd 壳运行 python 并把 stdout/stderr 追加到日志：SDK 的 WS 连接/报错
+# 不再只进看不见的窗口（10-30 事故：WS 首连卡死，bot 活着但聋、日志零线索）
+$old = "$base\bot_console.old.log"
+if (Test-Path "$base\bot_console.log") { Move-Item -Force "$base\bot_console.log" $old }
+$cmdLine = "`"$py`" `"$base\bot.py`" >> `"$base\bot_console.log`" 2>&1"
+Start-Process cmd -ArgumentList "/c $cmdLine" -WindowStyle Hidden
+Write-Host "完成。发条消息验证，或看 bot.log 尾部。"

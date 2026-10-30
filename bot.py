@@ -2647,6 +2647,38 @@ def on_card_action(event) -> object:
         return _card_toast(f"❌ {e!r}", "error")
 
 
+def _ws_watchdog() -> None:
+    """WS 连接看门狗：飞书长连接首连失败/重连卡死时，bot 会"活着但聋"——
+    进程在、零出站连接、消息收不到，bot.log 毫无线索（错误只在 SDK 的
+    stderr 里）。每 90 秒查一次本进程到外网 443 的 ESTABLISHED 连接，
+    连续两轮没有 → 先通知再自杀，把拉起交给外部（restart.ps1 / 保活）。"""
+    miss = 0
+    while True:
+        time.sleep(90)
+        try:
+            ok = any(c.status == "ESTABLISHED" and c.raddr
+                     and c.raddr.ip not in ("127.0.0.1", "::1", "0.0.0.0")
+                     and c.raddr.port == 443
+                     for c in psutil.Process(os.getpid()).net_connections("tcp"))
+        except Exception:
+            ok = True   # psutil 探查失败（权限等）：宁可不误杀
+        if ok:
+            miss = 0
+            continue
+        miss += 1
+        log(f"[WS 看门狗] 未检测到飞书出站连接（第 {miss}/2 次）")
+        if miss >= 2:
+            log("[WS 看门狗] 持续 3 分钟无飞书连接，判定 WS 卡死，自杀待外部拉起")
+            try:
+                chat = _desktop_perm_target() or ""
+                if chat:
+                    send_text(chat, "⚠️ bot 的飞书长连接卡死（进程活着但收不到消息），"
+                                    "已自动退出待重启——请稍后发消息验证，或运行 restart.ps1。")
+            except Exception:
+                pass
+            os._exit(1)
+
+
 def main() -> None:
     if not CLAUDE_PATH:
         sys.exit("❌ 找不到 claude 命令。请确认已安装 Claude Code 并在 PATH 中，"
@@ -2721,6 +2753,8 @@ def main() -> None:
     print(f"   白名单：{len(ALLOWED_USERS)} 人" + ("" if ALLOWED_USERS else "（未配置，首条消息会提示如何配置）"))
     # 权限确认通道：perm_mcp.py（claude 的 MCP 权限回调）连回本进程
     threading.Thread(target=_perm_server, daemon=True).start()
+    if psutil:
+        threading.Thread(target=_ws_watchdog, daemon=True).start()
     print("   等待消息中…（Ctrl+C 退出）")
     ws.start()  # 阻塞，断线自动重连
 
