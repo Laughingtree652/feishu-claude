@@ -111,8 +111,8 @@ HELP_TEXT = """📖 命令列表
 /takeover [序号|会话ID|latest|last] — 接管电脑上的会话（latest=电脑最新；last=本聊天上次让出的；在跑的发卡片选：排队/强制/取消）
 /exit — 退出当前接管的会话（解绑+回收驻留进程；历史保留，可再 /takeover）
 /handover [说明] — 一键移交终端：中断当前活→分身收尾总结写进转录→自动退出，接手命令（claude --resume）进剪贴板，终端粘贴回车即续跑
-/peek [序号|会话ID|latest] — 旁观会话当前进度（正在干什么、最新输出）
-/observe [序号|会话ID|latest] — 实时观察：转录有动静自动刷新快照卡片（远程看终端直播；观察中再 /ob 同一会话 = 重发新卡刷回底部）
+/peek [序号|会话ID|latest|last] — 旁观会话当前进度（last=本聊天上次让出的会话）
+/observe [序号|会话ID|latest|last] — 实时观察：转录有动静自动刷新快照卡片（last=上次让出的会话；观察中再 /ob 同一会话 = 重发新卡刷回底部）
 /unobserve — 停止实时观察
 /provider [序号|名称] — 查看/切换 Claude 供应商（cc-switch 库；切换即换 key，新起进程生效）
 /unqueue — 取消排队接管
@@ -2498,7 +2498,14 @@ def handle_command(chat_id: str, text: str) -> None:
         if not want:
             sid = (_sessions.get(chat_id) or {}).get("session_id")
             if not sid:
-                send_text(chat_id, "当前聊天没有绑定会话。用法：/peek <序号|会话ID|latest>")
+                send_text(chat_id, "当前聊天没有绑定会话。用法：/peek <序号|会话ID|latest|last>")
+                return
+        elif want.lower() == "last":
+            # 本聊天上一次让位/移交出去的会话（/exit /handover 换绑时自动记录）
+            sid = (_last_sessions.get(chat_id) or {}).get("sid")
+            if not sid:
+                send_text(chat_id, "本聊天没有让位过的会话记录"
+                                   "（/exit、/handover 或换绑后可 /peek last 查看）。")
                 return
         elif want.lower() == "latest":
             sid, _ = _latest_desktop_session()
@@ -2523,7 +2530,14 @@ def handle_command(chat_id: str, text: str) -> None:
         if not want:
             sid = (_sessions.get(chat_id) or {}).get("session_id")
             if not sid:
-                send_text(chat_id, "当前聊天没有绑定会话。用法：/observe <序号|会话ID|latest>")
+                send_text(chat_id, "当前聊天没有绑定会话。用法：/observe <序号|会话ID|latest|last>")
+                return
+        elif want.lower() == "last":
+            # 本聊天上一次让位/移交出去的会话（/exit /handover 换绑时自动记录）
+            sid = (_last_sessions.get(chat_id) or {}).get("sid")
+            if not sid:
+                send_text(chat_id, "本聊天没有让位过的会话记录"
+                                   "（/exit、/handover 或换绑后可 /observe last 观察）。")
                 return
         elif want.lower() == "latest":
             sid, _ = _latest_desktop_session()
@@ -2553,7 +2567,7 @@ def handle_command(chat_id: str, text: str) -> None:
                            "· 只读旁观：不占用会话，跟排队接管、其他聊天的观察互不干扰")
     elif cmd == "/unobserve":
         if not _stop_observer(chat_id, note="📴 已停止实时观察。"):
-            send_text(chat_id, "本聊天当前没有在观察任何会话（/observe <序号|ID|latest> 开始）。")
+            send_text(chat_id, "本聊天当前没有在观察任何会话（/observe <序号|ID|latest|last> 开始）。")
     elif cmd == "/provider":
         provs = _providers()
         if not provs:
