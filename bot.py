@@ -1387,6 +1387,9 @@ def _session_reader(chat_id: str, key: str, slot: dict) -> None:
         pass  # 主动让位（/new /cwd /takeover 换绑），命令本身已有回复
     elif reason == "handover":
         pass  # /handover 中断让位：正在 --resume 重生跑收尾总结，不打扰
+    elif reason == "exit":
+        pass  # 主动退出/移交（/exit、/handover 落地）taskkill 强杀退出码非 0，
+              # 不算异常——命令本身已有回执，别再发"进程异常退出"
     elif returncode != 0:
         if slot.get("sid") and ("session" in tail.lower() or "conversation" in tail.lower()):
             # --resume 失效（目录切换/记录损坏等）
