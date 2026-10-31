@@ -19,7 +19,7 @@ import urllib.request
 import sys
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 # 闲置回收的子进程检测用；未安装（没跑 uv sync）时自动退回纯时间判定
@@ -1922,7 +1922,14 @@ def _session_tail(session_file: Path, n: int = 14, since: int = -1):
             t = d.get("type")
             if t not in ("user", "assistant"):
                 continue
-            ts = (d.get("timestamp") or "")[11:19]
+            ts_raw = d.get("timestamp") or ""
+            ts = ts_raw[11:19]
+            if ts_raw.endswith("Z"):   # 转录时间戳是 UTC：转成北京时间（UTC+8）再展示
+                try:
+                    ts = datetime.fromisoformat(ts_raw.replace("Z", "+00:00")) \
+                        .astimezone(timezone(timedelta(hours=8))).strftime("%H:%M:%S")
+                except ValueError:
+                    pass
             c = (d.get("message") or {}).get("content")
             if t == "user":
                 if d.get("isMeta"):
@@ -1954,7 +1961,9 @@ def _session_tail(session_file: Path, n: int = 14, since: int = -1):
                     if not isinstance(b, dict):
                         continue
                     if b.get("type") == "text" and (b.get("text") or "").strip():
-                        out.append((ts, "🤖", b["text"].strip().replace("\n", " ")))   # 文字回复全显
+                        # 文字回复全显不截，且保留换行——压平会把 markdown 表格的
+                        # 行结构摧毁（一行竖线串渲染不出表格），观察卡就看不到表了
+                        out.append((ts, "🤖", b["text"].strip()))
                     elif b.get("type") == "tool_use":
                         out.append((ts, "🔧", _tool_summary(b.get("name", ""), b.get("input"))))
         if since >= 0 and len(out) < n:
@@ -1985,7 +1994,14 @@ def _peek_lines(chat_id: str, sid: str, sf: Path, cwd, eye: str = "👀",
         head = f"{eye} [{proj}] {sid[:8]}…（状态未知）"
     if name:
         head += f" 📛{name}"
-    lines = [head, "最近动态："] + [f"  {t} {who} {txt}" for t, who, txt in _session_tail(sf, since=since)]
+    lines = [head, "最近动态："]
+    for t, who, txt in _session_tail(sf, since=since):
+        if "\n" in txt:
+            # 多行内容（含表格）：给每行压 "时间 角色" 前缀会污染行首，表格就渲染
+            # 不出来了——元信息独立成行，原文整块另起（前后空行兼顾表格的上下文）
+            lines += [f"  {t} {who} ⬇", "", txt, ""]
+        else:
+            lines.append(f"  {t} {who} {txt}")
     pp_line = _pending_perm_line(sid, sf)
     if pp_line:
         lines.insert(1, pp_line)
