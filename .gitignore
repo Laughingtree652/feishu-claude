@@ -1,6 +1,7 @@
 # 敏感信息 / 本地状态（不进仓库）
 .env
 sessions.json
+last.json
 names.json
 commands.json
 listen.json

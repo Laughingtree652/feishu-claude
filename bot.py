@@ -108,9 +108,9 @@ HELP_TEXT = """📖 命令列表
 /status — 状态面板：机器人设置（权限/静默/免@）+ 会话绑定与进程工作状态
 /session — 查看当前会话 ID（在电脑上 claude --resume <id> 可接续）
 /sessions [条数] — 列出电脑上最近的会话（含当前绑定的；用过一段的自动带一行摘要）
-/takeover [序号|会话ID|latest] — 接管电脑上的会话（在跑的发卡片选：排队/强制/取消）
+/takeover [序号|会话ID|latest|last] — 接管电脑上的会话（latest=电脑最新；last=本聊天上次让出的；在跑的发卡片选：排队/强制/取消）
 /exit — 退出当前接管的会话（解绑+回收驻留进程；历史保留，可再 /takeover）
-/handover [说明] — 一键移交终端：解绑+回收分身，resume 命令自动复制到剪贴板，到终端粘贴回车即接手续跑（带说明则作为移交后的首条指令）
+/handover [说明] — 一键移交终端：中断当前活→分身收尾总结写进转录→自动退出，接手命令（claude --resume）进剪贴板，终端粘贴回车即续跑
 /peek [序号|会话ID|latest] — 旁观会话当前进度（正在干什么、最新输出）
 /observe [序号|会话ID|latest] — 实时观察：转录有动静自动刷新快照卡片（远程看终端直播；观察中再 /ob 同一会话 = 重发新卡刷回底部）
 /unobserve — 停止实时观察
@@ -448,6 +448,9 @@ def _takeover_running_dialog(chat_id: str, sid: str, cwd, session_file, age: flo
     if val == "cancel":
         send_text(chat_id, "↩️ 已取消接管。")
         return
+    old_sid = (_sessions.get(chat_id) or {}).get("session_id")
+    if old_sid and old_sid != sid:
+        _remember_last(chat_id, old_sid)   # 换绑前的旧会话，/takeover last 可接回
     if val == "force":
         _recycle_chat_sessions(chat_id)   # 换绑：旧会话的驻留进程让位
         evicted = _bind_session(chat_id, sid, cwd)
@@ -1121,10 +1124,75 @@ def _write_to_session(slot: dict, text: str) -> bool:
 def _recycle_chat_sessions(chat_id: str, reason: str = "recycle") -> None:
     """终结该聊天名下的所有长驻会话进程（/new /cwd /takeover 换绑时用）。"""
     with _running_lock:
+        last_sid = None
         for key, slot in list(_running.items()):
             if slot.get("chat_id") == chat_id and slot.get("proc") is not None:
+                last_sid = slot.get("sid") or last_sid
                 slot["reason"] = reason
                 kill_task(slot["proc"])
+    if last_sid:   # 记下让位的会话，/takeover last 一键接回（/exit /handover/换绑都走这里）
+        _remember_last(chat_id, last_sid)
+
+
+# ---------------- 让位会话记忆 + 移交收尾（/takeover last · /handover） ----------------
+LAST_FILE = BASE_DIR / "last.json"      # chat_id -> {sid, work_dir, ts}
+_last_lock = threading.Lock()
+_last_sessions: dict = {}
+if LAST_FILE.exists():
+    try:
+        _last_sessions = json.loads(LAST_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        _last_sessions = {}
+
+# /handover 等待收尾的聊天：chat_id -> {sid, cmd_line, ts}（收尾回合结束或超时由 _finalize 消费）
+_handover_lock = threading.Lock()
+_handovers: dict = {}
+HANDOVER_WAIT = 180   # 分身收尾总结的最长等待（秒），超时强制移交
+
+
+def _remember_last(chat_id: str, sid: str) -> None:
+    """聊天让位某会话时记一笔，/takeover last 据此一键接回。"""
+    with _last_lock:
+        _last_sessions[chat_id] = {"sid": sid,
+                                   "work_dir": (_sessions.get(chat_id) or {}).get("work_dir"),
+                                   "ts": time.time()}
+        try:
+            LAST_FILE.write_text(json.dumps(_last_sessions, ensure_ascii=False), encoding="utf-8")
+        except Exception:
+            pass
+
+
+def _finalize_handover(chat_id: str, forced: bool) -> None:
+    """/handover 的落地动作：分身收尾完成后（或超时强推）真正移交终端。"""
+    with _handover_lock:
+        info = _handovers.pop(chat_id, None)
+    if not info:
+        return   # 已被另一路收尾（result 先到/超时先到），幂等退出
+    sid = info["sid"]
+    label = _names.get(sid) or f"{sid[:8]}…"
+    cmd_line = info["cmd_line"]
+    # 走 PowerShell Set-Clipboard：CreateProcess 参数原生 UTF-16，中文不经码页转换
+    try:
+        subprocess.run(["powershell", "-NoProfile", "-Command",
+                        "Set-Clipboard -Value '" + cmd_line.replace("'", "’") + "'"],
+                       creationflags=subprocess.CREATE_NO_WINDOW, check=False)
+        clip_note = "✅ 接手命令已复制到剪贴板——到任意终端 Ctrl+V 回车即续跑"
+    except Exception:
+        clip_note = "⚠️ 剪贴板复制失败，手动执行：\n" + cmd_line
+    _remember_last(chat_id, sid)   # /takeover last 可一键接回
+    _recycle_chat_sessions(chat_id, reason="exit")   # 分身退场
+    with _pending_lock:
+        _pending.pop(chat_id, None)
+    with _sessions_lock:
+        _sessions.pop(chat_id, None)
+    save_sessions()
+    done_note = ("· 收尾总结已写入转录，终端接手第一眼可见\n" if not forced else
+                 "⚠️ 收尾超时未完成已强制移交——半程进度都在转录里，终端可续\n")
+    send_text(chat_id, f"🤝 会话已移交终端：{label}\n"
+                       f"{done_note}"
+                       f"· {clip_note}\n"
+                       f"· 若终端还开着本会话的进程，先 Ctrl+C 关掉再粘贴（避免两边同时写入）\n"
+                       "· /takeover last 随时把它接回飞书")
 
 
 def run_task(chat_id: str, prompt: str) -> None:
@@ -1317,6 +1385,8 @@ def _session_reader(chat_id: str, key: str, slot: dict) -> None:
         send_text(chat_id, "💤 会话进程已闲置回收（上下文已保存），随时发消息继续。")
     elif reason == "recycle":
         pass  # 主动让位（/new /cwd /takeover 换绑），命令本身已有回复
+    elif reason == "handover":
+        pass  # /handover 中断让位：正在 --resume 重生跑收尾总结，不打扰
     elif returncode != 0:
         if slot.get("sid") and ("session" in tail.lower() or "conversation" in tail.lower()):
             # --resume 失效（目录切换/记录损坏等）
@@ -1373,6 +1443,10 @@ def _finish_turn(chat_id: str, result: dict, last_text: str, slot: dict) -> None
                 slot["proc"].stdin.close()
         except (BrokenPipeError, OSError, ValueError):
             pass
+
+    # /handover 等收尾的聊天：收尾总结回合一结束就落地移交（进程稍后由 _finalize 杀掉）
+    if _handovers:
+        _finalize_handover(chat_id, forced=False)
 
 
 def _session_watchdog(chat_id: str, key: str, slot: dict) -> None:
@@ -2140,6 +2214,9 @@ def handle_command(chat_id: str, text: str) -> None:
     if cmd == "/help":
         send_text(chat_id, HELP_TEXT)
     elif cmd == "/new":
+        old_sid = (_sessions.get(chat_id) or {}).get("session_id")
+        if old_sid:
+            _remember_last(chat_id, old_sid)   # 旧会话让位，/takeover last 可接回
         _recycle_chat_sessions(chat_id)   # 终结旧会话的驻留进程
         with _pending_lock:   # 排队接管一并取消（否则队列线程稍后会发给新会话）
             _pending.pop(chat_id, None)
@@ -2153,6 +2230,8 @@ def handle_command(chat_id: str, text: str) -> None:
             send_text(chat_id, "当前聊天没有绑定会话，无需退出（直接发消息会开新会话）。")
             return
         sid = info.get("session_id") or ""
+        if sid:
+            _remember_last(chat_id, sid)   # /takeover last 可一键接回
         _recycle_chat_sessions(chat_id, reason="exit")   # 回收本聊天的驻留进程
         with _pending_lock:   # 排队接管一并取消
             _pending.pop(chat_id, None)
@@ -2161,10 +2240,11 @@ def handle_command(chat_id: str, text: str) -> None:
         save_sessions()
         label = _names.get(sid) or f"{sid[:8]}…"
         send_text(chat_id, f"🚪 已退出会话 {label}（驻留进程已回收，历史保留）。\n"
-                           f"· /takeover {sid[:8]} 可随时重新接管\n"
+                           "· /takeover last 可随时重新接管本会话\n"
                            "· 直接发消息则开启全新会话")
     elif cmd == "/handover":
-        # 一键移交终端：解绑+回收分身，resume 命令进剪贴板；带参数=移交说明
+        # 一键移交终端：分身先收尾（总结写进转录，终端接手第一眼可见），再退出+解绑。
+        # 正在跑的回合直接中断——"剩下的活"正是要交给终端的部分。
         sess = _sessions.get(chat_id) or {}
         sid = sess.get("session_id")
         if not sid:
@@ -2174,32 +2254,36 @@ def handle_command(chat_id: str, text: str) -> None:
         note = " ".join(arg.split())   # 移交说明压成单行，引号换成中文引号防破坏命令行
         note = note.replace('"', "”")
         cwd = sess.get("work_dir") or _chat_work_dir(chat_id)
-        label = _names.get(sid) or f"{sid[:8]}…"
-        if note:   # 带说明：作为终端接手后的首条指令（半程活由它继续）
+        if note:   # 带说明：嵌进接手命令，终端粘贴回车即带着说明续跑
             cmd_line = f'claude --resume {sid} "【飞书移交】剩下的活继续：{note}"'
         else:
             cmd_line = f"claude --resume {sid}"
-        try:
-            # 走 PowerShell Set-Clipboard：CreateProcess 参数原生 UTF-16，中文不经码页转换
-            subprocess.run(["powershell", "-NoProfile", "-Command",
-                            "Set-Clipboard -Value '" + cmd_line.replace("'", "’") + "'"],
-                           creationflags=subprocess.CREATE_NO_WINDOW, check=False)
-            clip_note = "✅ 命令已复制到剪贴板——到任意终端 Ctrl+V 回车即接手"
-        except Exception:
-            clip_note = "⚠️ 剪贴板复制失败，手动执行：\n" + cmd_line
-        # bot 侧停掉自己（同 /exit）：解绑+回收分身+取消排队。
-        # 跑回合中的分身一并中断——半程进度都在转录里，终端 resume 即续。
-        _recycle_chat_sessions(chat_id, reason="exit")
-        with _pending_lock:
-            _pending.pop(chat_id, None)
-        with _sessions_lock:
-            _sessions.pop(chat_id, None)
-        save_sessions()
-        send_text(chat_id, f"🤝 会话已移交终端：{label}\n"
+        # 正在跑的回合先中断（记 handover 原因，读泵静默收尾）
+        with _running_lock:
+            targets = [(k, s) for k, s in _running.items()
+                       if s.get("chat_id") == chat_id and s.get("proc") is not None
+                       and s.get("in_turn")]
+        for key, slot in targets:
+            slot["reason"] = "handover"
+            kill_task(slot["proc"])
+            with _msg_queue_lock:
+                _msg_queue.pop(key, None)
+        # 挂移交单：收尾回合结束（_finish_turn）或超时（Timer）由 _finalize 落地
+        with _handover_lock:
+            _handovers[chat_id] = {"sid": sid, "cmd_line": cmd_line, "ts": time.time()}
+        t = threading.Timer(HANDOVER_WAIT, _finalize_handover, args=(chat_id, True))
+        t.daemon = True
+        t.start()
+        # 收尾指令：进程活着（空闲）直送 stdin；被中断/本无进程则 run_task --resume 重生
+        wrapup = ("【移交终端】本会话即将从飞书移交电脑终端，请立即收尾、不要开始新的工作："
+                  "简要总结 ①当前任务进行到哪一步 ②已完成的关键改动/结论"
+                  f"③剩下的活（移交说明：{note or '见上文'}）④终端接手时的注意事项。"
+                  "这段总结将留在会话转录里，是终端接手后读到的最后内容。")
+        run_task(chat_id, wrapup)
+        send_text(chat_id, "🤝 移交中：分身正在做收尾总结（写进转录，终端接手可见），"
+                           "完成后自动退出并发送接手命令。\n"
                            f"· 工作目录：{cwd}\n"
-                           f"· 分身已回收（跑回合中的也已中断，进度都在转录里，终端续跑即可）\n"
-                           f"· {clip_note}\n"
-                           f"· 本聊天已解绑；/takeover {sid[:8]} 随时可再接管回飞书")
+                           f"· 接手命令（完成后自动进剪贴板）：{cmd_line}")
     elif cmd == "/stop":
         with _pending_lock:
             had_pending = _pending.pop(chat_id, None)
@@ -2313,7 +2397,18 @@ def handle_command(chat_id: str, text: str) -> None:
         if force:
             want = want[:-1].strip() or "latest"
         sid = cwd = None
-        if want.lower() == "latest":
+        if want.lower() == "last":
+            # 本聊天上一次让位/移交出去的会话（/exit /handover 换绑时自动记录）
+            info = _last_sessions.get(chat_id) or {}
+            sid = info.get("sid")
+            if not sid:
+                send_text(chat_id, "本聊天没有让位过的会话记录"
+                                   "（/exit、/handover 或换绑后可 /takeover last 接回）。")
+                return
+            cwd = info.get("work_dir")
+            if not cwd:   # 记录时没带目录：从会话列表兜底
+                _, cwd = _find_session_file(sid)
+        elif want.lower() == "latest":
             sid, cwd = _latest_desktop_session()
         elif want.isdigit():
             # 与 /sessions 同一份列表（含机器人管理的会话），序号才对得上
@@ -2341,6 +2436,9 @@ def handle_command(chat_id: str, text: str) -> None:
                                  args=(chat_id, sid, cwd, session_file, age),
                                  daemon=True).start()
                 return
+        old_sid = (_sessions.get(chat_id) or {}).get("session_id")
+        if old_sid and old_sid != sid:
+            _remember_last(chat_id, old_sid)   # 换绑前的旧会话，/takeover last 可接回
         _recycle_chat_sessions(chat_id)   # 换绑：旧会话的驻留进程让位
         evicted = _bind_session(chat_id, sid, cwd)
         stolen = "\n📌 该会话此前绑定在另一个聊天，已转移过来（对方已收到通知）。" if evicted else ""
