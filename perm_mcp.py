@@ -59,6 +59,11 @@ def ask_bot(args: dict) -> dict:
 
 def main() -> None:
     """极简 stdio MCP：newline 分隔的 JSON-RPC，只实现 initialize/tools/list/tools/call。"""
+    # MCP stdio 协议是 UTF-8，而 Windows 管道下 Python 默认按 cp936 解码——
+    # 中文 tool_input 会错解成乱码（飞书卡片上就是乱码），显式改为 UTF-8。
+    # stdout 同理：拒绝原因里的中文要原路传回 claude。
+    sys.stdin.reconfigure(encoding="utf-8", errors="replace")
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     for line in sys.stdin:
         line = line.strip()
         if not line:

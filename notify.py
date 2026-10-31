@@ -119,7 +119,9 @@ def main() -> int:
         return 0  # 机器人自己的 claude 子进程，bot 已转发结果，跳过
 
     try:
-        hook = json.loads(sys.stdin.read() or "{}")
+        # hook 的 stdin 是 UTF-8 JSON；Windows 管道下 Python 默认按 cp936 解码，
+        # 中文 cwd/message 会乱码（perm_gate.py 同款坑），显式按 UTF-8 读
+        hook = json.loads(sys.stdin.buffer.read().decode("utf-8", "replace") or "{}")
     except Exception:
         return 0
 
