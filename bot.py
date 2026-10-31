@@ -660,15 +660,13 @@ def _send_card(chat_id: str, card: dict):
 def _info_card(title: str, md: str, template: str = "blue") -> dict:
     """信息类卡片（/help /status 等）的统一外壳。
 
-    用 markdown 元素：lark_md 只支持粗体/链接等小子集，列表、标题、
-    代码块都会原样显示（ob 卡片不渲染的根因）；markdown 元素才是完整语法。
+    卡片 2.0 + markdown 组件：1.0 JSON 的 lark_md/markdown 元素实测都不
+    渲染（列表/标题/代码块原样显示），2.0 才是完整语法渲染（已实验验证）。
     """
-    return {
-        "config": {"wide_screen_mode": True},
-        "header": {"template": template,
-                   "title": {"tag": "plain_text", "content": title}},
-        "elements": [{"tag": "markdown", "content": md}],
-    }
+    return {"schema": "2.0",
+            "header": {"title": {"tag": "plain_text", "content": title},
+                       "template": template},
+            "body": {"elements": [{"tag": "markdown", "content": md}]}}
 
 
 class _LiveReply:
@@ -687,13 +685,13 @@ class _LiveReply:
         self._last_patch = 0.0
 
     def _card(self, content: str, streaming: bool) -> dict:
-        # markdown 元素（完整语法渲染）；Claude 回复本身就是 markdown，
-        # lark_md 会把列表/标题/代码块原样显示
-        els = [{"tag": "markdown", "content": content or "…"}]
+        # 卡片 2.0 + markdown 组件：Claude 回复本身就是 markdown，1.0 的
+        # lark_md/markdown 元素实测不渲染（原样显示），2.0 才是完整语法。
+        # 生成中提示并入内容尾部（2.0 少挂组件，零结构风险）。
+        c = content or "…"
         if streaming:
-            els.append({"tag": "note", "elements": [
-                {"tag": "plain_text", "content": "✍️ 正在生成…"}]})
-        return {"config": {"wide_screen_mode": True}, "elements": els}
+            c += "\n\n*(✍️ 正在生成…)*"
+        return {"schema": "2.0", "body": {"elements": [{"tag": "markdown", "content": c}]}}
 
     def _patch(self, content: str, streaming: bool) -> None:
         """把当前卡片整卡更新为指定内容；失败置 ok=False（后续走文本降级）。"""
@@ -798,7 +796,7 @@ def _freeze_choice_card(msg_id, card: dict, answer) -> None:
                 btn["text"] = {"tag": "plain_text", "content": f"{label}（已选择）"}
     if status:
         new_card.setdefault("elements", []).append(
-            {"tag": "markdown", "content": status})
+            {"tag": "div", "text": {"tag": "lark_md", "content": status}})
     req = PatchMessageRequest.builder() \
         .message_id(msg_id) \
         .request_body(PatchMessageRequestBody.builder()
@@ -844,10 +842,10 @@ def _ask_choice(chat_id: str, title: str, body_md: str, options: list,
             for o in options]
     elements = []
     if body_md:
-        elements.append({"tag": "markdown", "content": body_md})
+        elements.append({"tag": "div", "text": {"tag": "lark_md", "content": body_md}})
     elements.append({"tag": "action", "actions": btns})
     if note:
-        elements.append({"tag": "markdown", "content": note})
+        elements.append({"tag": "div", "text": {"tag": "lark_md", "content": note}})
     card = {"config": {"wide_screen_mode": True},
             "header": {"template": template,
                        "title": {"tag": "plain_text", "content": title}},
@@ -2025,11 +2023,10 @@ def _observe_loop(chat_id: str, sid: str, stop: threading.Event) -> None:
             pass
         last_push = time.time()
         content = "\n".join(_peek_lines(chat_id, sid, sf, cwd, eye="📡", since=prev))
-        card = {"config": {"wide_screen_mode": True},
-                "elements": [
-                    {"tag": "markdown", "content": content or "…"},
-                    {"tag": "note", "elements": [
-                        {"tag": "plain_text", "content": note}]}]}
+        # 卡片 2.0 + markdown 组件（1.0 的元素实测不渲染）；状态行并入内容尾部斜体
+        card = {"schema": "2.0",
+                "body": {"elements": [{"tag": "markdown",
+                                       "content": (content or "…") + f"\n\n*({note})*"}]}}
         if msg_id:   # 常规路径：整卡刷新；失败降级为重建新卡
             try:
                 req = PatchMessageRequest.builder() \
