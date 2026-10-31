@@ -16,9 +16,19 @@ import sys
 from pathlib import Path
 
 BASE = Path(__file__).resolve().parent
-TARGET_FILE = BASE / "notify_target.json"
-MUTE_FILE = BASE / "mute.flag"
-LOG_FILE = BASE / "notify.log"
+# 状态文件在 data/、日志在 logs/（与 bot.py 同布局）。
+# 兼容回退：bot 未重启的割裂窗口期，运行中的老 bot 还在往根目录写，
+# 本 hook 每次都是新进程（读的是最新落点），读新位置没有就回退老位置。
+STATE = BASE / "data"
+TARGET_FILE = STATE / "notify_target.json"
+MUTE_FILE = STATE / "mute.flag"
+LOG_FILE = BASE / "logs" / "notify.log"
+LOG_FILE.parent.mkdir(exist_ok=True)
+
+
+def _legacy(name: str) -> Path:
+    """老布局位置（根目录）——仅作读回退与 handoff 双写用。"""
+    return BASE / name
 
 
 def _log(msg: str) -> None:
@@ -113,8 +123,20 @@ def _send(app_id: str, app_secret: str, chat_id: str, text: str) -> bool:
         return False
 
 
-HANDOFF_FILE = BASE / "handoff_requests.json"
-ROUTE_FILE = BASE / "desktop_route.json"
+HANDOFF_FILE = STATE / "handoff_requests.json"
+ROUTE_FILE = STATE / "desktop_route.json"
+
+
+def _read_state(path: Path, default) -> dict:
+    """读状态 JSON：新位置优先，没有回退老位置（根目录）。都读不到返回 default。"""
+    try:
+        return json.loads(path.read_text("utf-8"))
+    except Exception:
+        pass
+    try:
+        return json.loads(_legacy(path.name).read_text("utf-8"))
+    except Exception:
+        return default
 
 
 def _route_target(sid: str) -> str:
@@ -122,15 +144,13 @@ def _route_target(sid: str) -> str:
     会话的聊天），未命中退回最后活跃聊天（notify_target.json）。失败返回 ""。"""
     if sid:
         try:
-            data = json.loads(ROUTE_FILE.read_text("utf-8")) \
-                if ROUTE_FILE.exists() else {}
-            hit = data.get(sid)
+            hit = _read_state(ROUTE_FILE, {}).get(sid)
             if isinstance(hit, str) and hit:
                 return hit
         except Exception:
             pass
     try:
-        return json.loads(TARGET_FILE.read_text("utf-8"))["chat_id"]
+        return _read_state(TARGET_FILE, {})["chat_id"]
     except Exception:
         return ""
 
@@ -145,14 +165,18 @@ def _pop_handoff(sid) -> str:
     if not sid:
         return ""
     try:
-        data = json.loads(HANDOFF_FILE.read_text("utf-8")) \
-            if HANDOFF_FILE.exists() else {}
+        data = _read_state(HANDOFF_FILE, {})
         item = data.pop(sid, None)
         if not item:
             return ""
         tmp = HANDOFF_FILE.with_suffix(".tmp")
         tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
         tmp.replace(HANDOFF_FILE)
+        # 割裂窗口期（bot 未重启时根目录副本可能还在）双写保持两边一致，
+        # 让老 bot 读到的移交列表也是消费后的状态
+        legacy = _legacy(HANDOFF_FILE.name)
+        if legacy.exists():
+            legacy.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
         return str(item.get("reason") or "")
     except Exception:
         return ""
@@ -196,8 +220,8 @@ def main() -> int:
                                         ensure_ascii=False))
             return 0
 
-    # 手动静音（飞书里 /mute）
-    if MUTE_FILE.exists():
+    # 手动静音（飞书里 /mute；老布局位置也查——bot 未重启时标志在根目录）
+    if MUTE_FILE.exists() or _legacy(MUTE_FILE.name).exists():
         return 0
     # 人在电脑前（最近有键鼠活动）就不打扰；离开超过阈值才推送
     try:

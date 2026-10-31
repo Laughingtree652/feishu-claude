@@ -20,8 +20,9 @@ import sys
 from pathlib import Path
 
 BASE = Path(__file__).resolve().parent
-LOG_FILE = BASE / "notify.log"
-MUTE_FILE = BASE / "mute.flag"
+LOG_FILE = BASE / "logs" / "notify.log"   # 日志集中进 logs/（与 bot.py 同布局）
+LOG_FILE.parent.mkdir(exist_ok=True)
+MUTE_FILE = BASE / "data" / "mute.flag"   # 状态进 data/；老布局位置兜底着查
 
 
 def _log(msg: str) -> None:
@@ -67,7 +68,7 @@ def main() -> int:
     if os.environ.get("FEISHU_BOT_CHILD") == "1":
         return 0  # bot 分身：权限已走 perm_mcp 的飞书卡，别发双卡
     # 手动静音（/mute）＝桌面事件推送全部暂停，权限确认回退终端
-    if MUTE_FILE.exists():
+    if MUTE_FILE.exists() or (BASE / "mute.flag").exists():
         return 0
 
     try:

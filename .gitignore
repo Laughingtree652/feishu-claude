@@ -1,21 +1,29 @@
 # 敏感信息 / 本地状态（不进仓库）
 .env
+
+# 运行状态与日志（bot.py 收敛进 data/、logs/，整目录忽略）
+data/
+logs/
+
+# 老布局残留（割裂窗口期：运行中的 bot 未重启时仍写根目录；迁移收编后可清理这组）
 sessions.json
 last.json
 names.json
-commands.json
 listen.json
 notify_target.json
 notify.log
 mute.flag
 quiet.json
+quiet.flag
 modes.json
 models.json
 summaries.json
 observe.json
 pending_perm.json
+pending_user.json
 handoff_requests.json
 desktop_route.json
+commands.json
 bot.log
 bot_console.log
 bot_console.old.log

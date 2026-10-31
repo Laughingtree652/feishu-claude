@@ -46,6 +46,38 @@ if sys.stdout and hasattr(sys.stdout, "reconfigure"):
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
 
+# ---------------- 目录布局：状态进 data/、日志进 logs/ ----------------
+STATE_DIR = BASE_DIR / "data"
+LOGS_DIR = BASE_DIR / "logs"
+STATE_DIR.mkdir(exist_ok=True)
+LOGS_DIR.mkdir(exist_ok=True)
+
+# 老布局（状态文件散在根目录）的一次性迁移清单：启动时老位置存在则
+# 搬进 data/（bot.log 进 logs/）。幂等；老覆盖新（割裂窗口期运行中的
+# 老 bot 一直在写根目录，老文件反而最新）。新增状态文件时记得登记。
+_MIGRATE_FILES = [
+    "sessions.json", "names.json", "models.json", "summaries.json",
+    "listen.json", "quiet.json", "quiet.flag", "modes.json",
+    "handoff_requests.json", "pending_perm.json", "pending_user.json",
+    "desktop_route.json", "notify_target.json", "last.json",
+    "observe.json", "mute.flag", "bot.log",
+]
+
+
+def _migrate_state_files() -> None:
+    for name in _MIGRATE_FILES:
+        old = BASE_DIR / name
+        if not old.exists():
+            continue
+        dst = (LOGS_DIR if name == "bot.log" else STATE_DIR) / name
+        try:
+            old.replace(dst)   # 覆盖同名目标：老位置的是运行期最新数据
+        except OSError:
+            pass
+
+
+_migrate_state_files()
+
 # ---------------- 配置（均可在 .env 覆盖） ----------------
 APP_ID = os.environ["FEISHU_APP_ID"]
 APP_SECRET = os.environ["FEISHU_APP_SECRET"]
@@ -96,7 +128,7 @@ PERM_TIMEOUT = int(os.environ.get("PERM_TIMEOUT_SECONDS", "0"))  # 等用户确�
 PERM_GATE_WAIT = int(os.environ.get("PERM_GATE_WAIT", "300"))    # 桌面权限卡等待上限（秒）；超时不答复，回退桌面终端弹框
 TAKEOVER_ASK_TIMEOUT = 60  # 接管运行中会话时等用户选卡片选项的上限（秒），超时默认排队
 
-SESSION_FILE = BASE_DIR / "sessions.json"
+SESSION_FILE = STATE_DIR / "sessions.json"
 MAX_CHUNK = 3500      # 单条飞书消息最大字符数，超长自动分段
 SEND_INTERVAL = 0.5   # 发消息最小间隔（秒），避免触发飞书频控
 LIVE_PATCH_INTERVAL = 1.2  # 流式卡片刷新间隔（秒）：更实时但太频繁会触发卡片更新频控
@@ -182,7 +214,7 @@ if SESSION_FILE.exists():
         _sessions = {}
 
 # ---------------- 会话命名（session_id -> 名字，/rename 维护） ----------------
-NAMES_FILE = BASE_DIR / "names.json"
+NAMES_FILE = STATE_DIR / "names.json"
 _names_lock = threading.Lock()
 _names: dict = {}
 if NAMES_FILE.exists():
@@ -200,7 +232,7 @@ def save_names() -> None:
             pass
 
 # ---------------- 聊天级模型设置（chat_id -> 模型名，/model 维护；分身 spawn 时 --model 显式指定） ----------------
-MODELS_FILE = BASE_DIR / "models.json"
+MODELS_FILE = STATE_DIR / "models.json"
 _models_lock = threading.Lock()
 _chat_models: dict = {}
 if MODELS_FILE.exists():
@@ -219,7 +251,7 @@ def save_models() -> None:
 
 
 # ---------------- 会话摘要（session_id -> 一行总结，驻留进程收尾时后台生成） ----------------
-SUMMARY_FILE = BASE_DIR / "summaries.json"
+SUMMARY_FILE = STATE_DIR / "summaries.json"
 _summaries: dict = {}
 if SUMMARY_FILE.exists():
     try:
@@ -235,7 +267,7 @@ def save_summaries() -> None:
         pass
 
 # ---------------- 免 @ 群（/listen 维护：只有自己+机器人的群里消息全量接收） ----------------
-LISTEN_FILE = BASE_DIR / "listen.json"
+LISTEN_FILE = STATE_DIR / "listen.json"
 _listen_lock = threading.Lock()
 _listen: set = set()
 if LISTEN_FILE.exists():
@@ -258,23 +290,23 @@ def save_listen() -> None:
 # ---------------- 静默模式 / 权限模式覆盖（/quiet /mode 维护，均按聊天独立落盘） ----------------
 # 静默模式：开着时本聊天不转发过程性输出（思考文本/🔧 工具调用），只推权限确认卡片、
 # 最终结果和异常——通知只出现在"需要你拍板"的时刻
-QUIET_FILE = BASE_DIR / "quiet.json"
+QUIET_FILE = STATE_DIR / "quiet.json"
 _quiet: set = set()
 if QUIET_FILE.exists():
     try:
         _quiet = set(json.loads(QUIET_FILE.read_text("utf-8")))
     except Exception:
         _quiet = set()
-elif (BASE_DIR / "quiet.flag").exists():
+elif (STATE_DIR / "quiet.flag").exists():
     # 旧版全局静默开关迁移：对所有绑定过会话的聊天开启，并删除旧标记
     _quiet = set(_sessions)
     try:
         QUIET_FILE.write_text(json.dumps(sorted(_quiet), ensure_ascii=False, indent=1), "utf-8")
-        (BASE_DIR / "quiet.flag").unlink()
+        (STATE_DIR / "quiet.flag").unlink()
     except OSError:
         pass
 
-MODES_FILE = BASE_DIR / "modes.json"
+MODES_FILE = STATE_DIR / "modes.json"
 _modes: dict = {}   # chat_id -> 权限模式（本聊天独立设置；未设置用全局默认 PERMISSION_MODE）
 if MODES_FILE.exists():
     try:
@@ -402,7 +434,7 @@ def _bind_session(chat_id: str, sid: str, cwd) -> list:
 
 
 # ---------------- 终端移交标记（takeover 接管落地 → 终端 Stop hook 消费） ----------------
-HANDOFF_FILE = BASE_DIR / "handoff_requests.json"   # sid -> {"reason", "ts"}
+HANDOFF_FILE = STATE_DIR / "handoff_requests.json"   # sid -> {"reason", "ts"}
 TERMINAL_HANDOFF_PROMPT = (
     "【飞书已接管本会话】你的工作已由飞书端的分身接手，请立即收尾、不要开始新的工作："
     "①简要说明当前进行到哪一步、还有什么没完成；"
@@ -569,7 +601,7 @@ def _active_child_count(proc: subprocess.Popen) -> int:
 
 
 # ---------------- 运行日志（打印 + 落盘 bot.log，机器人窗口看不到时远程排障用） ----------------
-LOG_FILE = BASE_DIR / "bot.log"
+LOG_FILE = LOGS_DIR / "bot.log"
 
 
 def log(msg: str) -> None:
@@ -960,7 +992,7 @@ def _perm_input_display(tool: str, inp) -> str:
 
 
 # ---------------- 桌面权限等待标记（perm_gate.py 转来的确认，/peek 与 /observe 显示） ----------------
-PENDING_PERM_FILE = BASE_DIR / "pending_perm.json"
+PENDING_PERM_FILE = STATE_DIR / "pending_perm.json"
 _pending_perm_lock = threading.Lock()
 _pending_perm: dict = {}    # sid -> {"ts": float, "tool": str}
 if PENDING_PERM_FILE.exists():
@@ -1018,7 +1050,7 @@ def _pending_perm_line(sid: str, sf: Path) -> str:
     return f"⏸ 桌面端在等你确认权限（{pp.get('tool', '?')}，{wait}）——确认卡已推到飞书，点 ✅ 放行 / ❌ 拒绝"
 
 
-DESKTOP_ROUTE_FILE = BASE_DIR / "desktop_route.json"   # sid -> chat_id（供 notify.py 查）
+DESKTOP_ROUTE_FILE = STATE_DIR / "desktop_route.json"   # sid -> chat_id（供 notify.py 查）
 
 
 def _desktop_route(sid: str) -> str:
@@ -1070,7 +1102,7 @@ def _desktop_perm_target(sid: str = "") -> str:
     if chat:
         return chat
     try:
-        return json.loads((BASE_DIR / "notify_target.json").read_text("utf-8")).get("chat_id") or ""
+        return json.loads((STATE_DIR / "notify_target.json").read_text("utf-8")).get("chat_id") or ""
     except Exception:
         return ""
 
@@ -1274,7 +1306,7 @@ def _recycle_chat_sessions(chat_id: str, reason: str = "recycle") -> None:
 
 
 # ---------------- 让位会话记忆 + 移交收尾（/takeover last · /handover） ----------------
-LAST_FILE = BASE_DIR / "last.json"      # chat_id -> {sid, work_dir, ts}
+LAST_FILE = STATE_DIR / "last.json"      # chat_id -> {sid, work_dir, ts}
 _last_lock = threading.Lock()
 _last_sessions: dict = {}
 if LAST_FILE.exists():
@@ -2036,7 +2068,7 @@ def _peek_lines(chat_id: str, sid: str, sf: Path, cwd, eye: str = "👀",
 
 
 # ---------------- 实时观察（/observe：盯转录文件，新动静时节流刷新快照卡片） ----------------
-OBSERVE_FILE = BASE_DIR / "observe.json"
+OBSERVE_FILE = STATE_DIR / "observe.json"
 OBSERVE_REFRESH = int(os.environ.get("OBSERVE_REFRESH_SECONDS", "15"))      # 快照刷新最小间隔（秒）
 _observers_lock = threading.Lock()
 _observers: dict = {}    # chat_id -> {"sid": str, "stop": threading.Event}
@@ -2498,7 +2530,7 @@ def handle_command(chat_id: str, text: str) -> None:
                             else f"{_mode_label(chat_id)}（全局默认，/mode 可单独设置本聊天）"),
             "- 静默模式：" + ("开启——只推权限卡片/最终结果/异常（/unquiet 关闭）" if chat_id in _quiet
                              else "关闭（/quiet 开启：不刷思考/工具过程）"),
-            "- 桌面事件推送：" + ("已静音" if (BASE_DIR / "mute.flag").exists() else "正常")
+            "- 桌面事件推送：" + ("已静音" if (STATE_DIR / "mute.flag").exists() else "正常")
                              + "（优先发到与该会话相关的聊天——接管/让位记录；无关会话发最后活跃聊天）",
         ]
         if listening:
@@ -2855,7 +2887,7 @@ def handle_command(chat_id: str, text: str) -> None:
         send_text(chat_id, "\n".join(lines))
     elif cmd == "/mute":
         try:
-            (BASE_DIR / "mute.flag").write_text(
+            (STATE_DIR / "mute.flag").write_text(
                 datetime.now().isoformat(timespec="seconds"), "utf-8")
         except OSError:
             pass
@@ -2863,7 +2895,7 @@ def handle_command(chat_id: str, text: str) -> None:
                            "另外：检测到你最近 3 分钟有键鼠活动时也会自动不打扰。")
     elif cmd == "/unmute":
         try:
-            (BASE_DIR / "mute.flag").unlink()
+            (STATE_DIR / "mute.flag").unlink()
         except OSError:
             pass
         send_text(chat_id, "🔔 桌面事件推送已恢复。")
@@ -2945,7 +2977,7 @@ def on_message(event: P2ImMessageReceiveV1) -> None:
         if not ALLOWED_USERS:
             # 记录首个发消息的人，便于自动完成白名单配置
             try:
-                (BASE_DIR / "pending_user.json").write_text(
+                (STATE_DIR / "pending_user.json").write_text(
                     json.dumps({"chat_id": chat_id, "open_id": sender_id,
                                 "updated": datetime.now().isoformat(timespec="seconds")},
                                ensure_ascii=False), "utf-8")
@@ -3001,7 +3033,7 @@ def dispatch_text(chat_id: str, text: str, sender_id: str = "") -> None:
     # 记录通知目标：桌面 hook 的 notify.py 读它把提醒推到这个聊天（最后活跃的聊天优先）
     if sender_id:
         try:
-            (BASE_DIR / "notify_target.json").write_text(
+            (STATE_DIR / "notify_target.json").write_text(
                 json.dumps({"chat_id": chat_id, "open_id": sender_id,
                             "updated": datetime.now().isoformat(timespec="seconds")},
                            ensure_ascii=False), "utf-8")
@@ -3062,7 +3094,7 @@ def on_app_version(event) -> None:
         else:
             text = f"📋 应用版本审核事件：{operation} {version}\n{remark[:200]}"
         try:
-            chat_id = json.loads((BASE_DIR / "notify_target.json").read_text("utf-8"))["chat_id"]
+            chat_id = json.loads((STATE_DIR / "notify_target.json").read_text("utf-8"))["chat_id"]
             send_text(chat_id, text)
         except Exception:
             print(f"[版本通知] 无通知目标，未推送：{text}")
