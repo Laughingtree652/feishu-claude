@@ -103,7 +103,7 @@ LIVE_PATCH_INTERVAL = 1.2  # 流式卡片刷新间隔（秒）：更实时但太
 
 HELP_TEXT = """📖 命令列表
 /help — 查看本帮助
-/new — 开启新会话（清除历史上下文）
+/new — 新开一个零上下文的会话（旧会话历史保留，/takeover last 可接回）
 /stop — 中断当前任务（排队的消息一并取消）
 /status — 状态面板：机器人设置（权限/静默/免@）+ 会话绑定与进程工作状态
 /session — 查看当前会话 ID（在电脑上 claude --resume <id> 可接续）
@@ -130,6 +130,40 @@ HELP_TEXT = """📖 命令列表
 Claude 需要权限确认时会发卡片，点按钮或直接回复文字（允许/拒绝/自定义说明）。
 命令支持缩写：唯一前缀自动展开（如 /ob → /observe），歧义时提示候选。
 !命令 = 直接在本机 PowerShell 执行（不经 Claude），如 !git status"""
+
+# 卡片版帮助（/help 发送；HELP_TEXT 保留作卡片失败的兜底纯文本）
+HELP_MD = """**🧩 会话管理**
+- **/new** — 新开一个零上下文的会话（旧会话历史保留，/takeover last 可接回）
+- **/stop** — 中断当前任务（排队的消息一并取消）
+- **/exit** — 退出当前接管的会话（解绑+回收驻留进程；历史保留，可再 /takeover）
+- **/handover** [说明] — 一键移交终端：中断当前活→分身收尾总结写进转录→自动退出，接手命令进剪贴板，终端粘贴回车即续跑
+
+**📡 接管与进度**
+- **/takeover** [序号|会话ID|latest|last] — 接管电脑上的会话（latest=电脑最新；last=本聊天上次让出的；在跑的发卡片选：排队/强制/取消）
+- **/peek** [序号|会话ID|latest|last] — 旁观会话当前进度
+- **/observe** [序号|会话ID|latest|last] — 实时观察：转录有动静自动刷新快照卡片
+- **/unobserve** — 停止实时观察
+- **/sessions** [条数] — 列出电脑上最近的会话（用过一段的自动带一行摘要）
+- **/session** — 查看当前会话 ID（在本机 claude --resume 会话ID 可接续）
+- **/rename** [名字] — 给当前会话起名（/sessions 列表优先显示名字）
+- **/unqueue** — 取消排队接管
+
+**⚙️ 设置**
+- **/status** — 状态面板：机器人设置 + 会话绑定与进程工作状态
+- **/mode** [模式] — 查看/切换本聊天的权限模式（manual、auto、acceptEdits…，未设置时用全局默认）
+- **/model** [序号|名称|reset] — 查看/切换本聊天的模型（reset 回退全局默认）
+- **/cwd** [路径] — 查看/切换 Claude 的工作目录
+- **/provider** [序号|名称] — 查看/切换 Claude 供应商（cc-switch 库；切换即换 key，新起进程生效）
+- **/listen** — 群聊免 @ 模式：本群所有消息直接发给机器人（适合只有你+机器人的群）
+- **/mute · /unmute** — 暂停/恢复桌面事件推送（全局）
+- **/quiet · /unquiet** — 静默模式（本聊天）：只推最终结果和权限确认
+
+**💡 说明**
+- 直接发送文本 = 给 Claude 下指令，多轮对话自动保持上下文
+- 回复以流式卡片实时呈现；任务执行中发的消息会直接递给 Claude（边跑边回应）
+- Claude 需要权限确认时会发卡片，点按钮或直接回复文字
+- 命令支持唯一前缀缩写（如 /ob → /observe），歧义时提示候选
+- **!命令** = 直接在本机 PowerShell 执行（不经 Claude），如 !git status"""
 
 # 用于发消息的 API 客户端（与收消息的 WebSocket 客户端相互独立）
 api = lark.Client.builder() \
@@ -620,6 +654,20 @@ def _send_card(chat_id: str, card: dict):
     except Exception as e:
         log(f"[发卡片异常] {e!r}")
         return None
+
+
+def _info_card(title: str, md: str, template: str = "blue") -> dict:
+    """信息类卡片（/help /status 等）的统一外壳。
+
+    用与流式/观察卡片同款的 div + lark_md 元素（实证可渲染），不用
+    markdown 直元素——本项目卡片一直是 1.0 结构，未验证过它的兼容性。
+    """
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {"template": template,
+                   "title": {"tag": "plain_text", "content": title}},
+        "elements": [{"tag": "div", "text": {"tag": "lark_md", "content": md}}],
+    }
 
 
 class _LiveReply:
@@ -2203,7 +2251,8 @@ def handle_command(chat_id: str, text: str) -> None:
     arg = text[len(parts[0]):].strip()
 
     if cmd == "/help":
-        send_text(chat_id, HELP_TEXT)
+        if not _send_card(chat_id, _info_card("📖 命令帮助", HELP_MD)):
+            send_text(chat_id, HELP_TEXT)   # 卡片发送失败兜底纯文本
     elif cmd == "/new":
         old_sid = (_sessions.get(chat_id) or {}).get("session_id")
         if old_sid:
@@ -2214,7 +2263,8 @@ def handle_command(chat_id: str, text: str) -> None:
         with _sessions_lock:
             _sessions.pop(chat_id, None)
         save_sessions()
-        send_text(chat_id, "🆕 已开启新会话，下一条消息不带历史上下文。")
+        send_text(chat_id, "🆕 已新开零上下文会话，下一条消息从零开始"
+                           "（旧会话历史保留，/takeover last 可接回）。")
     elif cmd == "/exit":
         info = _sessions.get(chat_id)
         if not info:
@@ -2308,14 +2358,12 @@ def handle_command(chat_id: str, text: str) -> None:
         with _listen_lock:
             listening = chat_id in _listen
         lines = [
-            "📊 状态",
-            "",
-            "⚙️ 本聊天设置",
-            "· 权限模式：" + (f"{_mode_label(chat_id)}（本聊天独立，/mode 切换）" if chat_id in _modes
+            "**⚙️ 本聊天设置**",
+            "- 权限模式：" + (f"{_mode_label(chat_id)}（本聊天独立，/mode 切换）" if chat_id in _modes
                             else f"{_mode_label(chat_id)}（全局默认，/mode 可单独设置本聊天）"),
-            "· 静默模式：" + ("开启——只推权限卡片/最终结果/异常（/unquiet 关闭）" if chat_id in _quiet
+            "- 静默模式：" + ("开启——只推权限卡片/最终结果/异常（/unquiet 关闭）" if chat_id in _quiet
                              else "关闭（/quiet 开启：不刷思考/工具过程）"),
-            "· 桌面事件推送：" + ("已静音" if (BASE_DIR / "mute.flag").exists() else "正常")
+            "- 桌面事件推送：" + ("已静音" if (BASE_DIR / "mute.flag").exists() else "正常")
                              + "（全局：桌面通知只有唯一目标聊天，/mute /unmute 切换）",
         ]
         if listening:
@@ -2323,40 +2371,42 @@ def handle_command(chat_id: str, text: str) -> None:
         if CLAUDE_TIMEOUT > 0:
             lines.append(f"· 单回合限时：{CLAUDE_TIMEOUT}s（超时强杀，/stop 随时中断）")
         label = _chat_label(chat_id)
-        lines += ["", "🧠 本聊天的 Claude 会话",
-                  f"· 会话：{label[1:-1] if label else '未绑定（下一条消息开新会话）'}",
-                  f"· 工作目录：{_chat_work_dir(chat_id)}"]
+        lines += ["", "**🧠 本聊天的 Claude 会话**",
+                  f"- 会话：{label[1:-1] if label else '未绑定（下一条消息开新会话）'}",
+                  f"- 工作目录：{_chat_work_dir(chat_id)}"]
         cur_key = _task_key(chat_id)
         if slots:
             for k, v in slots:
                 who = "当前会话" if k == cur_key else f"{k[:8]}…"
                 idle_s = int(time.time() - v.get("last_event", v["started"]))
                 if v.get("in_turn"):
-                    lines.append(f"· 进程状态：🔴 {who} 工作中（最近活动 {idle_s}s 前；/stop 可中断）")
+                    lines.append(f"- 进程状态：🔴 {who} 工作中（最近活动 {idle_s}s 前；/stop 可中断）")
                 else:
-                    lines.append(f"· 进程状态：🟢 {who} 空闲驻留（{idle_s}s 无活动，"
+                    lines.append(f"- 进程状态：🟢 {who} 空闲驻留（{idle_s}s 无活动，"
                                  f"{SESSION_IDLE_TIMEOUT // 60} 分钟后自动回收，消息直达进程）")
         else:
-            lines.append("· 进程状态：⚪ 无驻留进程（发消息自动 --resume 续接上下文）")
+            lines.append("- 进程状态：⚪ 无驻留进程（发消息自动 --resume 续接上下文）")
         if qn:
-            lines.append(f"· 📥 排队中：{qn} 条消息（自动依次执行）")
+            lines.append(f"- 📥 排队中：{qn} 条消息（自动依次执行）")
         if pend:
-            lines.append(f"· ⏳ 排队接管：等会话 {pend['sid'][:8]}… 空闲（已积 {len(pend['queue'])} 条；/unqueue 取消）")
+            lines.append(f"- ⏳ 排队接管：等会话 {pend['sid'][:8]}… 空闲（已积 {len(pend['queue'])} 条；/unqueue 取消）")
         obs_sid = (_observers.get(chat_id) or {}).get("sid")
         if obs_sid:
-            lines.append(f"· 📡 实时观察：会话 {obs_sid[:8]}…（快照卡片自动刷新，/unobserve 停止）")
-        lines += ["", "🔑 Provider",
-                  f"· 全局生效：{_provider_now()}"]
+            lines.append(f"- 📡 实时观察：会话 {obs_sid[:8]}…（快照卡片自动刷新，/unobserve 停止）")
+        lines += ["", "**🔑 Provider**",
+                  f"- 全局生效：{_provider_now()}"]
         m_set = _chat_models.get(chat_id)
-        lines.append(f"· 本聊天模型：{m_set}（显式）" if m_set else "· 本聊天模型：跟随全局")
+        lines.append(f"- 本聊天模型：{m_set}（显式）" if m_set else "- 本聊天模型：跟随全局")
         sess = _sessions.get(chat_id) or {}
         if sess.get("session_id"):
             sf, _cwd2 = _find_session_file(sess["session_id"])
             if sf:
                 born = next((v.get("provider") for k, v in slots if v.get("provider")), None)
                 extra = f"（驻留分身启动于 {born}）" if born else "（终端会话按其启动时刻的配置）"
-                lines.append(f"· 本会话最近模型：{_session_model(sf)} {extra}")
-        send_text(chat_id, "\n".join(lines))
+                lines.append(f"- 本会话最近模型：{_session_model(sf)} {extra}")
+        md = "\n".join(lines)
+        if not _send_card(chat_id, _info_card("📊 状态面板", md, "turquoise")):
+            send_text(chat_id, md)   # 卡片发送失败兜底纯文本
     elif cmd == "/session":
         sess = _sessions.get(chat_id) or {}
         sid = sess.get("session_id")
