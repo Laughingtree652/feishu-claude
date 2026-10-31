@@ -305,6 +305,7 @@ def _chat_mode(chat_id: str) -> str:
 def save_sessions() -> None:
     with _sessions_lock:
         SESSION_FILE.write_text(json.dumps(_sessions, ensure_ascii=False, indent=1), "utf-8")
+    _save_desktop_route()   # 绑定关系变化必经此处，路由文件随最新鲜
 
 
 def _lookup_session(chat_id: str):
@@ -659,14 +660,14 @@ def _send_card(chat_id: str, card: dict):
 def _info_card(title: str, md: str, template: str = "blue") -> dict:
     """信息类卡片（/help /status 等）的统一外壳。
 
-    用与流式/观察卡片同款的 div + lark_md 元素（实证可渲染），不用
-    markdown 直元素——本项目卡片一直是 1.0 结构，未验证过它的兼容性。
+    用 markdown 元素：lark_md 只支持粗体/链接等小子集，列表、标题、
+    代码块都会原样显示（ob 卡片不渲染的根因）；markdown 元素才是完整语法。
     """
     return {
         "config": {"wide_screen_mode": True},
         "header": {"template": template,
                    "title": {"tag": "plain_text", "content": title}},
-        "elements": [{"tag": "div", "text": {"tag": "lark_md", "content": md}}],
+        "elements": [{"tag": "markdown", "content": md}],
     }
 
 
@@ -686,7 +687,9 @@ class _LiveReply:
         self._last_patch = 0.0
 
     def _card(self, content: str, streaming: bool) -> dict:
-        els = [{"tag": "div", "text": {"tag": "lark_md", "content": content or "…"}}]
+        # markdown 元素（完整语法渲染）；Claude 回复本身就是 markdown，
+        # lark_md 会把列表/标题/代码块原样显示
+        els = [{"tag": "markdown", "content": content or "…"}]
         if streaming:
             els.append({"tag": "note", "elements": [
                 {"tag": "plain_text", "content": "✍️ 正在生成…"}]})
@@ -795,7 +798,7 @@ def _freeze_choice_card(msg_id, card: dict, answer) -> None:
                 btn["text"] = {"tag": "plain_text", "content": f"{label}（已选择）"}
     if status:
         new_card.setdefault("elements", []).append(
-            {"tag": "div", "text": {"tag": "lark_md", "content": status}})
+            {"tag": "markdown", "content": status})
     req = PatchMessageRequest.builder() \
         .message_id(msg_id) \
         .request_body(PatchMessageRequestBody.builder()
@@ -841,10 +844,10 @@ def _ask_choice(chat_id: str, title: str, body_md: str, options: list,
             for o in options]
     elements = []
     if body_md:
-        elements.append({"tag": "div", "text": {"tag": "lark_md", "content": body_md}})
+        elements.append({"tag": "markdown", "content": body_md})
     elements.append({"tag": "action", "actions": btns})
     if note:
-        elements.append({"tag": "div", "text": {"tag": "lark_md", "content": note}})
+        elements.append({"tag": "markdown", "content": note})
     card = {"config": {"wide_screen_mode": True},
             "header": {"template": template,
                        "title": {"tag": "plain_text", "content": title}},
@@ -965,8 +968,57 @@ def _pending_perm_line(sid: str, sf: Path) -> str:
     return f"⏸ 桌面端在等你确认权限（{pp.get('tool', '?')}，{wait}）——确认卡已推到飞书，点 ✅ 放行 / ❌ 拒绝"
 
 
-def _desktop_perm_target() -> str:
-    """桌面事件的推送目标聊天（notify_target.json，与 notify.py 同源）。"""
+DESKTOP_ROUTE_FILE = BASE_DIR / "desktop_route.json"   # sid -> chat_id（供 notify.py 查）
+
+
+def _desktop_route(sid: str) -> str:
+    """按会话反查关联聊天：当前绑定优先，其次让位记录（last）。命中返回 chat_id。
+
+    桌面事件（权限卡/通知）自带 session_id，路由按"哪个聊天接管过/让出过
+    这个会话"走，而不是"用户最后在哪说话"。
+    """
+    if not sid:
+        return ""
+    with _sessions_lock:
+        for chat, info in _sessions.items():
+            if (info or {}).get("session_id") == sid:
+                return chat
+    with _last_lock:
+        for chat, item in _last_sessions.items():
+            if (item or {}).get("sid") == sid:
+                return chat
+    return ""
+
+
+def _save_desktop_route() -> None:
+    """把会话→聊天路由落盘，notify.py（桌面通知 hook，独立进程）据此推送。
+
+    来源：当前绑定（_sessions，优先）+ 让位记录（_last_sessions 补缺）。
+    幂等全量重建，绑定关系每次变化后调用。
+    """
+    route = {}
+    with _sessions_lock:
+        for chat, info in _sessions.items():
+            sid = (info or {}).get("session_id")
+            if sid:
+                route[sid] = chat
+    with _last_lock:
+        for chat, item in _last_sessions.items():
+            sid = (item or {}).get("sid")
+            if sid and sid not in route:
+                route[sid] = chat
+    try:
+        DESKTOP_ROUTE_FILE.write_text(json.dumps(route, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _desktop_perm_target(sid: str = "") -> str:
+    """桌面事件的推送目标聊天：优先按会话路由（接管过/让出过它的聊天），
+    未命中退回 notify_target.json（最后活跃聊天，与 notify.py 兜底一致）。"""
+    chat = _desktop_route(sid)
+    if chat:
+        return chat
     try:
         return json.loads((BASE_DIR / "notify_target.json").read_text("utf-8")).get("chat_id") or ""
     except Exception:
@@ -1035,9 +1087,10 @@ def _perm_conn(conn) -> None:
         elif payload and payload.get("type") == "perm":
             result = {"behavior": "deny", "message": "权限确认缺少聊天上下文"}
         elif payload and payload.get("type") == "desktop_perm":
-            # 桌面终端会话的权限确认（perm_gate.py hook 转来）：卡片推给桌面通知目标聊天
-            chat_id = _desktop_perm_target()
+            # 桌面终端会话的权限确认（perm_gate.py hook 转来）：按 sid 路由到
+            # 接管过/让出过该会话的聊天，未命中退回最后活跃聊天
             sid = str(payload.get("sid") or "")
+            chat_id = _desktop_perm_target(sid)
             tool = str(payload.get("tool_name") or "?")
             if not chat_id:
                 result = None   # bot 还没收过消息（无通知目标）：不答复，hook 让路终端
@@ -1196,6 +1249,7 @@ def _remember_last(chat_id: str, sid: str) -> None:
             LAST_FILE.write_text(json.dumps(_last_sessions, ensure_ascii=False), encoding="utf-8")
         except Exception:
             pass
+    _save_desktop_route()   # 让位关系变化，路由文件随最新鲜
 
 
 def _finalize_handover(chat_id: str, forced: bool) -> None:
@@ -1973,7 +2027,7 @@ def _observe_loop(chat_id: str, sid: str, stop: threading.Event) -> None:
         content = "\n".join(_peek_lines(chat_id, sid, sf, cwd, eye="📡", since=prev))
         card = {"config": {"wide_screen_mode": True},
                 "elements": [
-                    {"tag": "div", "text": {"tag": "lark_md", "content": content or "…"}},
+                    {"tag": "markdown", "content": content or "…"},
                     {"tag": "note", "elements": [
                         {"tag": "plain_text", "content": note}]}]}
         if msg_id:   # 常规路径：整卡刷新；失败降级为重建新卡
@@ -2364,7 +2418,7 @@ def handle_command(chat_id: str, text: str) -> None:
             "- 静默模式：" + ("开启——只推权限卡片/最终结果/异常（/unquiet 关闭）" if chat_id in _quiet
                              else "关闭（/quiet 开启：不刷思考/工具过程）"),
             "- 桌面事件推送：" + ("已静音" if (BASE_DIR / "mute.flag").exists() else "正常")
-                             + "（全局：桌面通知只有唯一目标聊天，/mute /unmute 切换）",
+                             + "（优先发到与该会话相关的聊天——接管/让位记录；无关会话发最后活跃聊天）",
         ]
         if listening:
             lines.append("· 群免 @：本群已开启（/listen 关闭）")
@@ -2997,6 +3051,7 @@ def main() -> None:
     if not CLAUDE_PATH:
         sys.exit("❌ 找不到 claude 命令。请确认已安装 Claude Code 并在 PATH 中，"
                  "或在 .env 中设置 CLAUDE_PATH=claude 的完整路径")
+    _save_desktop_route()   # 启动即按当前绑定/让位记录重建路由（notify.py 按它推送）
     if not WORK_DIR.is_dir():
         sys.exit(f"❌ 工作目录不存在：{WORK_DIR}")
     valid_modes = PERMISSION_MODES | {""}

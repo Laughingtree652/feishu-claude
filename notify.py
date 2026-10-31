@@ -114,6 +114,25 @@ def _send(app_id: str, app_secret: str, chat_id: str, text: str) -> bool:
 
 
 HANDOFF_FILE = BASE / "handoff_requests.json"
+ROUTE_FILE = BASE / "desktop_route.json"
+
+
+def _route_target(sid: str) -> str:
+    """通知目标：优先按会话路由（bot 维护的"会话→聊天"——接管过/让出过该
+    会话的聊天），未命中退回最后活跃聊天（notify_target.json）。失败返回 ""。"""
+    if sid:
+        try:
+            data = json.loads(ROUTE_FILE.read_text("utf-8")) \
+                if ROUTE_FILE.exists() else {}
+            hit = data.get(sid)
+            if isinstance(hit, str) and hit:
+                return hit
+        except Exception:
+            pass
+    try:
+        return json.loads(TARGET_FILE.read_text("utf-8"))["chat_id"]
+    except Exception:
+        return ""
 
 
 def _pop_handoff(sid) -> str:
@@ -151,11 +170,6 @@ def main() -> int:
     except Exception:
         return 0
 
-    # 通知目标（bot 收到过消息才会存在）
-    try:
-        chat_id = json.loads(TARGET_FILE.read_text("utf-8"))["chat_id"]
-    except Exception:
-        return 0
     env = _load_env()
     app_id, app_secret = env.get("FEISHU_APP_ID"), env.get("FEISHU_APP_SECRET")
     if not (app_id and app_secret):
@@ -164,6 +178,12 @@ def main() -> int:
     sid = hook.get("session_id") or ""
     cwd = hook.get("cwd") or ""
     event = hook.get("hook_event_name") or ""
+
+    # 通知目标：优先按会话路由（接管过/让出过该会话的聊天），
+    # 未命中退回最后活跃聊天（bot 收到过消息才会存在）
+    chat_id = _route_target(sid)
+    if not chat_id:
+        return 0
 
     # takeover 移交标记（仅 Stop 事件）：本会话已被飞书端接管——block 一轮，
     # 让终端 Claude 收尾交出（进展说明 + 后台任务台账）。这是会话管理而非
