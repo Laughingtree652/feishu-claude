@@ -113,6 +113,32 @@ def _send(app_id: str, app_secret: str, chat_id: str, text: str) -> bool:
         return False
 
 
+HANDOFF_FILE = BASE / "handoff_requests.json"
+
+
+def _pop_handoff(sid) -> str:
+    """查并消费该会话的终端移交指令（/takeover 接管落地时 bot 写入）。返回指令文本或 ""。
+
+    终端进程没有可注入消息的通道，唯一抓手是本 hook：Stop 时查到标记就
+    block 一轮、把指令喂给终端 Claude——跑完手头回合就被"劝停交出"。
+    任何失败都返回 ""（当没有标记），绝不干扰桌面会话。
+    """
+    if not sid:
+        return ""
+    try:
+        data = json.loads(HANDOFF_FILE.read_text("utf-8")) \
+            if HANDOFF_FILE.exists() else {}
+        item = data.pop(sid, None)
+        if not item:
+            return ""
+        tmp = HANDOFF_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(HANDOFF_FILE)
+        return str(item.get("reason") or "")
+    except Exception:
+        return ""
+
+
 def main() -> int:
     import os
     if os.environ.get("FEISHU_BOT_CHILD") == "1":
@@ -138,6 +164,17 @@ def main() -> int:
     sid = hook.get("session_id") or ""
     cwd = hook.get("cwd") or ""
     event = hook.get("hook_event_name") or ""
+
+    # takeover 移交标记（仅 Stop 事件）：本会话已被飞书端接管——block 一轮，
+    # 让终端 Claude 收尾交出（进展说明 + 后台任务台账）。这是会话管理而非
+    # 通知推送：mute / 人在电脑前都不豁免（人回电脑时终端与分身对着干风险
+    # 最大，更需要劝停）；分身在上面已提前 return，不会自吃自己的标记。
+    if event == "Stop" and sid:
+        reason = _pop_handoff(sid)
+        if reason:
+            sys.stdout.write(json.dumps({"decision": "block", "reason": reason},
+                                        ensure_ascii=False))
+            return 0
 
     # 手动静音（飞书里 /mute）
     if MUTE_FILE.exists():

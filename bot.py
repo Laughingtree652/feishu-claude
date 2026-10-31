@@ -388,6 +388,41 @@ def _bind_session(chat_id: str, sid: str, cwd) -> list:
     return evicted
 
 
+# ---------------- 终端移交标记（takeover 接管落地 → 终端 Stop hook 消费） ----------------
+HANDOFF_FILE = BASE_DIR / "handoff_requests.json"   # sid -> {"reason", "ts"}
+TERMINAL_HANDOFF_PROMPT = (
+    "【飞书已接管本会话】你的工作已由飞书端的分身接手，请立即收尾、不要开始新的工作："
+    "①简要说明当前进行到哪一步、还有什么没完成；"
+    "②清点你拉起的后台任务（如 run_in_background 的监控脚本）：逐个说明任务内容、PID、"
+    "输出位置、最近一次结果——不要停掉它们，接管方将按此清单继续跟进监控；"
+    "③说完即停。这段说明会留在转录里，由接管方读取。")
+
+
+def _mark_terminal_handoff(sid: str) -> None:
+    """takeover 接管落地时给该会话的终端宿主留移交指令。
+
+    终端进程没有可注入消息的通道（stdin 是用户终端的），唯一抓手是它的
+    Stop hook（notify.py）：回合结束触发时查到标记 → block 一轮把指令喂给
+    终端 Claude，跑完手头回合就被"劝停交出"。空闲的终端不触发 Stop，标记
+    留到它下次活动时生效；分身（FEISHU_BOT_CHILD=1）的 Stop 不查标记。
+    """
+    if not sid:
+        return
+    try:
+        data = json.loads(HANDOFF_FILE.read_text(encoding="utf-8")) \
+            if HANDOFF_FILE.exists() else {}
+    except Exception:
+        data = {}
+    data[sid] = {"reason": TERMINAL_HANDOFF_PROMPT, "ts": time.time()}
+    try:
+        tmp = HANDOFF_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, HANDOFF_FILE)
+        log(f"[移交标记] 已给会话 {sid[:8]}… 的终端宿主留移交指令")
+    except Exception as e:
+        log(f"[移交标记] 写入失败：{e!r}")
+
+
 def _wait_and_drain(chat_id: str) -> None:
     """轮询排队中的会话，回合结束（空闲）后把排队消息依次执行。
 
@@ -413,6 +448,7 @@ def _wait_and_drain(chat_id: str) -> None:
             pend = _pending.pop(chat_id, None)
         if not pend:
             return
+        _mark_terminal_handoff(pend["sid"])   # 终端跑完这轮 Stop 时会被劝停交出
         if not pend["queue"]:
             send_text(chat_id, f"✅ 会话 {pend['sid'][:8]}… 已空闲，接管生效，随时发消息。")
             return
@@ -454,11 +490,13 @@ def _takeover_running_dialog(chat_id: str, sid: str, cwd, session_file, age: flo
     if val == "force":
         _recycle_chat_sessions(chat_id)   # 换绑：旧会话的驻留进程让位
         evicted = _bind_session(chat_id, sid, cwd)
+        _mark_terminal_handoff(sid)   # 终端跑完手头回合 Stop 时会被劝停交出
         stolen = "\n📌 该会话此前绑定在另一个聊天，已转移过来（对方已收到通知）。" if evicted else ""
         send_text(chat_id,
                   f"✅ 已强制接管会话 {sid[:8]}…（目录：{_chat_work_dir(chat_id)}）\n"
                   "下一条消息将带上该会话的全部上下文。\n"
-                  "⚠️ 桌面那边若还开着，两边同时用会分叉，建议先退出桌面端。" + stolen)
+                  "· 已给终端留移交指令：它跑完手头回合会自动收尾交出"
+                  "（含后台任务台账），之后不再接活。" + stolen)
         return
     # queue：绑定 + 排队接管（沿用 _wait_and_drain 轮询机制）
     _recycle_chat_sessions(chat_id)   # 换绑：旧会话的驻留进程让位
@@ -2280,7 +2318,10 @@ def handle_command(chat_id: str, text: str) -> None:
         # 收尾指令：进程活着（空闲）直送 stdin；被中断/本无进程则 run_task --resume 重生
         wrapup = ("【移交终端】本会话即将从飞书移交电脑终端，请立即收尾、不要开始新的工作："
                   "简要总结 ①当前任务进行到哪一步 ②已完成的关键改动/结论"
-                  f"③剩下的活（移交说明：{note or '见上文'}）④终端接手时的注意事项。"
+                  f"③剩下的活（移交说明：{note or '见上文'}）④终端接手时的注意事项"
+                  "⑤清点你拉起的后台任务（run_in_background 的监控脚本等）：逐个说明"
+                  "任务内容、PID、输出位置、最近一次结果——不要停掉它们，"
+                  "接管方将按此清单继续跟进监控。"
                   "这段总结将留在会话转录里，是终端接手后读到的最后内容。")
         run_task(chat_id, wrapup)
         send_text(chat_id, "🤝 移交中：分身正在做收尾总结（写进转录，终端接手可见），"
@@ -2444,11 +2485,13 @@ def handle_command(chat_id: str, text: str) -> None:
             _remember_last(chat_id, old_sid)   # 换绑前的旧会话，/takeover last 可接回
         _recycle_chat_sessions(chat_id)   # 换绑：旧会话的驻留进程让位
         evicted = _bind_session(chat_id, sid, cwd)
+        _mark_terminal_handoff(sid)   # 终端宿主跑完回合 Stop 时会被劝停交出
         stolen = "\n📌 该会话此前绑定在另一个聊天，已转移过来（对方已收到通知）。" if evicted else ""
         send_text(chat_id,
                   f"✅ 已接管会话 {sid[:8]}…（目录：{_chat_work_dir(chat_id)}）\n"
                   "下一条消息将带上该会话的全部上下文。\n"
-                  "⚠️ 若桌面那边还开着，请先退出（避免两边同时写入）。" + stolen)
+                  "· 已给终端留移交指令：它跑完手头回合会自动收尾交出"
+                  "（含后台任务台账），之后不再接活。" + stolen)
     elif cmd == "/peek":
         want = arg.strip()
         sid = None
