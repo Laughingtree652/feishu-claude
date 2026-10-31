@@ -117,7 +117,6 @@ HELP_TEXT = """📖 命令列表
 /provider [序号|名称] — 查看/切换 Claude 供应商（cc-switch 库；切换即换 key，新起进程生效）
 /unqueue — 取消排队接管
 /rename [名字] — 给当前会话起名（/sessions 列表优先显示名字）
-/addcmd 标签 消息 · /delcmd 序号 · /cmds · /panel — 快捷命令按钮面板
 /cwd [路径] — 查看 / 切换 Claude 的工作目录
 /mode [模式] — 查看 / 切换本聊天的权限模式（manual、auto、acceptEdits…，未设置时用全局默认）
 /model [序号|名称|reset] — 查看/切换本聊天的模型（网关可用模型实时列出；reset 回退全局默认）
@@ -200,27 +199,6 @@ def save_summaries() -> None:
         SUMMARY_FILE.write_text(json.dumps(_summaries, ensure_ascii=False, indent=1), "utf-8")
     except OSError:
         pass
-
-# ---------------- 快捷命令（卡片按钮面板，/addcmd 维护） ----------------
-COMMANDS_FILE = BASE_DIR / "commands.json"
-_commands_lock = threading.Lock()
-_commands: list = []
-if COMMANDS_FILE.exists():
-    try:
-        _commands = json.loads(COMMANDS_FILE.read_text("utf-8"))
-        if not isinstance(_commands, list):
-            _commands = []
-    except Exception:
-        _commands = []
-
-
-def save_commands() -> None:
-    with _commands_lock:
-        try:
-            COMMANDS_FILE.write_text(json.dumps(_commands, ensure_ascii=False, indent=1), "utf-8")
-        except OSError:
-            pass
-
 
 # ---------------- 免 @ 群（/listen 维护：只有自己+机器人的群里消息全量接收） ----------------
 LISTEN_FILE = BASE_DIR / "listen.json"
@@ -733,35 +711,6 @@ class _LiveReply:
                 else:
                     self.msg_id = mid
         return True
-
-
-def send_panel(chat_id: str) -> None:
-    """发送快捷命令卡片：每条命令一个按钮，点击即发送对应消息（卡片回传交互）。"""
-    if not _commands:
-        send_text(chat_id, "还没有快捷命令。用法：/addcmd 标签 消息内容\n"
-                           "例：/addcmd 状态 /status\n添加后发 /panel 生成按钮面板。")
-        return
-    rows, row = [], []
-    for i, c in enumerate(_commands):
-        row.append({
-            "tag": "button",
-            "text": {"tag": "plain_text", "content": c.get("label", "?")},
-            "type": "default",
-            "value": {"i": str(i)},
-        })
-        if len(row) == 3:
-            rows.append(row)
-            row = []
-    if row:
-        rows.append(row)
-    card = {
-        "config": {"wide_screen_mode": True},
-        "header": {"template": "blue",
-                   "title": {"tag": "plain_text", "content": "⚡ 快捷命令"}},
-        "elements": [{"tag": "action", "actions": r} for r in rows],
-    }
-    if not _send_card(chat_id, card):
-        send_text(chat_id, "❌ 卡片发送失败，重试 /panel。")
 
 
 # ---------------- 待决策卡片（权限确认 / 接管选择等，支持按钮+文字自定义回复） ----------------
@@ -2222,7 +2171,7 @@ def _switch_provider(chat_id: str, arg: str) -> None:
 COMMANDS = ["/help", "/new", "/exit", "/stop", "/status", "/session", "/sessions",
             "/takeover", "/peek", "/observe", "/unobserve", "/unqueue", "/rename",
             "/cwd", "/mode", "/model", "/mute", "/unmute", "/quiet", "/unquiet",
-            "/addcmd", "/delcmd", "/cmds", "/panel", "/listen", "/provider", "/handover"]
+            "/listen", "/provider", "/handover"]
 
 
 def _expand_cmd(text: str):
@@ -2238,7 +2187,7 @@ def _expand_cmd(text: str):
         return hits[0] + ((" " + rest) if rest else ""), f"↔️ {head} → {hits[0]}"
     if hits:
         return None, f"❓ {head} 匹配多个命令：{' '.join(hits)}（多打几位消歧义）"
-    return text, ""   # 自定义命令（/addcmd 面板）或未知命令，交原逻辑
+    return text, ""   # 未知命令，交原逻辑
 
 
 # ---------------- 命令处理 ----------------
@@ -2672,36 +2621,6 @@ def handle_command(chat_id: str, text: str) -> None:
                                "。正在执行的任务不受影响（要中断用 /stop）。")
         else:
             send_text(chat_id, "当前没有排队中的消息。")
-    elif cmd == "/addcmd":
-        parts_arg = arg.split(None, 1)
-        if len(parts_arg) < 2 or not parts_arg[1].strip():
-            send_text(chat_id, "用法：/addcmd 按钮标签 消息内容\n"
-                               "例：/addcmd 状态 /status\n"
-                               "/addcmd 看进度 /peek latest\n"
-                               "/addcmd 测试 跑一下测试套件并汇总失败原因")
-            return
-        with _commands_lock:
-            _commands.append({"label": parts_arg[0][:12], "text": parts_arg[1].strip()[:500]})
-        save_commands()
-        send_text(chat_id, f"✅ 已添加「{parts_arg[0][:12]}」。发 /panel 生成按钮面板"
-                           "（面板是快照，加删命令后要重发 /panel）。")
-    elif cmd == "/delcmd":
-        if not arg.isdigit() or not (1 <= int(arg) <= len(_commands)):
-            send_text(chat_id, "用法：/delcmd 序号（用 /cmds 查看当前命令）")
-            return
-        with _commands_lock:
-            removed = _commands.pop(int(arg) - 1)
-        save_commands()
-        send_text(chat_id, f"✅ 已删除「{removed.get('label')}」。记得重发 /panel。")
-    elif cmd == "/cmds":
-        if not _commands:
-            send_text(chat_id, "还没有快捷命令（/addcmd 添加）。")
-            return
-        lines = ["⚡ 当前快捷命令："] + [
-            f"{i}. {c['label']} → {c['text'][:40]}" for i, c in enumerate(_commands, 1)]
-        send_text(chat_id, "\n".join(lines))
-    elif cmd == "/panel":
-        send_panel(chat_id)
     elif cmd == "/listen":
         if _chat_types.get(chat_id) != "group":
             send_text(chat_id, "单聊本来就无需 @，这个设置只对群聊有意义。")
@@ -2967,7 +2886,7 @@ def on_app_version(event) -> None:
 
 
 def on_card_action(event) -> object:
-    """卡片按钮回调：点击快捷命令面板上的按钮 = 发送对应消息。"""
+    """卡片按钮回调：待决策卡片（权限确认/接管选择等）的选项点击处理。"""
     try:
         data = event.event
         if data is None or data.context is None:
@@ -2986,14 +2905,8 @@ def on_card_action(event) -> object:
             if label is None:
                 return _card_toast("❌ 该问题已回答或已过期", "error")
             return _card_toast(f"✅ 已选择：{label}")
-        idx = value.get("i")
-        if idx is None or not str(idx).isdigit() or int(idx) >= len(_commands):
-            return _card_toast("❌ 该命令已删除，重新发 /panel 获取新面板", "error")
-        text = _commands[int(idx)].get("text", "")
-        if not text:
-            return _card_toast("❌ 空命令", "error")
-        threading.Thread(target=dispatch_text, args=(chat_id, text, op), daemon=True).start()
-        return _card_toast(f"✅ 已发送：{text[:30]}")
+        # 快捷命令面板（/panel）已下线：旧面板卡片的按钮点击落到这里，明确告知
+        return _card_toast("❌ 快捷命令面板已下线，旧卡片按钮不再可用", "error")
     except Exception as e:
         return _card_toast(f"❌ {e!r}", "error")
 
