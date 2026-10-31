@@ -589,21 +589,73 @@ _last_send = 0.0
 
 
 def _split_chunks(text: str, cap: int = MAX_CHUNK) -> list:
-    """长文本分段：优先在换行处断开（避免硬切句子/代码行），内容不丢。
-
-    段与段之间的换行/空行会被当作分隔吃掉，属正常折损。
+    """长文本分段：按行贪心装段；表格块（连续含 | 行）作为原子整体不拆——
+    拆开的半张表在卡片里都渲染不出来。内容不丢；段间空行当分隔吃掉属正常折损。
     """
-    text = text or ""
-    out = []
-    while len(text) > cap:
-        cut = text.rfind("\n", 0, cap)
-        if cut < cap // 2:        # cap 内没有合适的换行（或太靠前）→ 硬切
-            cut = cap
-        out.append(text[:cut])
-        text = text[cut:].lstrip("\n")
-    if text:
-        out.append(text)
+    lines = (text or "").split("\n")
+    out: list = []
+    cur: list = []
+    cur_len = 0
+    i, n = 0, len(lines)
+    while i < n:
+        # 连续含 | 的行归并为一个原子块（宽松判定：误判只是切割点偏移，无害）
+        if "|" in lines[i]:
+            j = i
+            while j < n and "|" in lines[j]:
+                j += 1
+            block = lines[i:j]
+        else:
+            j = i + 1
+            block = [lines[i]]
+        blen = sum(len(x) + 1 for x in block)
+        if cur and cur_len + blen > cap:   # 装不下先封当前段
+            out.append("\n".join(cur).rstrip("\n"))
+            cur, cur_len = [], 0
+        if blen > cap and len(block) > 1:
+            # 超长表格：认命按行装（极罕见，不丢内容优先）
+            for ln in block:
+                if cur and cur_len + len(ln) + 1 > cap:
+                    out.append("\n".join(cur).rstrip("\n"))
+                    cur, cur_len = [], 0
+                cur.append(ln)
+                cur_len += len(ln) + 1
+        elif blen > cap:
+            seg = block[0]                  # 单行超限：硬切
+            while len(seg) > cap:
+                out.append(seg[:cap])
+                seg = seg[cap:]
+            cur.append(seg)
+            cur_len += len(seg) + 1
+        else:
+            cur.extend(block)
+            cur_len += blen
+        i = j
+    if cur:
+        out.append("\n".join(cur).rstrip("\n"))
     return out
+
+
+def _is_table_sep(line: str) -> bool:
+    """GFM 表格的分隔行（|---|:---:| 形态）。"""
+    s = set((line or "").strip())
+    return "|" in s and s <= {"|", "-", ":", " "}
+
+
+def _md_tables_need_blank(text: str) -> str:
+    """表格前必须空行，紧贴段落会导致整表不渲染（Claude 输出常见形态）。
+
+    分隔行的上一行是表头行；表头行若紧贴非空段落（out[-2] 非空），
+    在表头行**之前**补空行（插到表头和分隔行之间会把表格拆散）。
+    幂等：已补过（表头上是空行）不重复补。
+    """
+    lines = (text or "").split("\n")
+    out: list = []
+    for i, ln in enumerate(lines):
+        if (i >= 2 and _is_table_sep(ln)
+                and out[-1].strip() and out[-2].strip()):
+            out.insert(len(out) - 1, "")   # 表头前补空行
+        out.append(ln)
+    return "\n".join(out)
 
 
 def send_text(chat_id: str, text: str) -> None:
@@ -666,7 +718,7 @@ def _info_card(title: str, md: str, template: str = "blue") -> dict:
     return {"schema": "2.0",
             "header": {"title": {"tag": "plain_text", "content": title},
                        "template": template},
-            "body": {"elements": [{"tag": "markdown", "content": md}]}}
+            "body": {"elements": [{"tag": "markdown", "content": _md_tables_need_blank(md)}]}}
 
 
 class _LiveReply:
@@ -688,7 +740,7 @@ class _LiveReply:
         # 卡片 2.0 + markdown 组件：Claude 回复本身就是 markdown，1.0 的
         # lark_md/markdown 元素实测不渲染（原样显示），2.0 才是完整语法。
         # 生成中提示并入内容尾部（2.0 少挂组件，零结构风险）。
-        c = content or "…"
+        c = _md_tables_need_blank(content or "…")
         if streaming:
             c += "\n\n*(✍️ 正在生成…)*"
         return {"schema": "2.0", "body": {"elements": [{"tag": "markdown", "content": c}]}}
@@ -2026,7 +2078,7 @@ def _observe_loop(chat_id: str, sid: str, stop: threading.Event) -> None:
         # 卡片 2.0 + markdown 组件（1.0 的元素实测不渲染）；状态行并入内容尾部斜体
         card = {"schema": "2.0",
                 "body": {"elements": [{"tag": "markdown",
-                                       "content": (content or "…") + f"\n\n*({note})*"}]}}
+                                       "content": _md_tables_need_blank(content or "…") + f"\n\n*({note})*"}]}}
         if msg_id:   # 常规路径：整卡刷新；失败降级为重建新卡
             try:
                 req = PatchMessageRequest.builder() \
