@@ -1428,6 +1428,9 @@ def _spawn_claude(chat_id: str, session_id):
     )
 
 
+_rate_warn_ts: dict = {}   # 聊天 → 上次限流提醒时间（stderr 限流报错实时提醒的节流器）
+
+
 def _session_reader(chat_id: str, key: str, slot: dict) -> None:
     """长驻进程输出泵：转发回复/工具调用，逐回合汇报；进程退出时收尾并清理。"""
     proc = slot["proc"]
@@ -1436,6 +1439,19 @@ def _session_reader(chat_id: str, key: str, slot: dict) -> None:
     def _drain_stderr() -> None:
         for line in proc.stderr:
             stderr_buf.append(line)
+            # 限流/额度类报错实时提醒：CLI 对 429 是内部退避重试，期间 stdout
+            # 没有任何事件——不盯 stderr 的话飞书侧就是一片寂静（回合正常结束
+            # 和进程退出的报错路径此前已有，这里补的是"重试挂起中"这个窗口）。
+            # 同一聊天节流 10 分钟：退避重试会反复刷同样的 warning，只提醒一次。
+            low = line.lower()
+            if any(k in low for k in ("429", "rate limit", "rate_limit", "rate-limit",
+                                      "quota", "insufficient", "balance", "credit")):
+                now = time.time()
+                if now - _rate_warn_ts.get(chat_id, 0) >= 600:
+                    _rate_warn_ts[chat_id] = now
+                    if chat_id not in _quiet:
+                        send_text(chat_id, "⚠️ 上游限流/额度报错，Claude 正在自动退避重试"
+                                           "（可能要等几分钟）。/provider 可切换供应商。")
 
     threading.Thread(target=_drain_stderr, daemon=True).start()
 
