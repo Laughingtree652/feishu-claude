@@ -5,7 +5,7 @@
 飞书发消息给机器人 → 调用本地 claude CLI（多轮会话自动续接）→
 Claude 的回复与工具调用实时转发回飞书，实现远程操控。
 
-可用命令：/help /new /exit /stop /status /session /sessions /takeover /cwd /mode /mute /unmute /provider
+可用命令：/help /new /exit /handover /stop /status /session /sessions /takeover /cwd /mode /mute /unmute /provider
 （会话独占：同一会话只归一个聊天，后接管者优先，被挤掉的聊天会收到通知）
 """
 import json
@@ -110,6 +110,7 @@ HELP_TEXT = """📖 命令列表
 /sessions [条数] — 列出电脑上最近的会话（含当前绑定的；用过一段的自动带一行摘要）
 /takeover [序号|会话ID|latest] — 接管电脑上的会话（在跑的发卡片选：排队/强制/取消）
 /exit — 退出当前接管的会话（解绑+回收驻留进程；历史保留，可再 /takeover）
+/handover [说明] — 一键移交终端：解绑+回收分身，resume 命令自动复制到剪贴板，到终端粘贴回车即接手续跑（带说明则作为移交后的首条指令）
 /peek [序号|会话ID|latest] — 旁观会话当前进度（正在干什么、最新输出）
 /observe [序号|会话ID|latest] — 实时观察：转录有动静自动刷新快照卡片（远程看终端直播；观察中再 /ob 同一会话 = 重发新卡刷回底部）
 /unobserve — 停止实时观察
@@ -2105,7 +2106,7 @@ def _switch_provider(chat_id: str, arg: str) -> None:
 COMMANDS = ["/help", "/new", "/exit", "/stop", "/status", "/session", "/sessions",
             "/takeover", "/peek", "/observe", "/unobserve", "/unqueue", "/rename",
             "/cwd", "/mode", "/model", "/mute", "/unmute", "/quiet", "/unquiet",
-            "/addcmd", "/delcmd", "/cmds", "/panel", "/listen", "/provider"]
+            "/addcmd", "/delcmd", "/cmds", "/panel", "/listen", "/provider", "/handover"]
 
 
 def _expand_cmd(text: str):
@@ -2162,6 +2163,43 @@ def handle_command(chat_id: str, text: str) -> None:
         send_text(chat_id, f"🚪 已退出会话 {label}（驻留进程已回收，历史保留）。\n"
                            f"· /takeover {sid[:8]} 可随时重新接管\n"
                            "· 直接发消息则开启全新会话")
+    elif cmd == "/handover":
+        # 一键移交终端：解绑+回收分身，resume 命令进剪贴板；带参数=移交说明
+        sess = _sessions.get(chat_id) or {}
+        sid = sess.get("session_id")
+        if not sid:
+            send_text(chat_id, "当前聊天没有绑定会话，无需移交"
+                               "（终端里 claude --resume <ID> 可接任意会话）。")
+            return
+        note = " ".join(arg.split())   # 移交说明压成单行，引号换成中文引号防破坏命令行
+        note = note.replace('"', "”")
+        cwd = sess.get("work_dir") or _chat_work_dir(chat_id)
+        label = _names.get(sid) or f"{sid[:8]}…"
+        if note:   # 带说明：作为终端接手后的首条指令（半程活由它继续）
+            cmd_line = f'claude --resume {sid} "【飞书移交】剩下的活继续：{note}"'
+        else:
+            cmd_line = f"claude --resume {sid}"
+        try:
+            # 走 PowerShell Set-Clipboard：CreateProcess 参数原生 UTF-16，中文不经码页转换
+            subprocess.run(["powershell", "-NoProfile", "-Command",
+                            "Set-Clipboard -Value '" + cmd_line.replace("'", "’") + "'"],
+                           creationflags=subprocess.CREATE_NO_WINDOW, check=False)
+            clip_note = "✅ 命令已复制到剪贴板——到任意终端 Ctrl+V 回车即接手"
+        except Exception:
+            clip_note = "⚠️ 剪贴板复制失败，手动执行：\n" + cmd_line
+        # bot 侧停掉自己（同 /exit）：解绑+回收分身+取消排队。
+        # 跑回合中的分身一并中断——半程进度都在转录里，终端 resume 即续。
+        _recycle_chat_sessions(chat_id, reason="exit")
+        with _pending_lock:
+            _pending.pop(chat_id, None)
+        with _sessions_lock:
+            _sessions.pop(chat_id, None)
+        save_sessions()
+        send_text(chat_id, f"🤝 会话已移交终端：{label}\n"
+                           f"· 工作目录：{cwd}\n"
+                           f"· 分身已回收（跑回合中的也已中断，进度都在转录里，终端续跑即可）\n"
+                           f"· {clip_note}\n"
+                           f"· 本聊天已解绑；/takeover {sid[:8]} 随时可再接管回飞书")
     elif cmd == "/stop":
         with _pending_lock:
             had_pending = _pending.pop(chat_id, None)
