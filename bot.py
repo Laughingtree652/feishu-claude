@@ -2960,6 +2960,7 @@ def handle_command(chat_id: str, text: str) -> None:
 def on_message(event: P2ImMessageReceiveV1) -> None:
     """WebSocket 事件回调：只做快速解析与分发，重活交给工作线程（避免阻塞事件循环）。"""
     try:
+        _ws_ev["last"] = time.time()   # 收到推送即视为 WS 活着（半开聋检测的反例）
         data = event.event
         msg = data.message
         if msg is None:
@@ -3105,6 +3106,7 @@ def on_app_version(event) -> None:
 def on_card_action(event) -> object:
     """卡片按钮回调：待决策卡片（权限确认/接管选择等）的选项点击处理。"""
     try:
+        _ws_ev["last"] = time.time()   # 卡片动作同样走 WS 推送
         data = event.event
         if data is None or data.context is None:
             return _card_toast("❌ 事件数据不完整", "error")
@@ -3128,36 +3130,67 @@ def on_card_action(event) -> object:
         return _card_toast(f"❌ {e!r}", "error")
 
 
+# 半开聋判聋参数：到 443 的出站连接集合不变超 WATCH_STALE_CONN 且期间
+# 零飞书推送超 WATCH_STALE_IDLE → 疑似 TCP 半开（连接在但对端早死）。
+# 只在静默期兜底——白天有消息推送就永远不触发。
+WATCH_STALE_CONN = int(os.environ.get("WATCH_STALE_CONN_SECONDS", "14400"))  # 4 小时
+WATCH_STALE_IDLE = int(os.environ.get("WATCH_STALE_IDLE_SECONDS", "7200"))   # 2 小时
+_ws_ev = {"last": time.time()}   # 最近一次飞书 WS 推送时刻（消息/卡片动作都算）
+
+
 def _ws_watchdog() -> None:
     """WS 连接看门狗：飞书长连接首连失败/重连卡死时，bot 会"活着但聋"——
     进程在、零出站连接、消息收不到，bot.log 毫无线索（错误只在 SDK 的
     stderr 里）。每 90 秒查一次本进程到外网 443 的 ESTABLISHED 连接，
-    连续两轮没有 → 先通知再自杀，把拉起交给外部（restart.ps1 / 保活）。"""
+    连续两轮没有 → 先通知再自杀，把拉起交给外部（restart.ps1 / 保活）。
+
+    另盯 TCP 半开连接：夜间切网时对端发的 FIN 若落在断网窗口里丢掉，
+    本端 socket 会一直显示 ESTABLISHED，但对端早已断——连接检测看着
+    健康，实际永远收不到消息（11-01 事故：bot 聋了 7 小时）。判据：
+    出站连接集合长时间纹丝不动 + 期间零飞书推送（on_message /
+    卡片动作都会刷新 _ws_ev）→ 疑似半开，主动自杀换新连接。白天
+    有消息推送就不会触发，只在静默期兜底。"""
+    def _exit_with_notice(reason: str) -> None:
+        log(f"[WS 看门狗] {reason}，自杀待外部拉起")
+        try:
+            chat = _desktop_perm_target() or ""
+            if chat:
+                send_text(chat, f"⚠️ {reason}。已自动退出待重启——"
+                                "保活任务会在几分钟内拉起，或运行 restart.ps1。")
+        except Exception:
+            pass
+        os._exit(1)
+
     miss = 0
+    prev: frozenset = frozenset()
+    same_since = time.time()
     while True:
         time.sleep(90)
         try:
-            ok = any(c.status == "ESTABLISHED" and c.raddr
-                     and c.raddr.ip not in ("127.0.0.1", "::1", "0.0.0.0")
-                     and c.raddr.port == 443
-                     for c in psutil.Process(os.getpid()).net_connections("tcp"))
+            conns = psutil.Process(os.getpid()).net_connections("tcp")
+            probed = True
         except Exception:
-            ok = True   # psutil 探查失败（权限等）：宁可不误杀
-        if ok:
-            miss = 0
+            conns, probed = [], False   # psutil 探查失败（权限等）：宁可不误杀
+        if not probed:
             continue
-        miss += 1
-        log(f"[WS 看门狗] 未检测到飞书出站连接（第 {miss}/2 次）")
-        if miss >= 2:
-            log("[WS 看门狗] 持续 3 分钟无飞书连接，判定 WS 卡死，自杀待外部拉起")
-            try:
-                chat = _desktop_perm_target() or ""
-                if chat:
-                    send_text(chat, "⚠️ bot 的飞书长连接卡死（进程活着但收不到消息），"
-                                    "已自动退出待重启——请稍后发消息验证，或运行 restart.ps1。")
-            except Exception:
-                pass
-            os._exit(1)
+        cur = frozenset((c.raddr.ip, c.raddr.port) for c in conns
+                        if c.status == "ESTABLISHED" and c.raddr
+                        and c.raddr.ip not in ("127.0.0.1", "::1", "0.0.0.0")
+                        and c.raddr.port == 443)
+        if cur:
+            miss = 0
+            if cur == prev:
+                if time.time() - same_since > WATCH_STALE_CONN \
+                        and time.time() - _ws_ev["last"] > WATCH_STALE_IDLE:
+                    _exit_with_notice("出站连接长时间零变化且无飞书推送，疑似半开连接")
+            else:
+                prev = cur
+                same_since = time.time()
+        else:
+            miss += 1
+            log(f"[WS 看门狗] 未检测到飞书出站连接（第 {miss}/2 次）")
+            if miss >= 2:
+                _exit_with_notice("持续 3 分钟无飞书连接，判定 WS 卡死")
 
 
 def main() -> None:
