@@ -24,7 +24,17 @@ foreach ($n in @("bot_console.log", "bot_err.log")) {
 }
 if (Test-Path "$logs\bot_console.log") { Move-Item -Force "$logs\bot_console.log" "$logs\bot_console.old.log" }
 if (Test-Path "$logs\bot_err.log") { Move-Item -Force "$logs\bot_err.log" "$logs\bot_err.old.log" }
-Start-Process -FilePath $py -ArgumentList "$base\bot.py" -WorkingDirectory $base `
-    -WindowStyle Hidden `
-    -RedirectStandardOutput "$logs\bot_console.log" -RedirectStandardError "$logs\bot_err.log"
+# 重定向兜底：常规日志文件若被占用/重定向失败（10-31 深夜保活链下发生过，
+# 实例 stdout 全程黑洞，排障零线索），换时间戳文件名，确保输出一定有落点。
+$stamp = Get-Date -Format "MMdd_HHmmss"
+try {
+    Start-Process -FilePath $py -ArgumentList "$base\bot.py" -WorkingDirectory $base `
+        -WindowStyle Hidden -ErrorAction Stop `
+        -RedirectStandardOutput "$logs\bot_console.log" -RedirectStandardError "$logs\bot_err.log"
+} catch {
+    Write-Host "常规日志文件不可用（$($_.Exception.Message)），改用时间戳文件"
+    Start-Process -FilePath $py -ArgumentList "$base\bot.py" -WorkingDirectory $base `
+        -WindowStyle Hidden `
+        -RedirectStandardOutput "$logs\bot_console_$stamp.log" -RedirectStandardError "$logs\bot_err_$stamp.log"
+}
 Write-Host "完成。发条消息验证，或看 logs\bot_console.log。"
