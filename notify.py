@@ -209,6 +209,14 @@ def main() -> int:
     if not chat_id:
         return 0
 
+    # 接管态判定：sid 在会话路由表中＝被某个飞书聊天接管过。接管态下
+    # 响应面已搬到飞书（用户盯着飞书聊天），终端原生权限框可能压在别的
+    # 窗口下根本看不见——idle 只能证明"人在电脑前"，证明不了"人看得见
+    # 终端"，权限类通知被压制会直接卡死会话（11-02 用户实测漏推）
+    taken_over = bool(sid) and bool(_read_state(ROUTE_FILE, {}).get(sid))
+    _log(f"hook: event={event} sid={(sid or '')[:8]} taken_over={taken_over} "
+         f"chat={(chat_id or '')[:12]}")
+
     # takeover 移交标记（仅 Stop 事件）：本会话已被飞书端接管——block 一轮，
     # 让终端 Claude 收尾交出（进展说明 + 后台任务台账）。这是会话管理而非
     # 通知推送：mute / 人在电脑前都不豁免（人回电脑时终端与分身对着干风险
@@ -223,14 +231,17 @@ def main() -> int:
     # 手动静音（飞书里 /mute；老布局位置也查——bot 未重启时标志在根目录）
     if MUTE_FILE.exists() or _legacy(MUTE_FILE.name).exists():
         return 0
-    # 人在电脑前（最近有键鼠活动）就不打扰；离开超过阈值才推送
-    try:
-        idle_threshold = float(env.get("NOTIFY_IDLE_SECONDS", "180") or 180)
-    except ValueError:
-        idle_threshold = 180.0
-    idle = _user_idle_seconds()
-    if 0 <= idle < idle_threshold:
-        return 0
+    # 人在电脑前（最近有键鼠活动）就不打扰；离开超过阈值才推送。
+    # 例外：权限/等待输入类（Notification）+ 被接管的会话必须推——
+    # 等待人响应的事件压制即卡死，Stop 摘要类（可围观可不围观）照旧
+    if not (event == "Notification" and taken_over):
+        try:
+            idle_threshold = float(env.get("NOTIFY_IDLE_SECONDS", "180") or 180)
+        except ValueError:
+            idle_threshold = 180.0
+        idle = _user_idle_seconds()
+        if 0 <= idle < idle_threshold:
+            return 0
 
     proj = Path(cwd).name if cwd else ""
     if event == "Notification":
