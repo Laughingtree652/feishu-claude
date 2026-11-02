@@ -914,7 +914,8 @@ def _ask_choice(chat_id: str, title: str, body_md: str, options: list,
     """
     req_id = f"c{time.time_ns()}"
     entry = {"id": req_id, "event": threading.Event(), "answer": None,
-             "tag": tag, "labels": {o.get("value"): o.get("label", "?") for o in options}}
+             "tag": tag, "title": title,
+             "labels": {o.get("value"): o.get("label", "?") for o in options}}
     with _choices_lock:
         old = _choices.get(chat_id)
         if old is not None:
@@ -3060,6 +3061,10 @@ def dispatch_text(chat_id: str, text: str, sender_id: str = "") -> None:
             entry["event"].set()
             routed = True
     if routed:
+        # 回执：文字被当作对挂着的卡的答复处理了。不说一声用户会以为消息
+        # 石沉大海（11-02：用户“咋样了？”被凌晨挂着的权限卡吃掉，以为 bot 又挂）
+        send_text(chat_id, f"💬 已把这条消息作为对「{entry.get('title') or '待确认卡片'}」"
+                           "的答复处理；若本意是发任务，请重发一条。")
         return
 
     # 排队接管中：消息入队，等目标会话回合结束后由 _wait_and_drain 自动执行
@@ -3129,6 +3134,27 @@ def on_card_action(event) -> object:
     except Exception as e:
         return _card_toast(f"❌ {e!r}", "error")
 
+
+# TCP keepalive：让 lark SDK 建的 socket 空闲 60 秒后开始探测（每 5 秒一次）。
+# 半开连接（对端已死但本端 socket 不知情——夜里切网时对端 FIN 落在断网窗口
+# 里丢失的常见形态）会在一两分钟内被 TCP 层杀掉 → SDK 自动重连。比看门狗的
+# 小时级轮换快得多，且健康空闲连接零误伤（探测包被正常 ack）。
+def _enable_tcp_keepalive() -> None:
+    _orig = socket.create_connection
+
+    def _ka(*args, **kwargs):
+        s = _orig(*args, **kwargs)
+        try:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            s.ioctl(socket.SIO_KEEPALIVE_VALS, (1, 60000, 5000))   # Windows 专用参数
+        except (OSError, AttributeError):
+            pass   # 非 Windows / 不支持时退回系统默认 keepalive 行为
+        return s
+
+    socket.create_connection = _ka
+
+
+_enable_tcp_keepalive()
 
 # 半开聋判聋参数：到 443 的出站连接集合不变超 WATCH_STALE_CONN 且期间
 # 零飞书推送超 WATCH_STALE_IDLE → 疑似 TCP 半开（连接在但对端早死）。
