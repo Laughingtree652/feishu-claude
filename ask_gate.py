@@ -96,9 +96,10 @@ def main() -> int:
             continue
     sid = str(hook.get("session_id") or "")
     taken_over = bool(str(route.get(sid) or ""))
-    _log(f"ask_gate: questions={len(qs)} sid={sid[:8]} taken_over={taken_over}")
-
-    # 未接管 + 人在电脑前：让路，终端弹原生选择 UI（响应面在终端，免打扰）
+    # 未接管：查 idle——人在电脑前让路（响应面在终端，免打扰）；
+    # 人不在电脑前 → away=True（回退终端弹给谁看？没人看的框是死通道，
+    # 飞书卡须不限时等答复）；idle=-1 检测失败保守按可超时（away=False）
+    away = False
     if not taken_over:
         try:
             idle_threshold = float(env.get("NOTIFY_IDLE_SECONDS", "180") or 180)
@@ -106,7 +107,12 @@ def main() -> int:
             idle_threshold = 180.0
         idle = _user_idle_seconds()
         if 0 <= idle < idle_threshold:
+            _log(f"ask_gate: questions={len(qs)} sid={sid[:8]} taken_over=False "
+                 f"idle={idle:.0f}s → 让路终端")
             return 0
+        away = idle >= idle_threshold
+    _log(f"ask_gate: questions={len(qs)} sid={sid[:8]} "
+         f"taken_over={taken_over} away={away}")
 
     port = int(env.get("FEISHU_PERM_PORT", "37921") or 37921)
     try:
@@ -114,12 +120,13 @@ def main() -> int:
     except ValueError:
         wait = 300.0
 
-    payload = {"type": "desktop_ask", "sid": sid, "questions": qs}
+    payload = {"type": "desktop_ask", "sid": sid, "questions": qs, "away": away}
     reply = None
     try:
-        # 总预算按问题数放宽（bot 侧逐问推卡，最坏 N×wait）
+        # away（人不在电脑前）：bot 卡不限时，本连接同步不限时；
+        # 否则按问题数放宽（bot 侧逐问推卡，最坏 N×wait）
         with socket.create_connection(("127.0.0.1", port), timeout=10) as s:
-            s.settimeout(wait * len(qs) + 60)
+            s.settimeout(None if away else wait * len(qs) + 60)
             s.sendall((json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8"))
             line = s.makefile("rb").readline()
         if line.strip():

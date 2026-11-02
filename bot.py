@@ -1212,6 +1212,11 @@ def _perm_conn(conn) -> None:
             sid = str(payload.get("sid") or "")
             chat_id = _desktop_perm_target(sid)
             qs = payload.get("questions")
+            # away（ask_gate 实测人不在电脑前才置位）：超时回退终端弹给谁看？
+            # 没人看的终端框是死通道——飞书卡改为不限时等答复（与分身权限卡
+            # wait=None 同款）；接管态/检测失败仍走 PERM_GATE_WAIT 超时回退
+            # （人可能回流电脑，终端框有人能接住）
+            away = bool(payload.get("away"))
             if not chat_id or not isinstance(qs, list) or not qs:
                 result = None   # 无路由（bot 未收过消息）/无问题：让路终端原生 UI
             else:
@@ -1227,10 +1232,12 @@ def _perm_conn(conn) -> None:
                     note = "桌面终端上的会话在等这个选择；也可直接回复文字作答。"
                     if q.get("multiSelect"):
                         note += "本问是多选：请回复文字列出所选（如：选项A、选项C）。"
+                    if away:
+                        note += "你当前不在电脑前，本卡不限时，可随时答复。"
                     kind, val = _ask_choice(
                         chat_id, f"❓ {head}", str(q.get("question") or ""),
-                        opts, timeout=PERM_GATE_WAIT, template="blue",
-                        tag="desktop_ask", note=note)
+                        opts, timeout=(None if away else PERM_GATE_WAIT),
+                        template="blue", tag="desktop_ask", note=note)
                     if kind == "choice":
                         answers.append(f"{head}＝用户选择了「{val}」")
                     elif kind == "text":
