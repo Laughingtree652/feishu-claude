@@ -1204,6 +1204,45 @@ def _perm_conn(conn) -> None:
                 else:
                     result = None   # 超时/被顶替：不答复，桌面终端弹框接手
                     send_text(chat_id, f"⏳ 桌面权限确认（{tool}）超时未应答，已回退桌面终端弹框。")
+        elif payload and payload.get("type") == "desktop_ask":
+            # 桌面终端会话的选择题（ask_gate.py PreToolUse 拦 AskUserQuestion 转来）：
+            # 逐问推选择卡（复用 _ask_choice），答复组装成 block reason 回给 hook——
+            # Claude 以工具反馈形式收到答案、按答案继续，终端原生选择 UI 不弹。
+            # 超时/被顶替：不答复，hook 让路，终端原生 UI 接手。
+            sid = str(payload.get("sid") or "")
+            chat_id = _desktop_perm_target(sid)
+            qs = payload.get("questions")
+            if not chat_id or not isinstance(qs, list) or not qs:
+                result = None   # 无路由（bot 未收过消息）/无问题：让路终端原生 UI
+            else:
+                answers = []
+                ok = True
+                for i, q in enumerate(qs):
+                    if not isinstance(q, dict):
+                        continue
+                    head = str(q.get("header") or f"问题 {i + 1}")[:12]
+                    opts = [{"label": str(o.get("label") or "?"),
+                             "value": str(o.get("label") or "?")}
+                            for o in (q.get("options") or []) if isinstance(o, dict)]
+                    note = "桌面终端上的会话在等这个选择；也可直接回复文字作答。"
+                    if q.get("multiSelect"):
+                        note += "本问是多选：请回复文字列出所选（如：选项A、选项C）。"
+                    kind, val = _ask_choice(
+                        chat_id, f"❓ {head}", str(q.get("question") or ""),
+                        opts, timeout=PERM_GATE_WAIT, template="blue",
+                        tag="desktop_ask", note=note)
+                    if kind == "choice":
+                        answers.append(f"{head}＝用户选择了「{val}」")
+                    elif kind == "text":
+                        answers.append(f"{head}＝用户答复「{val}」")
+                    else:
+                        ok = False
+                        send_text(chat_id, f"⏳ 选择「{head}」超时未应答，已回退桌面终端选择框。")
+                        break
+                result = ({"behavior": "block",
+                           "reason": "用户已在飞书侧答复了提问：" + "；".join(answers) +
+                                     "。请严格按此答复继续工作，不要再用 AskUserQuestion 重复提问。"}
+                          if ok and answers else None)
     except Exception as e:
         log(f"[权限确认处理出错] {e!r}")
         result = {"behavior": "deny", "message": "权限确认处理内部错误"}
