@@ -1226,16 +1226,28 @@ def _perm_conn(conn) -> None:
                     if not isinstance(q, dict):
                         continue
                     head = str(q.get("header") or f"问题 {i + 1}")[:12]
-                    opts = [{"label": str(o.get("label") or "?"),
-                             "value": str(o.get("label") or "?")}
-                            for o in (q.get("options") or []) if isinstance(o, dict)]
+                    opts = []
+                    descs = []
+                    for o in (q.get("options") or []):
+                        if not isinstance(o, dict):
+                            continue
+                        lab = str(o.get("label") or "?")
+                        opts.append({"label": lab, "value": lab})
+                        d = str(o.get("description") or "").strip()
+                        if d:
+                            descs.append(f"·「{lab}」{d}")
+                    # 选项说明（AskUserQuestion 的 description）按钮放不下，
+                    # 随问题正文一起推——纯文本不赌 1.0 卡片的 md 渲染
+                    body = str(q.get("question") or "")
+                    if descs:
+                        body += "\n\n" + "\n".join(descs)
                     note = "桌面终端上的会话在等这个选择；也可直接回复文字作答。"
                     if q.get("multiSelect"):
                         note += "本问是多选：请回复文字列出所选（如：选项A、选项C）。"
                     if away:
                         note += "你当前不在电脑前，本卡不限时，可随时答复。"
                     kind, val = _ask_choice(
-                        chat_id, f"❓ {head}", str(q.get("question") or ""),
+                        chat_id, f"❓ {head}", body,
                         opts, timeout=(None if away else PERM_GATE_WAIT),
                         template="blue", tag="desktop_ask", note=note)
                     if kind == "choice":
