@@ -253,7 +253,12 @@ def main() -> int:
             text += "\n" + summary[:300]
     if sid:
         where = f"[{proj}] " if proj else ""
-        text += f"\n\n{where}会话 {sid[:8]}…\n/takeover {sid}  ← 在飞书接管该会话"
+        if taken_over:
+            # 已接管的会话别再提示 /takeover（点了只会回"这就是当前会话"）——
+            # 告知状态即可，人要做的动作就在眼前这个聊天里
+            text += f"\n\n{where}会话 {sid[:8]}…（已由飞书接管）"
+        else:
+            text += f"\n\n{where}会话 {sid[:8]}…\n/takeover {sid}  ← 在飞书接管该会话"
 
     _send(app_id, app_secret, chat_id, text)
     return 0  # 永远成功，不打断桌面会话

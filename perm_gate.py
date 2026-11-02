@@ -79,15 +79,32 @@ def main() -> int:
     if not isinstance(hook, dict) or not hook.get("tool_name"):
         return 0
 
-    # 人在电脑前：立即让路，终端弹框照常（与 notify.py 同一套免打扰阈值）
+    # 接管态判定（与 notify.py 同坑同修）：sid 被某飞书聊天接管过 → 响应面
+    # 在飞书，无视"人在电脑前"让路——用户正盯飞书（打字让键鼠活跃），活跃
+    # 证明不了看得见终端原生框，让路＝权限卡死等人。直接推飞书卡点按钮批；
+    # 卡通道挂了/超时照旧兜底回终端框，永不卡死
     env = _load_env()
-    try:
-        idle_threshold = float(env.get("NOTIFY_IDLE_SECONDS", "180") or 180)
-    except ValueError:
-        idle_threshold = 180.0
-    idle = _user_idle_seconds()
-    if 0 <= idle < idle_threshold:
-        return 0
+    route = {}
+    for p in (BASE / "data" / "desktop_route.json", BASE / "desktop_route.json"):
+        try:
+            route = json.loads(p.read_text(encoding="utf-8"))
+            break
+        except Exception:
+            continue
+    sid = str(hook.get("session_id") or "")
+    taken_over = bool(str(route.get(sid) or ""))
+    _log(f"perm_gate: tool={hook.get('tool_name')} sid={sid[:8]} taken_over={taken_over}")
+
+    # 人在电脑前：立即让路，终端弹框照常（仅未接管会话——响应面在终端，
+    # 免打扰；接管态上面已放行直推飞书卡）
+    if not taken_over:
+        try:
+            idle_threshold = float(env.get("NOTIFY_IDLE_SECONDS", "180") or 180)
+        except ValueError:
+            idle_threshold = 180.0
+        idle = _user_idle_seconds()
+        if 0 <= idle < idle_threshold:
+            return 0
 
     port = int(env.get("FEISHU_PERM_PORT", "37921") or 37921)
     try:
