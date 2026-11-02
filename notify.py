@@ -215,7 +215,13 @@ def main() -> int:
     # 终端"，权限类通知被压制会直接卡死会话（11-02 用户实测漏推）
     taken_over = bool(sid) and bool(_read_state(ROUTE_FILE, {}).get(sid))
     _log(f"hook: event={event} sid={(sid or '')[:8]} taken_over={taken_over} "
-         f"chat={(chat_id or '')[:12]}")
+         f"chat={(chat_id or '')[:12]} msg={str(hook.get('message') or '')[:80]!r}")
+    # 空闲提醒（回合结束后 60 秒没说下一句话的 nudge）：会话只是在等
+    # 下一条消息，用户什么都不用做，推到飞书是纯打扰——被接管会话尤甚
+    # （Stop 通知刚来过，隔一分钟又"需要你"）。过滤不推；权限/等待
+    # 输入类通知不受影响（它们是回合进行中卡住，才是真"需要你"）
+    if event == "Notification" and "waiting for your input" in str(hook.get("message") or ""):
+        return 0
 
     # takeover 移交标记（仅 Stop 事件）：本会话已被飞书端接管——block 一轮，
     # 让终端 Claude 收尾交出（进展说明 + 后台任务台账）。这是会话管理而非
