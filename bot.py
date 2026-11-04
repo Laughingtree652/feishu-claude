@@ -511,9 +511,16 @@ def _takeover_running_dialog(chat_id: str, sid: str, cwd, session_file, age: flo
     """
     tag = _names.get(sid) or f"{sid[:8]}…"
     raw_text = None
+    # 点按钮前先认脸：目录 + 摘要帮用户核对接的是不是目标会话（多会话时
+    # 光一个 8 位 ID 根本认不出谁是谁，接错就在这一步）
+    proj = Path(cwd).name if cwd else "?"
+    body = f"会话 **{tag}** · [{proj}] 正在跑（{int(age)} 秒前仍在写入），怎么接管？"
+    summary = _summaries.get(sid)
+    if summary:
+        body += f"\n📝 {summary}"
     kind, val = _ask_choice(
         chat_id, "⏳ 会话正在运行",
-        f"会话 **{tag}** 正在跑（{int(age)} 秒前仍在写入），怎么接管？",
+        body,
         [{"label": "⏳ 排队等它结束", "value": "queue", "style": "primary"},
          {"label": "⚡ 强制立即接管", "value": "force", "style": "danger"},
          {"label": "❌ 取消", "value": "cancel", "style": "default"}],
@@ -538,11 +545,12 @@ def _takeover_running_dialog(chat_id: str, sid: str, cwd, session_file, age: flo
         evicted = _bind_session(chat_id, sid, cwd)
         _mark_terminal_handoff(sid)   # 终端跑完手头回合 Stop 时会被劝停交出
         stolen = "\n📌 该会话此前绑定在另一个聊天，已转移过来（对方已收到通知）。" if evicted else ""
+        rescue = "\n· 接错了？/takeover last 立即接回刚让出的旧会话" if old_sid else ""
         send_text(chat_id,
                   f"✅ 已强制接管会话 {sid[:8]}…（目录：{_chat_work_dir(chat_id)}）\n"
                   "下一条消息将带上该会话的全部上下文。\n"
                   "· 已给终端留移交指令：它跑完手头回合会自动收尾交出"
-                  "（含后台任务台账），之后不再接活。" + stolen)
+                  "（含后台任务台账），之后不再接活。" + stolen + rescue)
         return
     # queue：绑定 + 排队接管（沿用 _wait_and_drain 轮询机制）
     _recycle_chat_sessions(chat_id)   # 换绑：旧会话的驻留进程让位
@@ -1842,6 +1850,33 @@ def _find_session_file(sid: str):
     return None, None
 
 
+def _resolve_want(want: str):
+    """用户输入的会话定位（/takeover /peek /observe 共用）：完整 ID 精确匹配；
+    未中且 ≥4 位 → ID 前缀匹配——/sessions 列表显示的 ID 前 8 位直接抄来就能用
+    （列表按活跃度排序，序号会漂，接错会话的根源就是依赖动态序号；前缀匹配
+    返回唯一命中 (sid, cwd, None)；歧义 (None, None, 候选列表)；未中 (None, None, [])。"""
+    w = (want or "").strip().lower()
+    if not w:
+        return None, None, []
+    sf, cwd = _find_session_file(w)
+    if sf:
+        return sf.stem, cwd, None
+    if len(w) < 4:
+        return None, None, []
+    root = Path.home() / ".claude" / "projects"
+    hits = []
+    for f in root.glob("*/*.jsonl"):
+        if f.stem.lower().startswith(w):
+            try:
+                hits.append((f, _session_cwd(f), f.stat().st_mtime))
+            except OSError:
+                continue
+    if len(hits) == 1:
+        return hits[0][0].stem, hits[0][1], None
+    hits.sort(key=lambda h: h[2], reverse=True)   # 歧义候选按新→旧排，方便挑
+    return None, None, hits
+
+
 # ---------------- 会话摘要（后台小模型生成，/sessions 列表展示） ----------------
 SUMMARY_MODEL = os.environ.get("SUMMARY_MODEL", "haiku").strip()   # 摘要用的模型
 _summarizing: set = set()            # 生成中的 session_id，防并发重复
@@ -2719,16 +2754,24 @@ def handle_command(chat_id: str, text: str) -> None:
         elif want.lower() == "latest":
             sid, cwd = _latest_desktop_session()
         elif want.isdigit():
-            # 与 /sessions 同一份列表（含机器人管理的会话），序号才对得上
-            items = _recent_sessions(8, include_managed=True)
+            # 与 /sessions 同一份列表（含机器人管理的会话；上限也对齐 20），
+            # 序号才对得上——注意列表按活跃度排序，隔一会儿序号会漂，
+            # 拿不准就抄 ID 前 8 位（_resolve_want 支持前缀匹配）
+            items = _recent_sessions(20, include_managed=True)
             idx = int(want) - 1
             if 0 <= idx < len(items):
                 sid, cwd = items[idx]["session_id"], items[idx]["cwd"]
         else:
-            sid, cwd = _find_session_file(want)
+            sid, cwd, cands = _resolve_want(want)
+            if not sid and cands:
+                msg = [f"❌ “{want}” 匹配到 {len(cands)} 个会话，多输几位 ID 前缀区分："]
+                for f, c, _m in cands[:5]:
+                    msg.append(f"· {f.stem[:8]}… [{Path(c).name if c else '?'}]")
+                send_text(chat_id, "\n".join(msg))
+                return
         if not sid:
             send_text(chat_id, f"❌ 找不到会话 {want}\n"
-                               "提示：电脑上执行 claude --resume 可查看会话列表和 ID；"
+                               "提示：/sessions 查看列表，接管可用序号或 ID 前 8 位；"
                                "桌面通知里也带有可复制的 /takeover 命令。")
             return
         cur = (_sessions.get(chat_id) or {}).get("session_id")
@@ -2751,11 +2794,12 @@ def handle_command(chat_id: str, text: str) -> None:
         evicted = _bind_session(chat_id, sid, cwd)
         _mark_terminal_handoff(sid)   # 终端宿主跑完回合 Stop 时会被劝停交出
         stolen = "\n📌 该会话此前绑定在另一个聊天，已转移过来（对方已收到通知）。" if evicted else ""
+        rescue = "\n· 接错了？/takeover last 立即接回刚让出的旧会话" if old_sid else ""
         send_text(chat_id,
                   f"✅ 已接管会话 {sid[:8]}…（目录：{_chat_work_dir(chat_id)}）\n"
                   "下一条消息将带上该会话的全部上下文。\n"
                   "· 已给终端留移交指令：它跑完手头回合会自动收尾交出"
-                  "（含后台任务台账），之后不再接活。" + stolen)
+                  "（含后台任务台账），之后不再接活。" + stolen + rescue)
     elif cmd == "/peek":
         want = arg.strip()
         sid = None
@@ -2774,12 +2818,18 @@ def handle_command(chat_id: str, text: str) -> None:
         elif want.lower() == "latest":
             sid, _ = _latest_desktop_session()
         elif want.isdigit():
-            items = _recent_sessions(8, include_managed=True)
+            items = _recent_sessions(20, include_managed=True)   # 窗口与 /sessions 上限对齐
             idx = int(want) - 1
             if 0 <= idx < len(items):
                 sid = items[idx]["session_id"]
         else:
-            sid, _ = _find_session_file(want)
+            sid, _cwd, cands = _resolve_want(want)
+            if not sid and cands:
+                msg = [f"❌ “{want}” 匹配到 {len(cands)} 个会话，多输几位 ID 前缀区分："]
+                for f, c, _m in cands[:5]:
+                    msg.append(f"· {f.stem[:8]}… [{Path(c).name if c else '?'}]")
+                send_text(chat_id, "\n".join(msg))
+                return
         if not sid:
             send_text(chat_id, f"❌ 找不到会话 {want}")
             return
@@ -2806,12 +2856,18 @@ def handle_command(chat_id: str, text: str) -> None:
         elif want.lower() == "latest":
             sid, _ = _latest_desktop_session()
         elif want.isdigit():
-            items = _recent_sessions(8, include_managed=True)
+            items = _recent_sessions(20, include_managed=True)   # 窗口与 /sessions 上限对齐
             idx = int(want) - 1
             if 0 <= idx < len(items):
                 sid = items[idx]["session_id"]
         else:
-            sid, _ = _find_session_file(want)
+            sid, _cwd, cands = _resolve_want(want)
+            if not sid and cands:
+                msg = [f"❌ “{want}” 匹配到 {len(cands)} 个会话，多输几位 ID 前缀区分："]
+                for f, c, _m in cands[:5]:
+                    msg.append(f"· {f.stem[:8]}… [{Path(c).name if c else '?'}]")
+                send_text(chat_id, "\n".join(msg))
+                return
         if not sid:
             send_text(chat_id, f"❌ 找不到会话 {want}")
             return
@@ -2966,15 +3022,25 @@ def handle_command(chat_id: str, text: str) -> None:
         if not items:
             send_text(chat_id, "没找到会话。")
             return
-        lines = [f"📋 最近的会话（/takeover 序号 即可接管）："]
+        lines = ["📋 最近的会话 · 接管：/takeover <序号 或 ID 前 8 位>",
+                 "✅＝本聊天已绑定，直接发消息即可（勿接管） · 🖥＝桌面会话，接管后终端跑完当前回合会交出 · "
+                 "🔀＝其他聊天占用，接管会转移过来（对方收通知）",
+                 ""]
         for i, it in enumerate(items, 1):
             proj = Path(it["cwd"]).name if it["cwd"] else "?"
-            active = " ⚡可能仍在运行" if time.time() - it["mtime"] < 15 else ""
+            active = " ⚡可能在跑" if time.time() - it["mtime"] < 15 else ""
             owner = it.get("managed_chat")
-            mine = "（本聊天当前会话）" if owner == chat_id else (
-                "（另一个飞书聊天在用）" if owner else "")
+            # 状态标记放开头：扫一眼就知道哪条能接、接了会怎样（搞混高发点：
+            # 把已绑定行当可接管行、把占用行当空闲行）
+            if owner == chat_id:
+                mark, tail = "✅", " ← 当前绑定"
+            elif owner:
+                mark, tail = "🔀", "（其他聊天占用）"
+            else:
+                mark, tail = "🖥", ""
             name = _names.get(it["session_id"])
-            lines.append(f"{i}. [{proj}] {_rel_time(it['mtime'])} · {it['session_id'][:8]}…{active}{mine}")
+            lines.append(f"{i}. {mark} [{proj}] {_rel_time(it['mtime'])} · "
+                         f"{it['session_id'][:8]}…{active}{tail}")
             if name:
                 lines.append(f"   📛 {name}")
             summary = _summaries.get(it["session_id"])
