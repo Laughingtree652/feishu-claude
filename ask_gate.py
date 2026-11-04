@@ -96,10 +96,13 @@ def main() -> int:
             continue
     sid = str(hook.get("session_id") or "")
     taken_over = bool(str(route.get(sid) or ""))
+    # 接管态 → away=True：响应面在飞书，超时回退终端框=弹给没人看的屏幕
+    # （11-04 用户实测报"离开电脑还会超时"——接管态恰恰是人不在时的常态，
+    # c8923a8 的"人可能回流电脑终端框能接住"在接管态不成立，回退=死通道）。
     # 未接管：查 idle——人在电脑前让路（响应面在终端，免打扰）；
-    # 人不在电脑前 → away=True（回退终端弹给谁看？没人看的框是死通道，
-    # 飞书卡须不限时等答复）；idle=-1 检测失败保守按可超时（away=False）
-    away = False
+    # 人不在电脑前 → away=True（飞书卡不限时等答复）；
+    # idle=-1 检测失败保守按可超时（away=False）
+    away = taken_over
     if not taken_over:
         try:
             idle_threshold = float(env.get("NOTIFY_IDLE_SECONDS", "180") or 180)

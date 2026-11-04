@@ -2,10 +2,10 @@
 # -*- coding: utf-8 -*-
 """桌面会话权限远程确认 hook（由 ~/.claude/settings.json 的 PermissionRequest 调起）
 
-桌面 Claude 卡在权限确认时把确认转发到飞书：人不在电脑前 → 经 bot 的本地权限
-通道发卡片，手机点 ✅/❌ 直接放行/拒绝桌面进程；人在电脑前 → 立即让路，终端
-照常弹确认框（零打扰）。任何失败都让路：无输出 = Claude Code 走默认（终端弹框），
-绝不干扰桌面会话。
+桌面 Claude 卡在权限确认时把确认转发到飞书：人不在电脑前/接管态 → 经 bot 的
+本地权限通道发卡片（不限时等答复，人回来随时点），手机点 ✅/❌ 直接放行/拒绝
+桌面进程；人在电脑前 → 立即让路，终端照常弹确认框（零打扰）。任何失败都让路：
+无输出 = Claude Code 走默认（终端弹框），绝不干扰桌面会话。
 
 stdin 是 PermissionRequest JSON（tool_name/tool_input/cwd/session_id；中文 description
 经 cp936 错解会产生孤代理字符，须 errors=replace 容错）。应答输出：
@@ -93,10 +93,13 @@ def main() -> int:
             continue
     sid = str(hook.get("session_id") or "")
     taken_over = bool(str(route.get(sid) or ""))
-    _log(f"perm_gate: tool={hook.get('tool_name')} sid={sid[:8]} taken_over={taken_over}")
 
-    # 人在电脑前：立即让路，终端弹框照常（仅未接管会话——响应面在终端，
-    # 免打扰；接管态上面已放行直推飞书卡）
+    # away（人不在电脑前/接管态，11-04 补齐与 ask_gate 同款）：超时回退终端
+    # 弹给谁看？没人看的框是死通道——飞书卡不限时等答复，本连接同步不限时
+    # （settings.json 的 hook timeout 须 ≥ 等待上限，已提至 86400）。
+    # 未接管+人在电脑前：立即让路终端弹框（免打扰）；idle=-1 检测失败保守
+    # 按可超时（away=False，超时回退有人接得住的终端）
+    away = taken_over
     if not taken_over:
         try:
             idle_threshold = float(env.get("NOTIFY_IDLE_SECONDS", "180") or 180)
@@ -105,6 +108,9 @@ def main() -> int:
         idle = _user_idle_seconds()
         if 0 <= idle < idle_threshold:
             return 0
+        away = idle >= idle_threshold
+    _log(f"perm_gate: tool={hook.get('tool_name')} sid={sid[:8]} "
+         f"taken_over={taken_over} away={away}")
 
     port = int(env.get("FEISHU_PERM_PORT", "37921") or 37921)
     try:
@@ -115,11 +121,12 @@ def main() -> int:
     payload = {"type": "desktop_perm", "sid": hook.get("session_id") or "",
                "tool_name": hook.get("tool_name"),
                "tool_input": hook.get("tool_input"),
-               "cwd": hook.get("cwd") or ""}
+               "cwd": hook.get("cwd") or "",
+               "away": away}
     decision = None
     try:
         with socket.create_connection(("127.0.0.1", port), timeout=10) as s:
-            s.settimeout(wait + 30)
+            s.settimeout(None if away else wait + 30)
             s.sendall((json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8"))
             line = s.makefile("rb").readline()
         if line.strip():

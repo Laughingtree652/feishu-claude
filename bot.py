@@ -1181,24 +1181,32 @@ def _perm_conn(conn) -> None:
             result = {"behavior": "deny", "message": "权限确认缺少聊天上下文"}
         elif payload and payload.get("type") == "desktop_perm":
             # 桌面终端会话的权限确认（perm_gate.py hook 转来）：按 sid 路由到
-            # 接管过/让出过该会话的聊天，未命中退回最后活跃聊天
+            # 接管过/让出过该会话的聊天，未命中退回最后活跃聊天。
+            # away（perm_gate 实测人不在电脑前/接管态置位）：没人看的终端框是
+            # 死通道，飞书卡不限时等答复（与 desktop_ask 同款）；非 away 仍按
+            # PERM_GATE_WAIT 超时回退（人可能回流电脑，终端框有人能接住）
             sid = str(payload.get("sid") or "")
             chat_id = _desktop_perm_target(sid)
             tool = str(payload.get("tool_name") or "?")
+            away = bool(payload.get("away"))
             if not chat_id:
                 result = None   # bot 还没收过消息（无通知目标）：不答复，hook 让路终端
             else:
                 disp = _perm_input_display(tool, payload.get("tool_input"))
                 _note_pending_perm(sid, tool)
+                note = ("桌面终端上跑的会话在等这个确认。也可以回复文字：`允许` / `拒绝` /"
+                        " 任意说明（说明会作为拒绝原因转给桌面 Claude）。\n")
+                if away:
+                    note += "你当前不在电脑前，本卡不限时，可随时答复。"
+                else:
+                    note += "超时未应答则回退到桌面终端弹框（人回电脑上点）。"
                 kind, val = _ask_choice(
                     chat_id, "🖥️ 桌面会话请求权限",
                     f"**工具**：`{tool}`\n**内容**：\n{disp}",
                     [{"label": "✅ 允许", "value": "allow", "style": "primary"},
                      {"label": "❌ 拒绝", "value": "deny", "style": "danger"}],
-                    timeout=PERM_GATE_WAIT, template="orange", tag="desktop_perm",
-                    note="桌面终端上跑的会话在等这个确认。也可以回复文字：`允许` / `拒绝` /"
-                         " 任意说明（说明会作为拒绝原因转给桌面 Claude）。\n"
-                         "超时未应答则回退到桌面终端弹框（人回电脑上点）。")
+                    timeout=(None if away else PERM_GATE_WAIT),
+                    template="orange", tag="desktop_perm", note=note)
                 _clear_pending_perm(sid)
                 if kind == "choice":
                     result = ({"behavior": "allow"} if val == "allow" else
@@ -1222,10 +1230,10 @@ def _perm_conn(conn) -> None:
             sid = str(payload.get("sid") or "")
             chat_id = _desktop_perm_target(sid)
             qs = payload.get("questions")
-            # away（ask_gate 实测人不在电脑前才置位）：超时回退终端弹给谁看？
-            # 没人看的终端框是死通道——飞书卡改为不限时等答复（与分身权限卡
-            # wait=None 同款）；接管态/检测失败仍走 PERM_GATE_WAIT 超时回退
-            # （人可能回流电脑，终端框有人能接住）
+            # away（ask_gate 实测人不在电脑前/接管态置位——11-04 起接管态也
+            # away，c8923a8 的"接管态保守超时"实测撤销：接管态终端框没人看）：
+            # 飞书卡不限时等答复（与分身权限卡 wait=None 同款）；
+            # 检测失败仍走 PERM_GATE_WAIT 超时回退
             away = bool(payload.get("away"))
             if not chat_id or not isinstance(qs, list) or not qs:
                 result = None   # 无路由（bot 未收过消息）/无问题：让路终端原生 UI
