@@ -29,6 +29,7 @@ except ImportError:
     psutil = None
 
 import lark_oapi as lark
+import requests
 from lark_oapi.api.im.v1 import (
     CreateMessageRequest,
     CreateMessageRequestBody,
@@ -700,6 +701,42 @@ def _md_tables_need_blank(text: str) -> str:
     return "\n".join(out)
 
 
+def _post_message(chat_id: str, msg_type: str, content: str):
+    """发一条消息（text/interactive 共用的底层调用），连接类网络错误自动重试。
+
+    open.feishu.cn 的 HTTPS 间歇抖动实测（logs/bot.log 11-03/11-04 十余次）：
+    连接池里的陈旧 keep-alive 连接被服务端/中间网络掐掉（10054 连接重置）、
+    DNS 解析瞬时失败——紧随其后的重发就能成功（21:56 三选卡降级文字即为
+    佐证：同端点卡片失败、文字成功）。故连接类异常重试 3 次（递增退避），
+    持续故障照旧返回失败由调用方降级；业务错误码（resp.success()=False）
+    是服务端明确答复，不重试。返回 (ok, message_id, err_text)。
+    """
+    err = ""
+    for attempt in range(3):
+        req = CreateMessageRequest.builder() \
+            .receive_id_type("chat_id") \
+            .request_body(
+                CreateMessageRequestBody.builder()
+                .receive_id(chat_id)
+                .msg_type(msg_type)
+                .content(content)
+                .build()
+            ).build()
+        try:
+            resp = api.im.v1.message.create(req)
+            if resp.success():
+                return True, (resp.data.message_id if resp.data else None), ""
+            return False, None, f"code={resp.code} msg={resp.msg}"
+        except Exception as e:
+            err = repr(e)
+            if attempt < 2 and isinstance(e, (requests.exceptions.ConnectionError,
+                                              requests.exceptions.Timeout)):
+                time.sleep(0.8 * (attempt + 1))
+                continue
+            break
+    return False, None, err
+
+
 def send_text(chat_id: str, text: str) -> None:
     """发送文本到指定会话：超长自动分段（换行处断开，不丢内容），带简单限速。"""
     global _last_send
@@ -712,43 +749,20 @@ def send_text(chat_id: str, text: str) -> None:
             if gap > 0:
                 time.sleep(gap)
             _last_send = time.time()
-            req = CreateMessageRequest.builder() \
-                .receive_id_type("chat_id") \
-                .request_body(
-                    CreateMessageRequestBody.builder()
-                    .receive_id(chat_id)
-                    .msg_type("text")
-                    .content(json.dumps({"text": chunk}, ensure_ascii=False))
-                    .build()
-                ).build()
-            try:
-                resp = api.im.v1.message.create(req)
-                if not resp.success():
-                    log(f"[发消息失败] code={resp.code} msg={resp.msg}")
-            except Exception as e:
-                log(f"[发消息异常] {e!r}")
+            ok, _, err = _post_message(chat_id, "text",
+                                       json.dumps({"text": chunk}, ensure_ascii=False))
+            if not ok:
+                log(f"[发消息失败] {err}")
 
 
 def _send_card(chat_id: str, card: dict):
     """发送交互卡片，成功返回 message_id（卡片定格更新用），失败返回 None。"""
-    req = CreateMessageRequest.builder() \
-        .receive_id_type("chat_id") \
-        .request_body(
-            CreateMessageRequestBody.builder()
-            .receive_id(chat_id)
-            .msg_type("interactive")
-            .content(json.dumps(card, ensure_ascii=False))
-            .build()
-        ).build()
-    try:
-        resp = api.im.v1.message.create(req)
-        if not resp.success():
-            log(f"[发卡片失败] code={resp.code} msg={resp.msg}")
-            return None
-        return resp.data.message_id if resp.data else None
-    except Exception as e:
-        log(f"[发卡片异常] {e!r}")
+    ok, msg_id, err = _post_message(chat_id, "interactive",
+                                    json.dumps(card, ensure_ascii=False))
+    if not ok:
+        log(f"[发卡片失败] {err}")
         return None
+    return msg_id
 
 
 def _info_card(title: str, md: str, template: str = "blue") -> dict:
