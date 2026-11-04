@@ -155,6 +155,25 @@ def _route_target(sid: str) -> str:
         return ""
 
 
+def _still_taken_over(sid) -> bool:
+    """该会话当前是否仍被飞书侧绑定（sessions.json 任一聊天的当前绑定）。
+
+    11-04 修复：移交标记原先写进 handoff_requests.json 后永不过期也不校验——
+    终端若一直没触发 Stop（接管后用户没在桌面用过），标记躺几天，哪天在桌面
+    resume 该会话干活，第一回合结束就被迟到的"劝停交出"打断（滞留炸弹，
+    10-31 起积压了多个）。判据用 sessions.json 当前绑定（desktop_route 含
+    让位残留不能当判据）：绑定在=所有权仍归飞书=劝停有效（防同 SID 双头写）；
+    绑定不在（已 /exit /换绑 /new）=没人接管了，标记作废，终端随便用。
+    """
+    if not sid:
+        return False
+    try:
+        sess = _read_state(STATE / "sessions.json", {})
+        return any((info or {}).get("session_id") == sid for info in sess.values())
+    except Exception:
+        return False   # 读不到绑定时保守放行劝停（保留原保护行为）
+
+
 def _pop_handoff(sid) -> str:
     """查并消费该会话的终端移交指令（/takeover 接管落地时 bot 写入）。返回指令文本或 ""。
 
@@ -168,6 +187,13 @@ def _pop_handoff(sid) -> str:
         data = _read_state(HANDOFF_FILE, {})
         item = data.pop(sid, None)
         if not item:
+            return ""
+        if not _still_taken_over(sid):
+            _log(f"handoff 丢弃滞留标记 sid={sid[:8]}…（该会话已不被飞书侧绑定，"
+                 f"可能早已 /exit/换绑——迟到的劝停会莫名打断终端工作）")
+            tmp = HANDOFF_FILE.with_suffix(".tmp")
+            tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+            tmp.replace(HANDOFF_FILE)
             return ""
         tmp = HANDOFF_FILE.with_suffix(".tmp")
         tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")

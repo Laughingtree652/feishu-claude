@@ -553,7 +553,9 @@ def _takeover_running_dialog(chat_id: str, sid: str, cwd, session_file, age: flo
                   f"✅ 已强制接管会话 {sid[:8]}…（目录：{_chat_work_dir(chat_id)}）\n"
                   "下一条消息将带上该会话的全部上下文。\n"
                   "· 已给终端留移交指令：它跑完手头回合会自动收尾交出"
-                  "（含后台任务台账），之后不再接活。" + stolen + rescue)
+                  "（含后台任务台账），之后不再接活——**收尾总结会写进转录，"
+                  "不是丢工作**，你在这边发「继续」即可无缝接着干。\n"
+                  "· 同一会话不能两头同时跑（会写花历史），终端让位是接管的必要动作。" + stolen + rescue)
         return
     # queue：绑定 + 排队接管（沿用 _wait_and_drain 轮询机制）
     _recycle_chat_sessions(chat_id)   # 换绑：旧会话的驻留进程让位
