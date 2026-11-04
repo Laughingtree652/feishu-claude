@@ -2261,6 +2261,19 @@ CCSWITCH_SETTINGS = CCSWITCH_DIR / "settings.json"
 CLAUDE_SETTINGS = Path.home() / ".claude" / "settings.json"
 
 
+def _ccswitch_running() -> bool:
+    """cc-switch 桌面应用是否在跑（切换提示用：它启动后的内存状态不知道
+    bot 改过的 is_current/settings.json，在它里面继续操作会基于旧状态错乱）。"""
+    try:
+        import psutil
+        for p in psutil.process_iter(["name"]):
+            if "cc-switch" in str(p.info.get("name") or "").lower():
+                return True
+    except Exception:
+        pass
+    return False
+
+
 def _providers() -> list:
     """cc-switch 库里的 Claude 供应商 [{"id","name","base","key_tail","is_current","env"}]。
     env 为空 dict 表示官方 OAuth 等非 env 形态（bot 切不了，得走 cc-switch 界面）。"""
@@ -2275,14 +2288,23 @@ def _providers() -> list:
     out = []
     for pid, name, cfg, cur, _si in rows:
         try:
-            env = (json.loads(cfg) or {}).get("env") or {}
+            d = json.loads(cfg)
         except Exception:
-            env = {}
+            d = {}
+        if not isinstance(d, dict):
+            d = {}
+        env = d.get("env") or {}
+        # 存档体检：cc-switch 本地代理（Live 接管）会把接管时刻的 settings.json
+        # 现场整个回写进当前供应商存档——顶层混入 hooks/permissions 等 Claude
+        # Code 运行配置，env 还被改写成 AUTH_TOKEN 形态、丢模型映射键
+        # （11-04 实测 GLM 存档中招）。供应商存档管的是"连哪家 API"，这俩键
+        # 绝不该出现，出现即判污染
+        dirty = ("hooks" in d) or ("permissions" in d)
         key = str(env.get("ANTHROPIC_API_KEY") or env.get("ANTHROPIC_AUTH_TOKEN") or "")
         out.append({"id": pid, "name": (name or "?").strip(), "env": env,
                     "base": env.get("ANTHROPIC_BASE_URL") or "?",
                     "key_tail": key[-4:] if len(key) >= 8 else "?",
-                    "is_current": bool(cur)})
+                    "is_current": bool(cur), "dirty": dirty})
     return out
 
 
@@ -2403,6 +2425,14 @@ def _switch_provider(chat_id: str, arg: str) -> None:
         send_text(chat_id, f"❌ {target['name']} 是官方 OAuth 等非 env 形态配置，"
                            "bot 切不了，请在 cc-switch 界面切换。")
         return
+    # 存档污染拒切：切换是"整块拷存档 env 进 settings.json"，脏存档会把
+    # AUTH_TOKEN 形态、缺模型映射键的 env 直接灌进运行环境
+    if target.get("dirty"):
+        send_text(chat_id, f"❌ {target['name']} 的存档疑似被污染（顶层混入 hooks/permissions——"
+                           "cc-switch 本地代理 Live 接管时会把 settings.json 现场整个回写进存档），"
+                           "拒切以防弄坏 settings.json。请先在 cc-switch 界面清理该供应商配置"
+                           "（只留 env），或让桌面助手从 ~/.cc-switch/backups 的每日备份恢复存档。")
+        return
     try:
         settings = json.loads(CLAUDE_SETTINGS.read_text("utf-8"))
     except Exception:
@@ -2443,6 +2473,9 @@ def _switch_provider(chat_id: str, arg: str) -> None:
         tips.append(f"· 已回收空闲分身 {idle} 个（绑定保留，发消息自动续接）")
     if busy:
         tips.append(f"· ⚠️ {busy} 个分身正在跑回合，这轮跑完仍是旧 key")
+    if _ccswitch_running():
+        tips.append("· ⚠️ cc-switch 正在运行：它不知道这次切换（内存里还是旧状态），"
+                    "先别在里面做切换/开本地代理（Live 接管会把现场回写进存档），要动先重启它")
     send_text(chat_id, "\n".join(tips))
 
 
@@ -2815,7 +2848,8 @@ def handle_command(chat_id: str, text: str) -> None:
             lines = ["🔑 Claude 供应商（cc-switch 库）："]
             for i, p in enumerate(provs, 1):
                 mark = " ← 生效中" if (p["key_tail"] == cur_tail and p["base"] == cur_base) else ""
-                lines.append(f"{i}. {p['name']} · {p['base']} · key …{p['key_tail']}{mark}")
+                warn = " ⚠️存档污染" if p.get("dirty") else ""
+                lines.append(f"{i}. {p['name']} · {p['base']} · key …{p['key_tail']}{warn}{mark}")
             lines += ["", f"当前生效：{_provider_now()}",
                       "切换：/provider <序号|名称关键字>（新起进程生效，终端活会话需重启）"]
             send_text(chat_id, "\n".join(lines))
