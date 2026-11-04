@@ -141,8 +141,8 @@ HELP_TEXT = """📖 命令列表
 /stop — 中断当前任务（排队的消息一并取消）
 /status — 状态面板：机器人设置（权限/静默/免@）+ 会话绑定与进程工作状态
 /session — 查看当前会话 ID（在电脑上 claude --resume <id> 可接续）
-/sessions [条数] — 列出电脑上最近的会话（含当前绑定的；用过一段的自动带一行摘要）
-/takeover [序号|会话ID|latest|last] — 接管电脑上的会话（latest=电脑最新；last=本聊天上次让出的；在跑的发卡片选：排队/强制/取消）
+/sessions [条数] — 列出电脑上最近的会话（含完整 ID 可复制；序号是快照，活跃重排会漂，精确接管请复制 ID）
+/takeover [序号|会话ID|latest|last] — 接管电脑上的会话（ID 用完整或前 8 位；latest=电脑最新；last=本聊天上次让出的；在跑的发卡片选：排队/强制/取消）
 /exit — 退出当前接管的会话（解绑+回收驻留进程；历史保留，可再 /takeover）
 /handover [说明] — 一键移交终端：中断当前活→分身收尾总结写进转录→自动退出，接手命令（claude --resume）进剪贴板，终端粘贴回车即续跑
 /peek [序号|会话ID|latest|last] — 旁观会话当前进度（last=本聊天上次让出的会话）
@@ -174,11 +174,11 @@ HELP_MD = """**🧩 会话管理**
 - **/handover** [说明] — 一键移交终端：中断当前活→分身收尾总结写进转录→自动退出，接手命令进剪贴板，终端粘贴回车即续跑
 
 **📡 接管与进度**
-- **/takeover** [序号|会话ID|latest|last] — 接管电脑上的会话（latest=电脑最新；last=本聊天上次让出的；在跑的发卡片选：排队/强制/取消）
+- **/takeover** [序号|会话ID|latest|last] — 接管电脑上的会话（ID 用完整或前 8 位；latest=电脑最新；last=本聊天上次让出的；在跑的发卡片选：排队/强制/取消）
 - **/peek** [序号|会话ID|latest|last] — 旁观会话当前进度
 - **/observe** [序号|会话ID|latest|last] — 实时观察：转录有动静自动刷新快照卡片
 - **/unobserve** — 停止实时观察
-- **/sessions** [条数] — 列出电脑上最近的会话（用过一段的自动带一行摘要）
+- **/sessions** [条数] — 列出电脑上最近的会话（含完整 ID 可复制；序号是快照会漂，精确接管请复制 ID）
 - **/session** — 查看当前会话 ID（在本机 claude --resume 会话ID 可接续）
 - **/rename** [名字] — 给当前会话起名（/sessions 列表优先显示名字）
 - **/unqueue** — 取消排队接管
@@ -2780,7 +2780,7 @@ def handle_command(chat_id: str, text: str) -> None:
         elif want.isdigit():
             # 与 /sessions 同一份列表（含机器人管理的会话；上限也对齐 20），
             # 序号才对得上——注意列表按活跃度排序，隔一会儿序号会漂，
-            # 拿不准就抄 ID 前 8 位（_resolve_want 支持前缀匹配）
+            # 拿不准就抄 /sessions 里的完整 ID（_resolve_want 也支持前缀匹配）
             items = _recent_sessions(20, include_managed=True)
             idx = int(want) - 1
             if 0 <= idx < len(items):
@@ -2788,14 +2788,14 @@ def handle_command(chat_id: str, text: str) -> None:
         else:
             sid, cwd, cands = _resolve_want(want)
             if not sid and cands:
-                msg = [f"❌ “{want}” 匹配到 {len(cands)} 个会话，多输几位 ID 前缀区分："]
+                msg = [f"❌ “{want}” 匹配到 {len(cands)} 个会话，多输几位前缀，或直接复制下面完整 ID："]
                 for f, c, _m in cands[:5]:
-                    msg.append(f"· {f.stem[:8]}… [{Path(c).name if c else '?'}]")
+                    msg.append(f"· {f.stem} [{Path(c).name if c else '?'}]")
                 send_text(chat_id, "\n".join(msg))
                 return
         if not sid:
             send_text(chat_id, f"❌ 找不到会话 {want}\n"
-                               "提示：/sessions 查看列表，接管可用序号或 ID 前 8 位；"
+                               "提示：/sessions 查看列表（含完整 ID 可复制），接管用完整 ID 或前 8 位；"
                                "桌面通知里也带有可复制的 /takeover 命令。")
             return
         cur = (_sessions.get(chat_id) or {}).get("session_id")
@@ -2849,9 +2849,9 @@ def handle_command(chat_id: str, text: str) -> None:
         else:
             sid, _cwd, cands = _resolve_want(want)
             if not sid and cands:
-                msg = [f"❌ “{want}” 匹配到 {len(cands)} 个会话，多输几位 ID 前缀区分："]
+                msg = [f"❌ “{want}” 匹配到 {len(cands)} 个会话，多输几位前缀，或直接复制下面完整 ID："]
                 for f, c, _m in cands[:5]:
-                    msg.append(f"· {f.stem[:8]}… [{Path(c).name if c else '?'}]")
+                    msg.append(f"· {f.stem} [{Path(c).name if c else '?'}]")
                 send_text(chat_id, "\n".join(msg))
                 return
         if not sid:
@@ -2887,9 +2887,9 @@ def handle_command(chat_id: str, text: str) -> None:
         else:
             sid, _cwd, cands = _resolve_want(want)
             if not sid and cands:
-                msg = [f"❌ “{want}” 匹配到 {len(cands)} 个会话，多输几位 ID 前缀区分："]
+                msg = [f"❌ “{want}” 匹配到 {len(cands)} 个会话，多输几位前缀，或直接复制下面完整 ID："]
                 for f, c, _m in cands[:5]:
-                    msg.append(f"· {f.stem[:8]}… [{Path(c).name if c else '?'}]")
+                    msg.append(f"· {f.stem} [{Path(c).name if c else '?'}]")
                 send_text(chat_id, "\n".join(msg))
                 return
         if not sid:
@@ -3046,7 +3046,9 @@ def handle_command(chat_id: str, text: str) -> None:
         if not items:
             send_text(chat_id, "没找到会话。")
             return
-        lines = ["📋 最近的会话 · 接管：/takeover <序号 或 ID 前 8 位>",
+        lines = ["📋 最近的会话 · 接管：/takeover <ID>（完整或前 8 位均可，精确优先复制 ID）",
+                 "⚠️ 序号是快照：列表按活跃度排序，会话一动就可能重排——隔了一会儿再按序号接管，"
+                 "可能接错！拿不准就复制下面完整 ID。",
                  "✅＝本聊天已绑定，直接发消息即可（勿接管） · 🖥＝桌面会话，接管后终端跑完当前回合会交出 · "
                  "🔀＝其他聊天占用，接管会转移过来（对方收通知）",
                  ""]
@@ -3063,8 +3065,11 @@ def handle_command(chat_id: str, text: str) -> None:
             else:
                 mark, tail = "🖥", ""
             name = _names.get(it["session_id"])
-            lines.append(f"{i}. {mark} [{proj}] {_rel_time(it['mtime'])} · "
-                         f"{it['session_id'][:8]}…{active}{tail}")
+            lines.append(f"{i}. {mark} [{proj}] {_rel_time(it['mtime'])}{active}{tail}")
+            # 完整 ID 独立成行（不与其他内容同行，划词复制才纯净）——
+            # 11-04 用户实测痛点：只显示前 8 位时无法精确指认，序号又因
+            # 活跃重排接错会话；全 ID 一行是精确接管的正路
+            lines.append(f"   {it['session_id']}")
             if name:
                 lines.append(f"   📛 {name}")
             summary = _summaries.get(it["session_id"])
