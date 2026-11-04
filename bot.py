@@ -136,6 +136,7 @@ LIVE_PATCH_INTERVAL = 1.2  # 流式卡片刷新间隔（秒）：更实时但太
 HELP_TEXT = """📖 命令列表
 /help — 查看本帮助
 /new — 新开一个零上下文的会话（旧会话历史保留，/takeover last 可接回）
+/compact [保留指令] — 手动压缩当前会话上下文（可附保留重点，如 /compact 重点保留代码结论；需分身空闲时）
 /stop — 中断当前任务（排队的消息一并取消）
 /status — 状态面板：机器人设置（权限/静默/免@）+ 会话绑定与进程工作状态
 /session — 查看当前会话 ID（在电脑上 claude --resume <id> 可接续）
@@ -166,6 +167,7 @@ Claude 需要权限确认时会发卡片，点按钮或直接回复文字（允�
 # 卡片版帮助（/help 发送；HELP_TEXT 保留作卡片失败的兜底纯文本）
 HELP_MD = """**🧩 会话管理**
 - **/new** — 新开一个零上下文的会话（旧会话历史保留，/takeover last 可接回）
+- **/compact** [保留指令] — 手动压缩当前会话上下文（可附保留重点，如 /compact 重点保留代码结论；需分身空闲时）
 - **/stop** — 中断当前任务（排队的消息一并取消）
 - **/exit** — 退出当前接管的会话（解绑+回收驻留进程；历史保留，可再 /takeover）
 - **/handover** [说明] — 一键移交终端：中断当前活→分身收尾总结写进转录→自动退出，接手命令进剪贴板，终端粘贴回车即续跑
@@ -2518,7 +2520,7 @@ def _switch_provider(chat_id: str, arg: str) -> None:
 COMMANDS = ["/help", "/new", "/exit", "/stop", "/status", "/session", "/sessions",
             "/takeover", "/peek", "/observe", "/unobserve", "/unqueue", "/rename",
             "/cwd", "/mode", "/model", "/mute", "/unmute", "/quiet", "/unquiet",
-            "/listen", "/provider", "/handover"]
+            "/listen", "/provider", "/handover", "/compact"]
 
 
 def _expand_cmd(text: str):
@@ -3116,6 +3118,30 @@ def handle_command(chat_id: str, text: str) -> None:
                                "会在本回合结束后用新模式重建）{warn}")
         else:
             send_text(chat_id, f"❌ 无效模式 {arg}\n可选：{' | '.join(sorted(PERMISSION_MODES))}")
+    elif cmd == "/compact":
+        # 手动压缩上下文：headless stdin 里的 slash 命令会被 CLI 解释执行而非发给模型
+        # （11-04 双实验实测：空会话喂 /compact 得 <synthetic> 合成回复零计费；
+        #  有内容会话触发 system:compact_boundary + 摘要生成计费，进程继续存活）。
+        # 直接写进分身 stdin 即可；compact 的 result 走正常回合收尾自动推 ✅ 回执。
+        info = _sessions.get(chat_id)
+        sid = (info or {}).get("session_id") or ""
+        if not sid:
+            send_text(chat_id, "当前聊天没有绑定会话：先发条消息或 /takeover 接管一个，再 /compact。")
+            return
+        with _running_lock:
+            slot = _running.get(sid) or _running.get(chat_id)   # init 前后键不同，两边都找
+        proc = (slot or {}).get("proc")
+        if not slot or proc is None or proc.poll() is not None:
+            send_text(chat_id, "💤 分身进程当前不在运行（闲置回收/已退出）。上下文都在盘上不会丢："
+                               "autoCompact 已开，下次拉起满载时会自动压缩；想立即压就先发条消息把分身叫起来。")
+        elif slot.get("in_turn"):
+            send_text(chat_id, "⏳ 分身正在跑回合，此刻注入压缩可能打断工作；等收到 ✅ 完成回执后再 /compact。")
+        else:
+            payload = "/compact" + ((" " + arg) if arg else "")   # 附加保留指令一并透传
+            if _write_to_session(slot, payload):
+                send_text(chat_id, "🧹 已向分身发送压缩指令（生成摘要会调一次模型，完成后有 ✅ 回执）。")
+            else:
+                send_text(chat_id, "❌ 写入分身失败（管道可能已断）；稍后重试或直接发消息让分身重建。")
     else:
         send_text(chat_id, f"未知命令 {cmd}，发送 /help 查看可用命令。")
 
