@@ -33,6 +33,8 @@ import requests
 from lark_oapi.api.im.v1 import (
     CreateMessageRequest,
     CreateMessageRequestBody,
+    CreateFileRequest,
+    CreateFileRequestBody,
     PatchMessageRequest,
     PatchMessageRequestBody,
     P2ImMessageReceiveV1,
@@ -152,6 +154,7 @@ HELP_TEXT = """📖 命令列表
 /unqueue — 取消排队接管
 /rename [名字] — 给当前会话起名（/sessions 列表优先显示名字）
 /cwd [路径] — 查看 / 切换 Claude 的工作目录
+/file [路径] — 把本地文件作为文件消息发进本聊天（相对路径相对工作目录）
 /mode [模式] — 查看 / 切换本聊天的权限模式（manual、auto、acceptEdits…，未设置时用全局默认）
 /model [序号|名称|reset] — 查看/切换本聊天的模型（网关可用模型实时列出；reset 回退全局默认）
 /listen — 群聊免 @ 模式：本群所有消息直接发给机器人（适合只有你+机器人的群）
@@ -188,6 +191,7 @@ HELP_MD = """**🧩 会话管理**
 - **/mode** [模式] — 查看/切换本聊天的权限模式（manual、auto、acceptEdits…，未设置时用全局默认）
 - **/model** [序号|名称|reset] — 查看/切换本聊天的模型（reset 回退全局默认）
 - **/cwd** [路径] — 查看/切换 Claude 的工作目录
+- **/file** [路径] — 把本地文件作为文件消息发进本聊天（相对路径相对工作目录）
 - **/provider** [序号|名称] — 查看/切换 Claude 供应商（cc-switch 库；切换即换 key，新起进程生效）
 - **/listen** — 群聊免 @ 模式：本群所有消息直接发给机器人（适合只有你+机器人的群）
 - **/mute · /unmute** — 暂停/恢复桌面事件推送（全局）
@@ -737,6 +741,48 @@ def _post_message(chat_id: str, msg_type: str, content: str):
                 continue
             break
     return False, None, err
+
+
+# 飞书文件消息两步走：先传 im/v1/files 拿 file_key（上限 30MB），再发
+# msg_type=file。飞书认的 file_type 只有 opus/mp4/pdf/doc/xls/ppt/stream，
+# 其余（md/txt/log/json/py…）一律走通用 stream，收发不受影响。
+_FILE_TYPE_MAP = {".pdf": "pdf", ".doc": "doc", ".docx": "doc",
+                  ".xls": "xls", ".xlsx": "xls", ".ppt": "ppt", ".pptx": "ppt",
+                  ".mp4": "mp4", ".opus": "opus", ".mp3": "opus"}
+
+
+def send_file(chat_id: str, path: Path) -> bool:
+    """把本地文件作为文件消息发进指定聊天（/file 命令与后续自动发共用）。"""
+    try:
+        size = path.stat().st_size
+    except OSError as e:
+        send_text(chat_id, f"❌ 读不到文件：{e!r}")
+        return False
+    if size > 30 * 1024 * 1024:
+        send_text(chat_id, f"❌ 文件超限：{path.name} {size / 1048576:.1f}MB"
+                           "（飞书文件消息上限 30MB）")
+        return False
+    ftype = _FILE_TYPE_MAP.get(path.suffix.lower(), "stream")
+    try:
+        with path.open("rb") as f:
+            req = CreateFileRequest.builder().request_body(
+                CreateFileRequestBody.builder()
+                .file_type(ftype).file_name(path.name).file(f)
+                .build()).build()
+            resp = api.im.v1.file.create(req)
+    except Exception as e:
+        # 上传走独立端点（不走 _post_message 的重试），连接类抖动让用户重发即可
+        send_text(chat_id, f"❌ 文件上传失败：{e!r}")
+        return False
+    if not resp.success() or not (resp.data and resp.data.file_key):
+        send_text(chat_id, f"❌ 文件上传失败：code={resp.code} msg={resp.msg}")
+        return False
+    ok, _, err = _post_message(chat_id, "file",
+                               json.dumps({"file_key": resp.data.file_key}))
+    if not ok:
+        send_text(chat_id, f"❌ 文件消息发送失败：{err}")
+        return False
+    return True
 
 
 def send_text(chat_id: str, text: str) -> None:
@@ -2543,7 +2589,7 @@ def _switch_provider(chat_id: str, arg: str) -> None:
 # ---------------- 命令缩写（/ob → /observe：唯一前缀展开，歧义则提示补全） ----------------
 COMMANDS = ["/help", "/new", "/exit", "/stop", "/status", "/session", "/sessions",
             "/takeover", "/peek", "/observe", "/unobserve", "/unqueue", "/rename",
-            "/cwd", "/mode", "/model", "/mute", "/unmute", "/quiet", "/unquiet",
+            "/cwd", "/file", "/mode", "/model", "/mute", "/unmute", "/quiet", "/unquiet",
             "/listen", "/provider", "/handover", "/compact"]
 
 
@@ -3118,6 +3164,21 @@ def handle_command(chat_id: str, text: str) -> None:
                     _sessions.pop(chat_id, None)  # 只重置本聊天的会话，不影响其他聊天
                 save_sessions()
                 send_text(chat_id, f"📁 工作目录已切换：{WORK_DIR}\n（本聊天的历史会话已重置）")
+    elif cmd == "/file":
+        # 发文件进本聊天：先传飞书拿 file_key 再发 file 消息。
+        # 相对路径相对本聊天工作目录解析——和分身看到的文件系统一致，
+        # 分身说"已生成 report.md"时直接 /file report.md 就能取到。
+        if not arg:
+            send_text(chat_id, f"用法：/file <路径>  （相对路径相对当前工作目录：{_chat_work_dir(chat_id)}）")
+        else:
+            p = Path(arg)
+            if not p.is_absolute():
+                p = _chat_work_dir(chat_id) / p
+            p = p.resolve()
+            if not p.is_file():
+                send_text(chat_id, f"❌ 文件不存在：{p}")
+            else:
+                send_file(chat_id, p)
     elif cmd == "/mode":
         if not arg:
             cur = _chat_mode(chat_id)
