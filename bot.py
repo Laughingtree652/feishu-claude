@@ -1845,29 +1845,46 @@ def _session_preview(session_file: Path) -> str:
 
     注意转录里 tool_result 记录的 type 也是 "user"，需按内容形态排除；
     isMeta 的是系统注入消息，同样跳过。
+
+    11-06 修两处捞空/捞错：
+    ① 捞空——固定 64KB 尾部窗口对长回合会话不够：一条 thinking/工具
+    结果就几十 KB，真人消息被挤出去后返回空串，/sessions 里整条会话只剩
+    光秃秃的 ID 认不出（实测 18MB 活跃会话尾部 512KB 仍无 user 行）。
+    改递增窗口 1MB→6MB 步进重扫，页缓存下毫秒级；小文件扫到头即停。
+    ② 捞错——压缩摘要行（isCompactSummary 的 type=user 常驻尾部）、
+    synthetic/系统注入（"<" 开头）、slash 命令文本（"/" 开头）显示出来
+    同样认不出，一并排除。
     """
     try:
-        with session_file.open("rb") as fh:
-            fh.seek(0, 2)
-            size = fh.tell()
-            fh.seek(max(0, size - 65536))  # 只看最后 64KB
-            data = fh.read().decode("utf-8", "replace")
-        for line in reversed(data.splitlines()):
-            if '"user"' not in line:
-                continue
-            try:
-                d = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if d.get("type") != "user" or d.get("isMeta"):
-                continue
-            c = (d.get("message") or {}).get("content")
-            if isinstance(c, str) and c.strip():
-                return c.strip().replace("\n", " ")[:40]
-            if isinstance(c, list):
-                for b in c:
-                    if isinstance(b, dict) and b.get("type") == "text" and (b.get("text") or "").strip():
-                        return b["text"].strip().replace("\n", " ")[:40]
+        size = session_file.stat().st_size
+        for window in range(1 << 20, 7 << 20, 1 << 20):   # 1MB…6MB 递增重扫
+            with session_file.open("rb") as fh:
+                fh.seek(max(0, size - window))
+                data = fh.read().decode("utf-8", "replace")
+            for line in reversed(data.splitlines()):
+                if '"user"' not in line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if d.get("type") != "user" or d.get("isMeta") or d.get("isCompactSummary") \
+                        or d.get("isApiErrorMessage") or d.get("isStub"):
+                    continue
+                c = (d.get("message") or {}).get("content")
+                text = ""
+                if isinstance(c, str):
+                    text = c.strip()
+                elif isinstance(c, list):
+                    for b in c:
+                        if isinstance(b, dict) and b.get("type") == "text" and (b.get("text") or "").strip():
+                            text = b["text"].strip()
+                            break
+                if not text or text.startswith(("<", "/")):
+                    continue
+                return text.replace("\n", " ")[:60]
+            if size <= window:
+                break   # 已扫到文件头，没找到就是真没有
     except OSError:
         pass
     return ""
