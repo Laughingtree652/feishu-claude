@@ -1,5 +1,7 @@
 ﻿# 一键重启飞书机器人：杀掉现有实例，再启动一个新的独立窗口
 # 用法（PowerShell 里）：  powershell -ExecutionPolicy Bypass -File D:\work\feishu-claude\restart.ps1
+#                      （保活拉起时传 -Reason keepalive，启动通知据此区分文案）
+param([string]$Reason = "manual")
 $ErrorActionPreference = "SilentlyContinue"
 $base = "D:\work\feishu-claude"
 $py = "$base\.venv\Scripts\python.exe"
@@ -37,8 +39,9 @@ try {
         -WindowStyle Hidden `
         -RedirectStandardOutput "$logs\bot_console_$stamp.log" -RedirectStandardError "$logs\bot_err_$stamp.log"
 }
-# 手动重启标记：bot 起来后给私聊发"重启完成"通知（bot.py 读后自删；
-# 无标记的启动如看门狗自愈也会发，但按 10 分钟节流防崩溃循环刷屏）
-Set-Content -Path "$base\data\boot_reason.flag" -Value "manual restart" -Encoding ASCII
+# 启动来源标记：bot 起来后按值区分通知文案（bot.py 读后自删）——manual=手动
+# 重启报"部署重启完成"；keepalive=保活链拉起报"自愈恢复"。无标记的启动（开机
+# 自启等）也发，但按 10 分钟节流防崩溃循环刷屏
+Set-Content -Path "$base\data\boot_reason.flag" -Value $Reason -Encoding ASCII
 
 Write-Host "完成。发条消息验证，或看 logs\bot_console.log。"

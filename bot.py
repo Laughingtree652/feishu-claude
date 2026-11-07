@@ -3790,11 +3790,13 @@ def _boot_notice() -> None:
                 return
             flag = STATE_DIR / "boot_reason.flag"
             forced = flag.exists()
+            reason = ""
             if forced:
                 try:
+                    reason = flag.read_text("utf-8").strip()[:40]
                     flag.unlink()
                 except OSError:
-                    pass
+                    reason = ""
             ts_file = STATE_DIR / "boot_notify.ts"
             now = time.time()
             if not forced:
@@ -3812,7 +3814,16 @@ def _boot_notice() -> None:
             except Exception:
                 pass
             version = version[:80] + ("…" if len(version) > 80 else "")
-            text = "✅ 机器人已重启完成，新进程已上线"
+            # 文案按启动来源分支（11-07 用户被"反复发"的复读感困扰：一天 4 次
+            # 启动=2 部署+2 自愈全长得一样，分不清哪次要关心）：
+            # manual=restart.ps1 手动（部署）；keepalive=保活拉起（进程崩溃/
+            # 看门狗自杀/断网后自动恢复——值得多看一眼）；其余=通用
+            if reason == "keepalive":
+                text = "🔧 机器人自愈恢复：检测到进程不在（崩溃/断网自杀/被停），保活已自动拉起"
+            elif reason == "manual":
+                text = "✅ 机器人已重启完成，新进程已上线"
+            else:
+                text = "✅ 机器人已启动，新进程已上线"
             if version:
                 text += f"\n版本：{version}"
             send_text(target, text)

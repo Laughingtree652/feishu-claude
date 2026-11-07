@@ -6,5 +6,7 @@ if (-not (Test-Path $py)) { exit 1 }
 $running = Get-CimInstance Win32_Process -Filter "Name='python.exe'" |
     Where-Object { $_.CommandLine -like "*bot.py*" }
 if (-not $running) {
-    & powershell -NoProfile -ExecutionPolicy Bypass -File "D:\work\feishu-claude\restart.ps1"
+    # -Reason keepalive：启动通知据此报"自愈恢复"而非"手动重启"
+    # （bot 进程不在=崩溃/看门狗自杀/断网，这次启动是保活拉起不是人手动）
+    & powershell -NoProfile -ExecutionPolicy Bypass -File "D:\work\feishu-claude\restart.ps1" -Reason keepalive
 }
