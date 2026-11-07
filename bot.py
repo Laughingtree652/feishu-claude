@@ -814,6 +814,27 @@ def _send_card(chat_id: str, card: dict):
     return msg_id
 
 
+def send_markdown(chat_id: str, text: str) -> None:
+    """发 markdown 卡片：2.0 + markdown 组件渲染（飞书 text 消息不渲染 markdown，
+    静默模式的结果此前走 send_text 原样显示 #/**/` 等标记——11-07 实测用户报障）。
+
+    超长自动分段续卡（与 _LiveReply 定格形态一致：无 header 纯正文卡）；
+    发卡失败该段回退纯文本，内容不丢。
+    """
+    text = (text or "").strip()
+    if not text:
+        return
+    chunks = _split_chunks(text)
+    for i, chunk in enumerate(chunks):
+        card = {"schema": "2.0",
+                "body": {"elements": [{"tag": "markdown",
+                                       "content": _md_tables_need_blank(chunk)}]}}
+        if _send_card(chat_id, card) is None:
+            send_text(chat_id, chunk)   # 卡片通道挂了：纯文本兜底，内容不丢
+        if i < len(chunks) - 1:
+            time.sleep(SEND_INTERVAL)  # 多卡连发节流（与 send_text 同款频控）
+
+
 def _info_card(title: str, md: str, template: str = "blue") -> dict:
     """信息类卡片（/help /status 等）的统一外壳。
 
@@ -1809,12 +1830,13 @@ def _session_reader(chat_id: str, key: str, slot: dict) -> None:
                         if live is not None:
                             # 流式卡片收尾定格（超长续卡 / 通道失败降级都在里面）
                             if not live.close(final):
-                                send_text(chat_id, final)
+                                send_markdown(chat_id, final)   # 卡片没承载：markdown 卡重试，失败内部回退文本
                             live = None
                             last_sent = final
                         elif chat_id not in _quiet:
-                            # 没走流式（卡片通道降级/静默刚开启）：普通文本兜底
-                            send_text(chat_id, final)
+                            # 没走流式（卡片通道降级等）：markdown 卡片兜底
+                            # （send_markdown 发卡失败内部再回退纯文本）
+                            send_markdown(chat_id, final)
                             last_sent = final
                     elif btype == "tool_use":
                         # quiet 状态卡阶段+计数（所有模式都维护，只有 quiet 有线程消费）
@@ -1888,7 +1910,9 @@ def _finish_turn(chat_id: str, result: dict, last_text: str, slot: dict) -> None
     """单个回合结束的汇报（长驻进程里每条消息各有一个 result 事件）。"""
     final_text = (result.get("result") or "").strip()
     if final_text and final_text != last_text:
-        send_text(chat_id, final_text)
+        # markdown 卡片渲染（飞书 text 消息不渲染 markdown——quiet 结果此前原样
+        # 显示标记）。非 quiet 的正常路径 last_sent=final_text 会跳过这里
+        send_markdown(chat_id, final_text)
 
     dur = (result.get("duration_ms") or 0) / 1000
     cost = result.get("total_cost_usd") or 0
@@ -3310,7 +3334,8 @@ def handle_command(chat_id: str, text: str) -> None:
         save_quiet()
         send_text(chat_id, "🔕 本聊天已开启静默模式：思考过程和工具调用不再实时转发。"
                            "每条消息改为发一张「思考中…」状态卡——转圈动画+已耗时+当前阶段"
-                           "（思考/工具/生成回复），回合一结束卡上定格「✅ 完成」，结果随即推送；"
+                           "（思考/工具/生成回复），回合一结束卡上定格「✅ 完成」，"
+                           "结果随即以 markdown 卡片推送（渲染标题/列表/表格/代码块）；"
                            "权限确认卡片照常弹。/unquiet 恢复实时转发（仅本聊天生效）。")
     elif cmd == "/unquiet":
         _quiet.discard(chat_id)
