@@ -283,6 +283,22 @@ if LISTEN_FILE.exists():
     except Exception:
         _listen = set()
 _chat_types: dict = {}   # chat_id -> "p2p"/"group"（on_message 记录，命令处理时用）
+# 落盘（data/chat_types.json）：重启后启动通知仍需知道哪些聊天是私聊——
+# 只发私聊不发群（11-07 用户要求：重启完成通知别打扰群聊）
+try:
+    _chat_types = {k: v for k, v in json.loads(
+        (STATE_DIR / "chat_types.json").read_text("utf-8")).items()
+        if v in ("p2p", "group")}
+except Exception:
+    pass
+
+
+def save_chat_types() -> None:
+    try:
+        (STATE_DIR / "chat_types.json").write_text(
+            json.dumps(_chat_types, ensure_ascii=False, indent=1), "utf-8")
+    except OSError:
+        pass
 _hint_ts: dict = {}      # chat_id -> 上次"群里裸命令"提示时间（限频用）
 
 
@@ -1549,7 +1565,9 @@ def _finalize_handover(chat_id: str, forced: bool) -> None:
 # 生成回复），result 事件时 _finish_turn 把卡定格成"✅ 完成"终态。安静不刷屏，
 # 又随时能看到 AI 在干活；最终结果照旧以新消息推送。
 PROGRESS_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"   # 盲文 spinner 10 帧，视觉上顺时针转圈
-PROGRESS_INTERVAL = 5.0                    # 刷帧间隔（秒）
+PROGRESS_INTERVAL = 0.5                    # 刷帧间隔（秒）：0.5s/帧≈5秒一圈（5s 一刷太
+                                           # 迟钝，11-07 用户实测要求更流畅；流式卡 1.2s 长期
+                                           # 稳，0.5s 配失败容忍防 429 抖动杀卡）
 
 
 def _progress_card(title: str, md: str) -> dict:
@@ -1561,7 +1579,12 @@ def _progress_card(title: str, md: str) -> dict:
 
 
 def _patch_progress(slot: dict, title: str, md: str) -> bool:
-    """状态卡整卡更新一次；失败置 p_ok=False（卡片通道挂了，后续不再硬刷）。"""
+    """状态卡整卡更新一次；连续 3 次失败才判死（p_ok=False 停刷）。
+
+    0.5s 高频更新下飞书偶发 429/网络抖动是常态，不该一次就杀卡——单次
+    失败只跳过本帧，下帧自动重试；连续 3 次（≥1.5s 全拒）才是通道真挂了。
+    """
+    ok = False
     try:
         req = PatchMessageRequest.builder() \
             .message_id(slot["p_msg_id"]) \
@@ -1570,13 +1593,19 @@ def _patch_progress(slot: dict, title: str, md: str) -> bool:
                           .build()) \
             .build()
         resp = api.im.v1.message.patch(req)
-        if not resp.success():
+        if resp.success():
+            ok = True
+        else:
             log(f"[状态卡更新失败] code={resp.code} msg={resp.msg}")
-            slot["p_ok"] = False
     except Exception as e:
         log(f"[状态卡更新异常] {e!r}")
-        slot["p_ok"] = False
-    return slot["p_ok"]
+    if ok:
+        slot["p_fail"] = 0
+    else:
+        slot["p_fail"] = slot.get("p_fail", 0) + 1
+        if slot["p_fail"] >= 3:
+            slot["p_ok"] = False
+    return ok   # 本帧是否刷上：_stop_progress 据此决定回退文本回执
 
 
 def _start_progress(chat_id: str, slot: dict, note: str = "") -> None:
@@ -1600,6 +1629,7 @@ def _start_progress(chat_id: str, slot: dict, note: str = "") -> None:
     slot["p_msg_id"] = msg_id
     slot["p_t0"] = time.time()
     slot["p_ok"] = True
+    slot["p_fail"] = 0
     slot["p_done"] = False
     slot["p_final_ok"] = False
     slot["p_lock"] = threading.Lock()
@@ -3470,7 +3500,9 @@ def on_message(event: P2ImMessageReceiveV1) -> None:
             return
 
         # 群聊：默认需 @机器人（白名单负责拦截外人）；/listen 开启的群免 @ 全量接收
-        _chat_types[chat_id] = msg.chat_type
+        if _chat_types.get(chat_id) != msg.chat_type:   # 类型只在变化时落盘（低频）
+            _chat_types[chat_id] = msg.chat_type
+            save_chat_types()
         if msg.chat_type == "group":
             with _listen_lock:
                 listen = chat_id in _listen
@@ -3689,6 +3721,85 @@ def _ws_watchdog() -> None:
                 _exit_with_notice("持续 3 分钟无飞书连接，判定 WS 卡死")
 
 
+BOOT_NOTICE_DELAY = 3      # 通知延后秒数：给 WS 首连留窗口，通知更接近"已能收消息"
+BOOT_NOTICE_THROTTLE = 600 # 自愈/开机类启动的重复通知节流（秒），防崩溃循环轰炸
+
+
+def _boot_notice() -> None:
+    """重启完成通知：报一声"新进程已上线"，用户不必再来问"重启好了吗"。
+
+    目标只挑私聊（p2p）——群聊不打扰（11-07 用户要求）。选择：最后活跃聊天
+    是私聊就用它，否则从 chat_types 记录里挑一个私聊（白名单单人时私聊唯一；
+    记录靠消息驱动落盘，全新部署需用户先在私聊发过一条消息才有目标）。
+    手动重启（restart.ps1 写 data/boot_reason.flag）必发并清标记；其余启动
+    （看门狗自愈拉起/开机自启）按 BOOT_NOTICE_THROTTLE 节流。带当前 git 版本，
+    用户知道重启到了哪份代码。任何失败只打日志，绝不影响启动主流程。
+    """
+    def _notice() -> None:
+        try:
+            time.sleep(BOOT_NOTICE_DELAY)
+            target = ""
+            # 显式配置优先（data/boot_notice_target.json：用户指定的通知落点；
+            # 本机场景用户的"私聊对话"实为只有用户+机器人的单人群，会话列表
+            # 全 group，严格 p2p 过滤会全空——配置文件是唯一可靠落点）
+            try:
+                target = json.loads((STATE_DIR / "boot_notice_target.json")
+                                    .read_text("utf-8")).get("chat_id") or ""
+            except Exception:
+                target = ""
+            if not target:
+                # 通用退路：最后活跃聊天是私聊 → 用它；否则 chat_types 里挑私聊
+                try:
+                    last = json.loads((STATE_DIR / "notify_target.json")
+                                      .read_text("utf-8")).get("chat_id") or ""
+                except Exception:
+                    last = ""
+                if last and _chat_types.get(last) == "p2p":
+                    target = last
+                else:
+                    p2p = [c for c, t in _chat_types.items() if t == "p2p"]
+                    target = p2p[0] if p2p else ""
+            if not target:
+                log("[启动通知] 无目标（boot_notice_target 未配置且无 p2p 记录），跳过")
+                return
+            flag = STATE_DIR / "boot_reason.flag"
+            forced = flag.exists()
+            if forced:
+                try:
+                    flag.unlink()
+                except OSError:
+                    pass
+            ts_file = STATE_DIR / "boot_notify.ts"
+            now = time.time()
+            if not forced:
+                try:
+                    if now - float(ts_file.read_text("utf-8").strip() or 0) \
+                            < BOOT_NOTICE_THROTTLE:
+                        return
+                except (OSError, ValueError):
+                    pass
+            version = ""
+            try:
+                version = subprocess.check_output(
+                    ["git", "log", "-1", "--format=%h %s"],
+                    cwd=str(BASE_DIR), timeout=5).decode("utf-8", "replace").strip()
+            except Exception:
+                pass
+            version = version[:80] + ("…" if len(version) > 80 else "")
+            text = "✅ 机器人已重启完成，新进程已上线"
+            if version:
+                text += f"\n版本：{version}"
+            send_text(target, text)
+            try:
+                ts_file.write_text(str(int(now)), "utf-8")
+            except OSError:
+                pass
+        except Exception as e:
+            log(f"[启动通知] 发送失败：{e!r}")
+
+    threading.Thread(target=_notice, daemon=True).start()
+
+
 def main() -> None:
     if not CLAUDE_PATH:
         sys.exit("❌ 找不到 claude 命令。请确认已安装 Claude Code 并在 PATH 中，"
@@ -3767,6 +3878,7 @@ def main() -> None:
     if psutil:
         threading.Thread(target=_ws_watchdog, daemon=True).start()
     print("   等待消息中…（Ctrl+C 退出）")
+    _boot_notice()   # 重启完成通知（后台延时发私聊，只报一声，不影响主流程）
     ws.start()  # 阻塞，断线自动重连
 
 

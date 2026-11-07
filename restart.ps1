@@ -37,4 +37,8 @@ try {
         -WindowStyle Hidden `
         -RedirectStandardOutput "$logs\bot_console_$stamp.log" -RedirectStandardError "$logs\bot_err_$stamp.log"
 }
+# 手动重启标记：bot 起来后给私聊发"重启完成"通知（bot.py 读后自删；
+# 无标记的启动如看门狗自愈也会发，但按 10 分钟节流防崩溃循环刷屏）
+Set-Content -Path "$base\data\boot_reason.flag" -Value "manual restart" -Encoding ASCII
+
 Write-Host "完成。发条消息验证，或看 logs\bot_console.log。"
