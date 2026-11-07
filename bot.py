@@ -205,10 +205,13 @@ HELP_MD = """**🧩 会话管理**
 - **!命令** = 直接在本机 PowerShell 执行（不经 Claude），如 !git status"""
 
 # 用于发消息的 API 客户端（与收消息的 WebSocket 客户端相互独立）
+# timeout=5（SDK 默认 30s，11-07 状态卡实测 ReadTimeout 一挂 30 秒，帧循环整体
+# 冻结——发消息有 _post_message 的 3 次重试兜底，快速失败更快重试/降级）
 api = lark.Client.builder() \
     .app_id(APP_ID) \
     .app_secret(APP_SECRET) \
     .log_level(lark.LogLevel.WARNING) \
+    .timeout(5) \
     .build()
 
 # ---------------- 会话持久化（chat_id -> {session_id, work_dir, updated}） ----------------
@@ -1579,12 +1582,14 @@ def _progress_card(title: str, md: str) -> dict:
 
 
 def _patch_progress(slot: dict, title: str, md: str) -> bool:
-    """状态卡整卡更新一次；连续 3 次失败才判死（p_ok=False 停刷）。
+    """状态卡整卡更新一次（只由 _progress_loop 单线程串行调用）。
 
-    0.5s 高频更新下飞书偶发 429/网络抖动是常态，不该一次就杀卡——单次
-    失败只跳过本帧，下帧自动重试；连续 3 次（≥1.5s 全拒）才是通道真挂了。
+    业务失败（偶发 429/频控）连续 3 次才判死——单次只跳帧下帧重试；
+    网络挂起类异常（ReadTimeout 等，全局 5s 超时兜底）直接判死——通道真挂了，
+    重试只会让动画冻结更久。
     """
     ok = False
+    timeout_hit = False
     try:
         req = PatchMessageRequest.builder() \
             .message_id(slot["p_msg_id"]) \
@@ -1598,14 +1603,19 @@ def _patch_progress(slot: dict, title: str, md: str) -> bool:
         else:
             log(f"[状态卡更新失败] code={resp.code} msg={resp.msg}")
     except Exception as e:
+        if "timeout" in type(e).__name__.lower():
+            timeout_hit = True
         log(f"[状态卡更新异常] {e!r}")
     if ok:
         slot["p_fail"] = 0
-    else:
-        slot["p_fail"] = slot.get("p_fail", 0) + 1
-        if slot["p_fail"] >= 3:
-            slot["p_ok"] = False
-    return ok   # 本帧是否刷上：_stop_progress 据此决定回退文本回执
+        return True
+    if timeout_hit:
+        slot["p_ok"] = False
+        return False
+    slot["p_fail"] = slot.get("p_fail", 0) + 1
+    if slot["p_fail"] >= 3:
+        slot["p_ok"] = False
+    return False
 
 
 def _start_progress(chat_id: str, slot: dict, note: str = "") -> None:
@@ -1630,9 +1640,8 @@ def _start_progress(chat_id: str, slot: dict, note: str = "") -> None:
     slot["p_t0"] = time.time()
     slot["p_ok"] = True
     slot["p_fail"] = 0
-    slot["p_done"] = False
+    slot["p_final"] = None
     slot["p_final_ok"] = False
-    slot["p_lock"] = threading.Lock()
     slot["p_stop"] = threading.Event()
     slot["p_thread"] = threading.Thread(target=_progress_loop, args=(chat_id, slot),
                                         daemon=True)
@@ -1640,45 +1649,60 @@ def _start_progress(chat_id: str, slot: dict, note: str = "") -> None:
 
 
 def _progress_loop(chat_id: str, slot: dict) -> None:
-    """状态卡刷帧线程：spinner + 已耗时 + 当前阶段 + 工具计数，每 5 秒整卡 patch。
+    """状态卡刷帧线程——所有 patch 的唯一写者（含终帧定格）。
 
-    退出条件（均不再刷帧）：p_done=终态已由 _stop_progress 定格；p_ok=False=卡片
-    通道挂了；进程已退出=读泵的收尾消息马上就到，状态卡不抢戏定格。
+    固定 PROGRESS_INTERVAL 节拍（patch 往返时长不改变帧率——11-07 用户实测
+    "wait 0.5s + 网络 RTT"导致帧距 0.8~1s 且快慢交替的顿挫感）；_stop_progress
+    只置终态并唤醒，终帧由本线程定格：单写者天然无覆盖竞态，patch 挂起
+    （5s 超时兜底）也只冻结本线程，绝不拖完成定格和结果推送。
     """
+    next_t = time.time() + PROGRESS_INTERVAL
     i = 0
-    while not slot["p_stop"].wait(PROGRESS_INTERVAL):
-        with slot["p_lock"]:
-            if slot.get("p_done") or not slot.get("p_ok"):
-                return
-            proc = slot.get("proc")
-            if proc is not None and proc.poll() is not None:
-                return
-            i += 1
-            stage = slot.get("p_stage") or "🧠 思考中"
-            secs = int(time.time() - slot["p_t0"])
-            md = f"{PROGRESS_FRAMES[i % len(PROGRESS_FRAMES)]} {stage} · {secs // 60}分{secs % 60:02d}秒"
-            if slot.get("p_tool_n"):
-                md += f"\n\n本轮已调用工具 {slot['p_tool_n']} 次"
-            # 卡片 header title 有长度限制（超长整卡被拒）：阶段标题独立截断
-            _patch_progress(slot, (stage[:23] + "…") if len(stage) > 24 else stage, md)
+    while True:
+        if slot["p_stop"].wait(max(0.01, next_t - time.time())):
+            # 终态唤醒：单写者定格（此前帧 patch 已串行完成，顺序天然正确）
+            final = slot.get("p_final")
+            if final and slot.get("p_ok"):
+                ok = _patch_progress(slot, final[0], final[1])
+                slot["p_final_ok"] = ok
+                if not ok and final[2]:
+                    send_text(chat_id, final[2])   # 定格失败且带了兜底文案：文本补一句
+            slot["p_thread"] = None
+            return
+        next_t += PROGRESS_INTERVAL
+        if not slot.get("p_ok"):
+            slot["p_thread"] = None   # 通道已判死
+            return
+        proc = slot.get("proc")
+        if proc is not None and proc.poll() is not None:
+            slot["p_thread"] = None   # 进程退出：读泵收尾消息即到，不抢戏
+            return
+        i += 1
+        stage = slot.get("p_stage") or "🧠 思考中"
+        secs = int(time.time() - slot["p_t0"])
+        md = f"{PROGRESS_FRAMES[i % len(PROGRESS_FRAMES)]} {stage} · {secs // 60}分{secs % 60:02d}秒"
+        if slot.get("p_tool_n"):
+            md += f"\n\n本轮已调用工具 {slot['p_tool_n']} 次"
+        # 卡片 header title 有长度限制（超长整卡被拒）：阶段标题独立截断
+        _patch_progress(slot, (stage[:23] + "…") if len(stage) > 24 else stage, md)
 
 
-def _stop_progress(chat_id: str, slot: dict, title: str, md: str) -> bool:
+def _stop_progress(chat_id: str, slot: dict, title: str, md: str,
+                   fallback: str = "") -> bool:
     """把状态卡定格成终态（✅ 完成 / ⚠️ 异常 / ⛔ 会话结束）。幂等。
 
-    返回 False = 本聊天没有活动状态卡（非 quiet / 发卡失败）或定格失败，
-    调用方据此回退文本回执，信息不丢。
+    只置终态并唤醒刷帧线程，终帧由它单线程定格（见 _progress_loop）。
+    返回 False = 无活动状态卡或通道已判死，调用方据此立即回退文本回执；
+    返回 True 后定格若仍失败且给了 fallback，刷帧线程会文本补一句，信息不丢。
     """
     if not slot.get("p_stop"):
         return False
-    with slot["p_lock"]:
-        if slot.get("p_done"):
-            return slot.get("p_final_ok", False)
-        slot["p_done"] = True
-        slot["p_final_ok"] = slot.get("p_ok", False) and _patch_progress(slot, title, md)
+    if slot.get("p_thread") is None:
+        return bool(slot.get("p_final_ok", False))   # 幂等：刷帧线程已退出
+    slot["p_final"] = (title, md, fallback)
+    alive = bool(slot.get("p_ok"))
     slot["p_stop"].set()
-    slot["p_thread"] = None
-    return slot["p_final_ok"]
+    return alive
 
 
 def run_task(chat_id: str, prompt: str) -> None:
@@ -1959,10 +1983,12 @@ def _finish_turn(chat_id: str, result: dict, last_text: str, slot: dict) -> None
                                   "insufficient", "balance", "credit")):
             line += "\n⚠️ 疑似供应商额度耗尽/限流——/provider 查看并切换。"
     # 完成回执优先定格进 quiet 状态卡（转圈卡就此收口，豆包式体验）；没有活动
-    # 状态卡（非 quiet / 发卡失败）照旧发文本回执，信息不丢
+    # 状态卡（非 quiet / 发卡失败）照旧发文本回执，信息不丢；卡定格失败时由
+    # 刷帧线程拿 fallback 文本补一句
     summary = f"耗时 {dur:.1f}s · {turns} 轮对话" + (f" · ${cost:.3f}" if cost else "")
     if not _stop_progress(chat_id, slot,
-                          "⚠️ 异常结束" if is_err else "✅ 完成", summary):
+                          "⚠️ 异常结束" if is_err else "✅ 完成", summary,
+                          fallback=line):
         send_text(chat_id, line)
 
     denials = result.get("permission_denials") or []
