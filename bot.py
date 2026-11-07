@@ -2613,13 +2613,14 @@ def _start_observer(chat_id: str, sid: str) -> None:
 # 窗口/飞书分身上线自动写一行。协作身份锚 = session_id（永不变、--resume 可复活）；
 # 窗口换代 ref 会失效——账本与花名册只认 ID，ref 当次消歧用完即弃（11-07 用户痛点：
 # 转录工单里的 "29 [ec831d]" 隔天成死引用，找不到对端是哪一个）。
-def _roster_lines(limit: int = 20, flt: str = "") -> list:
-    """花名册渲染：按 session_id 去重取最新登记，转录动静倒序。
-    flt 非空时按项目目录名/路径关键字过滤。"""
+def _roster_items(limit: int = 20, flt: str = "") -> tuple:
+    """花名册数据：([条目], 空态文案)。条目 = dict(seq, sid, name, tag, act, proj, pv)，
+    按 session_id 去重取最新登记、转录动静倒序；flt 非空按项目目录名/路径过滤。
+    空态文案非 None 表示无内容（空册 / 读失败 / 无匹配）。"""
     f = STATE_DIR / "roster.jsonl"
     if not f.exists():
-        return ["📋 花名册还是空的。SessionStart hook 已在登记，",
-                "新开 / 重启（含 --resume 复线）的窗口和分身会自动上册。"]
+        return [], ("📋 花名册还是空的。SessionStart hook 已在登记，"
+                    "新开 / 重启（含 --resume 复线）的窗口和分身会自动上册。")
     rows: dict = {}
     try:
         for ln in f.read_text("utf-8").splitlines():
@@ -2631,40 +2632,81 @@ def _roster_lines(limit: int = 20, flt: str = "") -> list:
             except Exception:
                 pass
     except OSError:
-        return ["❌ 花名册读取失败（data/roster.jsonl）。"]
-    items = []
+        return [], "❌ 花名册读取失败（data/roster.jsonl）。"
+    queue = []
     for sid, r in rows.items():
         try:
             mt = Path(r.get("tp") or "?").stat().st_mtime
         except OSError:
             mt = None
         born = float(r.get("ts") or 0)
-        items.append((mt if mt is not None else born - 1e9, sid, r, mt))
-    items.sort(key=lambda x: -x[0])
-    lines = ["📋 Claude 花名册（ID 永不变=身份锚；窗口换代 ref 会变，别拿 ref 认人）"]
-    shown = 0
-    for _t, sid, r, mt in items:
+        queue.append((mt if mt is not None else born - 1e9, sid, r, mt))
+    queue.sort(key=lambda x: -x[0])
+    items, shown = [], 0
+    for _t, sid, r, mt in queue:
         proj = Path(r.get("cwd") or "?").name or "?"
         if flt and flt.lower() not in f"{r.get('cwd') or ''} {proj}".lower():
             continue
         if shown >= limit:
             break
         shown += 1
-        tag = "📱飞书分身" if r.get("bot_child") else "🖥桌面窗口"
-        act = f"{_rel_time(mt)}有动静" if mt else "转录缺失（未留档）"
-        name = _names.get(sid)
-        head = f"📓{name} · " if name else ""
-        lines.append(f"{shown}. {head}{tag} · {act} · [{proj}]")
-        lines.append(f"   {sid}")
-        if mt:   # 最近一条真人消息预览（11-07 用户要：光看 ID 认不出是谁）
-            pv = _session_preview(Path(r.get("tp") or "?"))
-            if pv:
-                lines.append(f"   「{pv}」")
-    if not shown:
-        lines.append(f"（没有匹配「{flt}」的登记记录）")
+        items.append({"seq": shown, "sid": sid,
+                      "name": _names.get(sid) or "",
+                      "tag": "📱飞书分身" if r.get("bot_child") else "🖥桌面窗口",
+                      "act": f"{_rel_time(mt)}有动静" if mt else "转录缺失（未留档）",
+                      "proj": proj,
+                      # 最近一条真人消息预览（11-07 用户要：光看 ID 认不出是谁）；
+                      # 反引号会拆坏代码样式标记，清洗掉
+                      "pv": (_session_preview(Path(r.get("tp") or "?")).replace("`", "'")
+                             if mt else "")})
+    if not items:
+        return [], (f"（没有匹配「{flt}」的登记记录）" if flt else
+                    "📋 花名册还是空的。SessionStart hook 已在登记，"
+                    "新开 / 重启（含 --resume 复线）的窗口和分身会自动上册。")
+    return items, None
+
+
+def _roster_lines(limit: int = 20, flt: str = "") -> list:
+    """花名册文本渲染（发卡失败降级用）。"""
+    items, empty = _roster_items(limit, flt)
+    if empty is not None:
+        return [empty]
+    lines = ["📋 Claude 花名册（ID 永不变=身份锚；窗口换代 ref 会变，别拿 ref 认人）"]
+    for it in items:
+        head = f"📓{it['name']} · " if it["name"] else ""
+        lines.append(f"{it['seq']}. {head}{it['tag']} · {it['act']} · [{it['proj']}]")
+        lines.append(f"   {it['sid']}")
+        if it["pv"]:
+            lines.append(f"   「{it['pv']}」")
     lines += ["", "· 盯动态 /observe <完整ID> · 看快照 /peek <完整ID>",
               "· 死档复活：--resume <完整ID>（ref 换新，身份不变）"]
     return lines
+
+
+def _roster_card(limit: int = 20, flt: str = "") -> dict:
+    """花名册卡片（2.0，实证唯一完整渲染路径）：每条一个独立 markdown 组件——
+    加粗头行 + 代码样式 ID + 引用块预览，组件间天然分行。11-07 用户反馈：整段
+    markdown 拼列表时单换行被折叠成一行，头行/ID/预览全挤一起，丑且认不清。"""
+    items, empty = _roster_items(limit, flt)
+    card = {"schema": "2.0",
+            "header": {"title": {"tag": "plain_text", "content": "📋 Claude 花名册"},
+                       "template": "blue"},
+            "body": {"elements": []}}
+    if empty is not None:
+        card["body"]["elements"].append({"tag": "markdown", "content": empty})
+        return card
+    for it in items:
+        head = f"📓{it['name']} · " if it["name"] else ""
+        md = (f"**{it['seq']}. {head}{it['tag']} · {it['act']} · [{it['proj']}]**\n\n"
+              f"`{it['sid']}`")
+        if it["pv"]:
+            md += f"\n\n> 「{it['pv']}」"
+        card["body"]["elements"].append({"tag": "markdown", "content": md})
+    card["body"]["elements"].append(
+        {"tag": "markdown",
+         "content": "*盯动态 /observe <完整ID> · 看快照 /peek <完整ID> · "
+                    "死档复活 --resume <完整ID>（ref 换新，身份不变）*"})
+    return card
 
 
 # ---------------- Provider 供应商切换（cc-switch 库：额度耗尽时飞书直接换 key） ----------------
@@ -3433,7 +3475,9 @@ def handle_command(chat_id: str, text: str) -> None:
                 lines.append(f"   「{it['preview']}」")
         send_text(chat_id, "\n".join(lines))
     elif cmd == "/roster":
-        send_markdown(chat_id, "\n".join(_roster_lines(20, arg.strip())))
+        # 卡片优先（结构化整洁），发卡失败降级 markdown 文本、内容不丢
+        if _send_card(chat_id, _roster_card(20, arg.strip())) is None:
+            send_markdown(chat_id, "\n".join(_roster_lines(20, arg.strip())))
     elif cmd == "/mute":
         try:
             (STATE_DIR / "mute.flag").write_text(
