@@ -17,6 +17,7 @@ import json
 import os
 import socket
 import sys
+import time
 from pathlib import Path
 
 BASE = Path(__file__).resolve().parent
@@ -26,9 +27,10 @@ MUTE_FILE = BASE / "data" / "mute.flag"   # 状态进 data/；老布局位置兜
 
 
 def _log(msg: str) -> None:
+    # 11-07 加时间戳：notify.log 行原先没有时刻，无法与 bot.log 时间线对齐
     try:
         with LOG_FILE.open("a", encoding="utf-8") as f:
-            f.write(msg.rstrip() + "\n")
+            f.write(time.strftime("%m-%d %H:%M:%S ") + msg.rstrip() + "\n")
     except OSError:
         pass
 

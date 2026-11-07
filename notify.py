@@ -13,6 +13,7 @@ stdin 收到 hook JSON：{"session_id","transcript_path","cwd","hook_event_name"
 """
 import json
 import sys
+import time
 from pathlib import Path
 
 BASE = Path(__file__).resolve().parent
@@ -32,9 +33,11 @@ def _legacy(name: str) -> Path:
 
 
 def _log(msg: str) -> None:
+    # 11-07 加时间戳：排查跨会话消息确认等事件时，notify.log 行原先没有
+    # 时刻，无法与 bot.log 的时间线对齐（11-07 取证实测之痛）
     try:
         with LOG_FILE.open("a", encoding="utf-8") as f:
-            f.write(msg.rstrip() + "\n")
+            f.write(time.strftime("%m-%d %H:%M:%S ") + msg.rstrip() + "\n")
     except OSError:
         pass
 
@@ -96,6 +99,30 @@ def _user_idle_seconds() -> float:
     except Exception:
         pass
     return -1.0
+
+
+def _notification_text(hook: dict) -> str:
+    """Notification 类通知的飞书文案（11-07 抽函数：跨会话消息确认特判）。
+
+    跨会话消息（SendMessage 给本会话）在 CLI 弹「是否接受」确认框时只发
+    Notification 事件不发 PermissionRequest——hook 只有通知权没有代答权，
+    飞书侧弹不出可点的选择框（11-07 notify.log 实证：只有 Notification 行，
+    perm_gate 未收到对应请求）。原生文案是一句英文原文，看不出是什么、
+    该怎么办，特判成带指引的说明；确认框本身仍要在终端里按 y/n。
+    同权限模式的会话之间消息直达不扣留（SendMessage 工具文档原文：
+    "a session running in a different permission mode than yours holds
+    cross-session messages for its user's approval"）——想根治不弹框，
+    把发送方与本会话的模式调成一致即可。
+    """
+    msg = str(hook.get("message") or "")
+    if "message from another session" in msg:
+        return ("🔔 终端会话收到一条来自其他 Claude 会话的消息，终端里弹了"
+                "「是否接受」确认框：\n"
+                "· 在电脑前 → 到终端按 y/n 处理\n"
+                "· 想以后不弹框 → 把发送方与本会话的权限模式调成一致"
+                "（同模式时消息直达不扣留）\n"
+                "· 不处理它会过期自动丢弃，不影响手头工作")
+    return "🔔 桌面 Claude 需要你：" + msg
 
 
 def _send(app_id: str, app_secret: str, chat_id: str, text: str) -> bool:
@@ -277,7 +304,7 @@ def main() -> int:
 
     proj = Path(cwd).name if cwd else ""
     if event == "Notification":
-        text = "🔔 桌面 Claude 需要你：" + (hook.get("message") or "")
+        text = _notification_text(hook)
     else:  # Stop（完成一个回合）
         summary = _last_text(hook.get("transcript_path"))
         text = "🏁 桌面 Claude 完成了一个回合"
