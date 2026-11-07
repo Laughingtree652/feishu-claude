@@ -5,7 +5,7 @@
 飞书发消息给机器人 → 调用本地 claude CLI（多轮会话自动续接）→
 Claude 的回复与工具调用实时转发回飞书，实现远程操控。
 
-可用命令：/help /new /exit /handover /stop /status /session /sessions /takeover /cwd /mode /mute /unmute /provider
+可用命令：/help /new /exit /handover /stop /status /session /sessions /takeover /cwd /mode /mute /unmute /provider /roster
 （会话独占：同一会话只归一个聊天，后接管者优先，被挤掉的聊天会收到通知）
 """
 import json
@@ -150,6 +150,7 @@ HELP_TEXT = """📖 命令列表
 /peek [序号|会话ID|latest|last] — 旁观会话当前进度（last=本聊天上次让出的会话）
 /observe [序号|会话ID|latest|last] — 实时观察：转录有动静自动刷新快照卡片（last=上次让出的会话；观察中再 /ob 同一会话 = 重发新卡刷回底部）
 /unobserve — 停止实时观察
+/roster [项目关键字] — 花名册：查所有上过线的 Claude 窗口/分身（名字·完整ID·最近动静·桌面或飞书）
 /provider [序号|名称] — 查看/切换 Claude 供应商（cc-switch 库；切换即换 key，新起进程生效）
 /unqueue — 取消排队接管
 /rename [名字] — 给当前会话起名（/sessions 列表优先显示名字）
@@ -192,6 +193,7 @@ HELP_MD = """**🧩 会话管理**
 - **/model** [序号|名称|reset] — 查看/切换本聊天的模型（reset 回退全局默认）
 - **/cwd** [路径] — 查看/切换 Claude 的工作目录
 - **/file** [路径] — 把本地文件作为文件消息发进本聊天（相对路径相对工作目录）
+- **/roster** [项目关键字] — 花名册：所有上过线的 Claude 窗口/分身（名字·完整ID·最近动静·桌面或飞书），SessionStart hook 自动登记
 - **/provider** [序号|名称] — 查看/切换 Claude 供应商（cc-switch 库；切换即换 key，新起进程生效）
 - **/listen** — 群聊免 @ 模式：本群所有消息直接发给机器人（适合只有你+机器人的群）
 - **/mute · /unmute** — 暂停/恢复桌面事件推送（全局）
@@ -2606,6 +2608,61 @@ def _start_observer(chat_id: str, sid: str) -> None:
     log(f"[实时观察] chat={chat_id[-6:]} → 会话 {sid[:8]}…")
 
 
+# ---------------- 花名册（/roster：多 agent 协作的身份辨认） ----------------
+# data/roster.jsonl 由 SessionStart hook（roster_register.py）登记：任何 Claude
+# 窗口/飞书分身上线自动写一行。协作身份锚 = session_id（永不变、--resume 可复活）；
+# 窗口换代 ref 会失效——账本与花名册只认 ID，ref 当次消歧用完即弃（11-07 用户痛点：
+# 转录工单里的 "29 [ec831d]" 隔天成死引用，找不到对端是哪一个）。
+def _roster_lines(limit: int = 20, flt: str = "") -> list:
+    """花名册渲染：按 session_id 去重取最新登记，转录动静倒序。
+    flt 非空时按项目目录名/路径关键字过滤。"""
+    f = STATE_DIR / "roster.jsonl"
+    if not f.exists():
+        return ["📋 花名册还是空的。SessionStart hook 已在登记，",
+                "新开 / 重启（含 --resume 复线）的窗口和分身会自动上册。"]
+    rows: dict = {}
+    try:
+        for ln in f.read_text("utf-8").splitlines():
+            try:
+                r = json.loads(ln)
+                sid = str(r.get("sid") or "")
+                if sid:
+                    rows[sid] = r     # 后行覆盖前行 = 取最新登记
+            except Exception:
+                pass
+    except OSError:
+        return ["❌ 花名册读取失败（data/roster.jsonl）。"]
+    items = []
+    for sid, r in rows.items():
+        try:
+            mt = Path(r.get("tp") or "?").stat().st_mtime
+        except OSError:
+            mt = None
+        born = float(r.get("ts") or 0)
+        items.append((mt if mt is not None else born - 1e9, sid, r, mt))
+    items.sort(key=lambda x: -x[0])
+    lines = ["📋 Claude 花名册（ID 永不变=身份锚；窗口换代 ref 会变，别拿 ref 认人）"]
+    shown = 0
+    for _t, sid, r, mt in items:
+        proj = Path(r.get("cwd") or "?").name or "?"
+        if flt and flt.lower() not in f"{r.get('cwd') or ''} {proj}".lower():
+            continue
+        if shown >= limit:
+            break
+        shown += 1
+        tag = "📱飞书分身" if r.get("bot_child") else "🖥桌面窗口"
+        act = f"{_rel_time(mt)}有动静" if mt else "转录缺失（未留档）"
+        name = _names.get(sid)
+        head = f"📓{name} · " if name else ""
+        lines.append(f"{shown}. {head}{tag} · {act} · [{proj}]")
+        lines.append(f"   {sid}")
+    if not shown:
+        lines.append(f"（没有匹配「{flt}」的登记记录）")
+    lines += ["", "· 盯动态 /observe <完整ID> · 看快照 /peek <完整ID>",
+              "· 死档复活：--resume <完整ID>（ref 换新，身份不变）"]
+    return lines
+
+
 # ---------------- Provider 供应商切换（cc-switch 库：额度耗尽时飞书直接换 key） ----------------
 CCSWITCH_DIR = Path.home() / ".cc-switch"
 CCSWITCH_DB = CCSWITCH_DIR / "cc-switch.db"
@@ -2835,7 +2892,7 @@ def _switch_provider(chat_id: str, arg: str) -> None:
 COMMANDS = ["/help", "/new", "/exit", "/stop", "/status", "/session", "/sessions",
             "/takeover", "/peek", "/observe", "/unobserve", "/unqueue", "/rename",
             "/cwd", "/file", "/mode", "/model", "/mute", "/unmute", "/quiet", "/unquiet",
-            "/listen", "/provider", "/handover", "/compact"]
+            "/listen", "/provider", "/handover", "/compact", "/roster"]
 
 
 def _expand_cmd(text: str):
@@ -3371,6 +3428,8 @@ def handle_command(chat_id: str, text: str) -> None:
             elif it["preview"]:
                 lines.append(f"   「{it['preview']}」")
         send_text(chat_id, "\n".join(lines))
+    elif cmd == "/roster":
+        send_markdown(chat_id, "\n".join(_roster_lines(20, arg.strip())))
     elif cmd == "/mute":
         try:
             (STATE_DIR / "mute.flag").write_text(
