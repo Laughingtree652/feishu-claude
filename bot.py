@@ -157,7 +157,7 @@ HELP_TEXT = """📖 命令列表
 /cwd [路径] — 查看 / 切换 Claude 的工作目录
 /file [路径] — 把本地文件作为文件消息发进本聊天（相对路径相对工作目录）
 /mode [模式] — 查看 / 切换本聊天的权限模式（manual、auto、acceptEdits…，未设置时用全局默认）
-/model [序号|名称|reset] — 查看/切换本聊天的模型（网关可用模型实时列出；reset 回退全局默认）
+/model [序号|名称|reset] — 查看/切换本聊天的模型（只列 cc-switch 当前供应商已配置的模型；reset 回退全局默认）
 /listen — 群聊免 @ 模式：本群所有消息直接发给机器人（适合只有你+机器人的群）
 /mute · /unmute — 暂停/恢复桌面事件推送（全局）
 /quiet · /unquiet — 静默模式（本聊天）：不刷思考/工具过程，改发「思考中…」状态卡（动画+计时+阶段，回合结束定格），结果照常推送
@@ -190,7 +190,7 @@ HELP_MD = """**🧩 会话管理**
 **⚙️ 设置**
 - **/status** — 状态面板：机器人设置 + 会话绑定与进程工作状态
 - **/mode** [模式] — 查看/切换本聊天的权限模式（manual、auto、acceptEdits…，未设置时用全局默认）
-- **/model** [序号|名称|reset] — 查看/切换本聊天的模型（reset 回退全局默认）
+- **/model** [序号|名称|reset] — 查看/切换本聊天的模型（只列 cc-switch 已配置的模型；reset 回退全局默认）
 - **/cwd** [路径] — 查看/切换 Claude 的工作目录
 - **/file** [路径] — 把本地文件作为文件消息发进本聊天（相对路径相对工作目录）
 - **/roster** [项目关键字] — 花名册：所有上过线的 Claude 窗口/分身（名字·完整ID·最近动静·桌面或飞书），SessionStart hook 自动登记
@@ -2841,6 +2841,36 @@ def _model_chain() -> list:
     return out
 
 
+def _configured_models() -> list:
+    """已配置模型清单（settings.json env = 当前 cc-switch 供应商的模型配置）。
+    11-07 用户反馈：/model 拉网关 /v1/models 全量清单太长，只想看自己在
+    cc-switch 里配的那几个。收集 env 的 ANTHROPIC_MODEL +
+    ANTHROPIC_DEFAULT_{OPUS,SONNET,HAIKU,FABLE}_MODEL，去重保留顺序。
+    返回 [{"name","tags"}]，tags=哪些位置引用它（默认/opus/sonnet/haiku/fable）。
+    官方 OAuth 等无 env 模型键的形态返回空，调用方降级网关清单。"""
+    try:
+        env = json.loads(CLAUDE_SETTINGS.read_text("utf-8")).get("env") or {}
+    except Exception:
+        return []
+    order = [("默认", "ANTHROPIC_MODEL"),
+             ("opus", "ANTHROPIC_DEFAULT_OPUS_MODEL"),
+             ("sonnet", "ANTHROPIC_DEFAULT_SONNET_MODEL"),
+             ("haiku", "ANTHROPIC_DEFAULT_HAIKU_MODEL"),
+             ("fable", "ANTHROPIC_DEFAULT_FABLE_MODEL")]
+    out = []
+    for tag, k in order:
+        v = str(env.get(k) or "").strip()
+        if not v:
+            continue
+        for e in out:
+            if e["name"] == v:
+                e["tags"].append(tag)
+                break
+        else:
+            out.append({"name": v, "tags": [tag]})
+    return out
+
+
 def _recycle_idle_children() -> tuple:
     """回收所有空闲分身（换 provider/模型后，新配置只对起新进程生效；
     空闲分身内存里揣着旧配置）。返回 (已回收数, 忙碌保留数)。"""
@@ -3347,20 +3377,29 @@ def handle_command(chat_id: str, text: str) -> None:
                     tips.append(f"· ⚠️ {busy} 个分身正在跑回合，这轮跑完仍是旧模型")
                 send_text(chat_id, "\n".join(tips))
         elif a:
-            # 目标：网关序号（需查询成功）或名称直接采纳（网关不支持列表时也能设）
+            # 目标：已配置模型序号（cc-switch 供应商配置）或名称直接采纳；
+            # 没有配置清单时退回网关序号（官方 OAuth 等形态）
             target = None
-            base, key = _current_endpoint()
-            glist = _gateway_models(base, key)
-            if a.isdigit() and glist:
-                if 1 <= int(a) <= len(glist):
-                    target = glist[int(a) - 1]
-                else:
-                    send_text(chat_id, f"序号超出范围（网关列表共 {len(glist)} 个）。")
-                    return
+            mlist = [m["name"] for m in _configured_models()]
+            if a.isdigit():
+                names = mlist
+                if not names:
+                    base, key = _current_endpoint()
+                    names = _gateway_models(base, key)
+                if names:
+                    if 1 <= int(a) <= len(names):
+                        target = names[int(a) - 1]
+                    else:
+                        send_text(chat_id, f"序号超出范围（清单共 {len(names)} 个）。")
+                        return
             if target is None:
                 target = a
-                if glist and target not in glist:
-                    send_text(chat_id, f"⚠️ {target} 不在网关列表中，仍按名称设置"
+                names = mlist
+                if not names:
+                    base, key = _current_endpoint()
+                    names = _gateway_models(base, key)
+                if names and target not in names:
+                    send_text(chat_id, f"⚠️ {target} 不在清单中，仍按名称设置"
                                        "（若模型名有误会由下一轮请求报错，届时 /model 重选）。")
             with _models_lock:
                 _chat_models[chat_id] = target
@@ -3374,27 +3413,29 @@ def handle_command(chat_id: str, text: str) -> None:
                 tips.append(f"· ⚠️ {busy} 个分身正在跑回合，这轮跑完仍是旧模型")
             send_text(chat_id, "\n".join(tips))
         else:
-            base, key = _current_endpoint()
-            glist = _gateway_models(base, key)
             m_set = _chat_models.get(chat_id)
+            mlist = _configured_models()
             lines = ["🧬 模型"]
             lines.append(f"· 本聊天设置：{m_set}（显式 --model）" if m_set
-                         else "· 本聊天设置：未设置（跟随全局链路）")
-            chain = _model_chain()
-            if chain:
-                lines.append("· 全局链路：" + " ｜ ".join(chain))
-            sess = _sessions.get(chat_id) or {}
-            if sess.get("session_id"):
-                sf, _cwd2 = _find_session_file(sess["session_id"])
-                if sf:
-                    lines.append(f"· 分身转录实测：{_session_model(sf)}")
-            if glist:
-                lines.append(f"· 网关可用模型（{base}）：")
-                for i, m in enumerate(glist, 1):
-                    mark = " ← 本聊天" if m == m_set else ""
-                    lines.append(f"  {i}. {m}{mark}")
+                         else "· 本聊天设置：未设置（跟随全局）")
+            if mlist:
+                # 只列 cc-switch 里配置过的模型（11-07 用户要求），不再拉网关全量
+                lines.append(f"· 已配置模型（cc-switch 当前供应商，共 {len(mlist)} 个）：")
+                for i, m in enumerate(mlist, 1):
+                    mark = " ← 本聊天" if m["name"] == m_set else ""
+                    lines.append(f"  {i}. {m['name']}（{'·'.join(m['tags'])}）{mark}")
             else:
-                lines.append("· 网关模型清单查询失败（超时/不支持）——可 /model <模型名> 直接指定")
+                # 降级：官方 OAuth 等没配模型键的形态，退回网关实时清单
+                base, key = _current_endpoint()
+                glist = _gateway_models(base, key)
+                if glist:
+                    lines.append(f"· 网关可用模型（{base}）：")
+                    for i, m in enumerate(glist, 1):
+                        mark = " ← 本聊天" if m == m_set else ""
+                        lines.append(f"  {i}. {m}{mark}")
+                else:
+                    lines.append("· 未找到已配置模型清单（env 无模型键、网关清单也查不到）"
+                                 "——可 /model <模型名> 直接指定")
             lines += ["", "切换：/model <序号|名称>  ·  重置：/model reset"]
             send_text(chat_id, "\n".join(lines))
     elif cmd == "/unqueue":
