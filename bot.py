@@ -2656,6 +2656,10 @@ def _roster_lines(limit: int = 20, flt: str = "") -> list:
         head = f"📓{name} · " if name else ""
         lines.append(f"{shown}. {head}{tag} · {act} · [{proj}]")
         lines.append(f"   {sid}")
+        if mt:   # 最近一条真人消息预览（11-07 用户要：光看 ID 认不出是谁）
+            pv = _session_preview(Path(r.get("tp") or "?"))
+            if pv:
+                lines.append(f"   「{pv}」")
     if not shown:
         lines.append(f"（没有匹配「{flt}」的登记记录）")
     lines += ["", "· 盯动态 /observe <完整ID> · 看快照 /peek <完整ID>",
