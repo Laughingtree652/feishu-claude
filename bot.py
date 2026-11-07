@@ -2575,7 +2575,7 @@ def _observe_loop(chat_id: str, sid: str, stop: threading.Event) -> None:
             msg_id = None
         msg_id = _send_card(chat_id, card)
         if msg_id is None:
-            send_text(chat_id, content)   # 卡片通道不可用：文本兜底，内容不丢
+            send_markdown(chat_id, content)   # 卡片通道不可用：markdown 卡兜底，再降纯文本，内容不丢
 
     _frame(f"📡 实时观察中 · 有动静约每 {OBSERVE_REFRESH} 秒刷新一帧 · /unobserve 停止")
     while not stop.is_set():
@@ -3154,7 +3154,7 @@ def handle_command(chat_id: str, text: str) -> None:
         if not sf:
             send_text(chat_id, f"❌ 找不到会话 {sid[:8]}… 的转录文件")
             return
-        send_text(chat_id, "\n".join(_peek_lines(chat_id, sid, sf, cwd2)))
+        send_markdown(chat_id, "\n".join(_peek_lines(chat_id, sid, sf, cwd2)))
     elif cmd == "/observe":
         want = arg.strip()
         sid = None
