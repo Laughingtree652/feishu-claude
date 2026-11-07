@@ -159,7 +159,7 @@ HELP_TEXT = """📖 命令列表
 /model [序号|名称|reset] — 查看/切换本聊天的模型（网关可用模型实时列出；reset 回退全局默认）
 /listen — 群聊免 @ 模式：本群所有消息直接发给机器人（适合只有你+机器人的群）
 /mute · /unmute — 暂停/恢复桌面事件推送（全局）
-/quiet · /unquiet — 静默模式（本聊天）：不刷思考/工具过程，只推最终结果和权限确认
+/quiet · /unquiet — 静默模式（本聊天）：不刷思考/工具过程，改发「思考中…」状态卡（动画+计时+阶段，回合结束定格），结果照常推送
 
 直接发送文本 = 给 Claude 下指令，多轮对话自动保持上下文。
 回复以流式卡片实时呈现（边生成边更新，超长自动分段不丢内容）。
@@ -195,7 +195,7 @@ HELP_MD = """**🧩 会话管理**
 - **/provider** [序号|名称] — 查看/切换 Claude 供应商（cc-switch 库；切换即换 key，新起进程生效）
 - **/listen** — 群聊免 @ 模式：本群所有消息直接发给机器人（适合只有你+机器人的群）
 - **/mute · /unmute** — 暂停/恢复桌面事件推送（全局）
-- **/quiet · /unquiet** — 静默模式（本聊天）：只推最终结果和权限确认
+- **/quiet · /unquiet** — 静默模式（本聊天）：只推状态卡、最终结果和权限确认
 
 **💡 说明**
 - 直接发送文本 = 给 Claude 下指令，多轮对话自动保持上下文
@@ -295,7 +295,8 @@ def save_listen() -> None:
 
 
 # ---------------- 静默模式 / 权限模式覆盖（/quiet /mode 维护，均按聊天独立落盘） ----------------
-# 静默模式：开着时本聊天不转发过程性输出（思考文本/🔧 工具调用），只推权限确认卡片、
+# 静默模式：开着时本聊天不转发过程性输出（思考文本/🔧 工具调用），改为回合状态卡
+# （_start_progress：spinner 动画+计时+当前阶段，result 时定格），再推权限确认卡片、
 # 最终结果和异常——通知只出现在"需要你拍板"的时刻
 QUIET_FILE = STATE_DIR / "quiet.json"
 _quiet: set = set()
@@ -1213,6 +1214,15 @@ def _perm_conn(conn) -> None:
             chat_id = payload["chat_id"]
             tool = str(payload.get("tool_name") or "?")
             disp = _perm_input_display(tool, payload.get("tool_input"))
+            # quiet 状态卡同步阶段：等答复期间标成"等权限"——不标的话计时
+            # 还在走，看着像在干活，实际是在等点卡。应答放行后的下一个
+            # stream 事件（工具/思考/回复）会自然覆盖回正常阶段。
+            try:
+                pslot = _running.get(_task_key(chat_id))
+                if pslot is not None:
+                    pslot["p_stage"] = "⏸ 等待权限确认（见上方 🔐 卡片）"
+            except Exception:
+                pass
             kind, val = _ask_choice(
                 chat_id, "🔐 需要权限确认", f"**工具**：`{tool}`\n**内容**：\n{disp}",
                 [{"label": "✅ 允许", "value": "allow", "style": "primary"},
@@ -1511,6 +1521,115 @@ def _finalize_handover(chat_id: str, forced: bool) -> None:
                        "· /takeover last 随时把它接回飞书")
 
 
+# ---------------- quiet 静默模式的回合状态卡（豆包式"思考中…"，11-07） ----------------
+# 飞书没有原生 typing 指示，用「发一张状态卡 + 后台线程周期整卡 patch」模拟：
+# quiet 聊天收到消息时起卡，每 PROGRESS_INTERVAL 秒刷一帧（spinner 轮转 + 已耗时 +
+# 当前阶段），阶段由 _session_reader 从 stream 事件维护进 slot（thinking → 工具 →
+# 生成回复），result 事件时 _finish_turn 把卡定格成"✅ 完成"终态。安静不刷屏，
+# 又随时能看到 AI 在干活；最终结果照旧以新消息推送。
+PROGRESS_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"   # 盲文 spinner 10 帧，视觉上顺时针转圈
+PROGRESS_INTERVAL = 5.0                    # 刷帧间隔（秒）
+
+
+def _progress_card(title: str, md: str) -> dict:
+    """状态卡外壳（2.0 + markdown）：patch 的 content 是整卡 JSON，标题随阶段换。"""
+    return {"schema": "2.0",
+            "header": {"title": {"tag": "plain_text", "content": title},
+                       "template": "blue"},
+            "body": {"elements": [{"tag": "markdown", "content": md}]}}
+
+
+def _patch_progress(slot: dict, title: str, md: str) -> bool:
+    """状态卡整卡更新一次；失败置 p_ok=False（卡片通道挂了，后续不再硬刷）。"""
+    try:
+        req = PatchMessageRequest.builder() \
+            .message_id(slot["p_msg_id"]) \
+            .request_body(PatchMessageRequestBody.builder()
+                          .content(json.dumps(_progress_card(title, md), ensure_ascii=False))
+                          .build()) \
+            .build()
+        resp = api.im.v1.message.patch(req)
+        if not resp.success():
+            log(f"[状态卡更新失败] code={resp.code} msg={resp.msg}")
+            slot["p_ok"] = False
+    except Exception as e:
+        log(f"[状态卡更新异常] {e!r}")
+        slot["p_ok"] = False
+    return slot["p_ok"]
+
+
+def _start_progress(chat_id: str, slot: dict, note: str = "") -> None:
+    """quiet 聊天收到消息：起一张「思考中」状态卡（已有活动卡则不重复起）。
+
+    同一回合适用中追加的消息不另起新卡（一张卡代表"这个聊天有任务在跑"，
+    result 到点统一定格）。发卡失败就静默放弃——quiet 的结果推送不受影响。
+    note 随首帧展示（新起进程时放"续接 xxx · 模式"等一次性信息，省一条回执）。
+    """
+    cur = slot.get("p_thread")
+    if cur is not None and cur.is_alive():
+        return
+    slot["p_stage"] = "🧠 思考中"
+    slot["p_tool_n"] = 0
+    md = f"{PROGRESS_FRAMES[0]} 🧠 思考中 · 0秒"
+    if note:
+        md += f"\n\n{note}"
+    msg_id = _send_card(chat_id, _progress_card("🧠 思考中…", md))
+    if msg_id is None:
+        return
+    slot["p_msg_id"] = msg_id
+    slot["p_t0"] = time.time()
+    slot["p_ok"] = True
+    slot["p_done"] = False
+    slot["p_final_ok"] = False
+    slot["p_lock"] = threading.Lock()
+    slot["p_stop"] = threading.Event()
+    slot["p_thread"] = threading.Thread(target=_progress_loop, args=(chat_id, slot),
+                                        daemon=True)
+    slot["p_thread"].start()
+
+
+def _progress_loop(chat_id: str, slot: dict) -> None:
+    """状态卡刷帧线程：spinner + 已耗时 + 当前阶段 + 工具计数，每 5 秒整卡 patch。
+
+    退出条件（均不再刷帧）：p_done=终态已由 _stop_progress 定格；p_ok=False=卡片
+    通道挂了；进程已退出=读泵的收尾消息马上就到，状态卡不抢戏定格。
+    """
+    i = 0
+    while not slot["p_stop"].wait(PROGRESS_INTERVAL):
+        with slot["p_lock"]:
+            if slot.get("p_done") or not slot.get("p_ok"):
+                return
+            proc = slot.get("proc")
+            if proc is not None and proc.poll() is not None:
+                return
+            i += 1
+            stage = slot.get("p_stage") or "🧠 思考中"
+            secs = int(time.time() - slot["p_t0"])
+            md = f"{PROGRESS_FRAMES[i % len(PROGRESS_FRAMES)]} {stage} · {secs // 60}分{secs % 60:02d}秒"
+            if slot.get("p_tool_n"):
+                md += f"\n\n本轮已调用工具 {slot['p_tool_n']} 次"
+            # 卡片 header title 有长度限制（超长整卡被拒）：阶段标题独立截断
+            _patch_progress(slot, (stage[:23] + "…") if len(stage) > 24 else stage, md)
+
+
+def _stop_progress(chat_id: str, slot: dict, title: str, md: str) -> bool:
+    """把状态卡定格成终态（✅ 完成 / ⚠️ 异常 / ⛔ 会话结束）。幂等。
+
+    返回 False = 本聊天没有活动状态卡（非 quiet / 发卡失败）或定格失败，
+    调用方据此回退文本回执，信息不丢。
+    """
+    if not slot.get("p_stop"):
+        return False
+    with slot["p_lock"]:
+        if slot.get("p_done"):
+            return slot.get("p_final_ok", False)
+        slot["p_done"] = True
+        slot["p_final_ok"] = slot.get("p_ok", False) and _patch_progress(slot, title, md)
+    slot["p_stop"].set()
+    slot["p_thread"] = None
+    return slot["p_final_ok"]
+
+
 def run_task(chat_id: str, prompt: str) -> None:
     """任务入口：每个会话一个长驻 claude 进程（stream-json 双向）。
 
@@ -1535,8 +1654,12 @@ def run_task(chat_id: str, prompt: str) -> None:
                                    f"用 /takeover {key[:8]} 可把会话接管过来。")
                 return
             if _write_to_session(slot, prompt):
-                send_text(chat_id, "💬 已送达当前会话（正在执行的话会在工具间隙读取，"
-                                   "Claude 会根据进度决定何时回应）")
+                # quiet：状态卡替代"已送达"回执（转动的卡本身就是"收到并在跑"）
+                if chat_id in _quiet:
+                    _start_progress(chat_id, slot)
+                else:
+                    send_text(chat_id, "💬 已送达当前会话（正在执行的话会在工具间隙读取，"
+                                       "Claude 会根据进度决定何时回应）")
                 return
         # 没有活进程：在锁内完成 起进程+首条消息写入，保证消息次序不乱
         slot = {"chat_id": chat_id, "proc": None, "started": time.time(), "reason": None,
@@ -1557,7 +1680,11 @@ def run_task(chat_id: str, prompt: str) -> None:
         _write_to_session(slot, prompt)
     label = _chat_label(chat_id)
     tag = f"续接 {label} · {_mode_label(chat_id)}" if label else f"新会话 · {_mode_label(chat_id)}"
-    send_text(chat_id, f"🤖 收到（{tag}），开始执行…")
+    if chat_id in _quiet:
+        # quiet：起进程信息（续接哪个会话/什么模式）并入状态卡首帧，少一条回执
+        _start_progress(chat_id, slot, tag)
+    else:
+        send_text(chat_id, f"🤖 收到（{tag}），开始执行…")
     threading.Thread(target=_session_reader, args=(chat_id, key, slot), daemon=True).start()
     threading.Thread(target=_session_watchdog, args=(chat_id, key, slot), daemon=True).start()
 
@@ -1659,15 +1786,21 @@ def _session_reader(chat_id: str, key: str, slot: dict) -> None:
                         _running.setdefault(sid, slot)
             elif etype == "stream_event":
                 # 流式增量（--include-partial-messages）：只关心回复文本，
-                # thinking_delta / 工具入参增量不展示（静默诉求：思考过程不打扰）
+                # thinking_delta / 工具入参增量不展示（静默诉求：思考过程不打扰）。
+                # 增量类型顺手维护 p_stage（quiet 状态卡的当前阶段；非 quiet 聊天
+                # 没有状态卡线程消费，写个键零成本）
                 sev = evt.get("event") or {}
                 if sev.get("type") == "content_block_delta":
                     d = sev.get("delta") or {}
-                    if d.get("type") == "text_delta" and d.get("text") \
-                            and chat_id not in _quiet:
-                        if live is None:
-                            live = _LiveReply(chat_id)
-                        live.feed(d["text"])
+                    dtype = d.get("type")
+                    if dtype == "thinking_delta":
+                        slot["p_stage"] = "🧠 思考中"
+                    elif dtype == "text_delta" and d.get("text"):
+                        slot["p_stage"] = "✍️ 生成回复"
+                        if chat_id not in _quiet:
+                            if live is None:
+                                live = _LiveReply(chat_id)
+                            live.feed(d["text"])
             elif etype == "assistant":
                 for block in (evt.get("message") or {}).get("content") or []:
                     btype = block.get("type")
@@ -1683,11 +1816,17 @@ def _session_reader(chat_id: str, key: str, slot: dict) -> None:
                             # 没走流式（卡片通道降级/静默刚开启）：普通文本兜底
                             send_text(chat_id, final)
                             last_sent = final
-                    elif btype == "tool_use" and FORWARD_TOOLS and chat_id not in _quiet:
-                        if live is not None:   # 文本后紧跟工具调用：先定格卡片再发 🔧
-                            live.close()
-                            live = None
-                        send_text(chat_id, "🔧 " + _tool_summary(block.get("name", "?"), block.get("input")))
+                    elif btype == "tool_use":
+                        # quiet 状态卡阶段+计数（所有模式都维护，只有 quiet 有线程消费）
+                        slot["p_tool_n"] = slot.get("p_tool_n", 0) + 1
+                        slot["p_stage"] = "🔧 " + _tool_summary(
+                            block.get("name", "?"), block.get("input"))[:50]
+                        if FORWARD_TOOLS and chat_id not in _quiet:
+                            if live is not None:   # 文本后紧跟工具调用：先定格卡片再发 🔧
+                                live.close()
+                                live = None
+                            send_text(chat_id, "🔧 " + _tool_summary(block.get("name", "?"),
+                                                                    block.get("input")))
             elif etype == "result":
                 if live is not None:   # 异常路径兜底：定格尚未收尾的卡片
                     live.close()
@@ -1702,6 +1841,9 @@ def _session_reader(chat_id: str, key: str, slot: dict) -> None:
         live.close()
         live = None
     _cancel_perm_choice(chat_id)   # claude 已退出（跑完/被停），挂着的权限确认不再等
+    # quiet 状态卡若还在转（超时强杀/手动中断等 result 没来的路径）：定格成中性
+    # 终态，具体收尾信息由下方 reason 分支的文本交代。幂等——result 已定格过则跳过。
+    _stop_progress(chat_id, slot, "⛔ 会话已结束", "进程已退出，收尾信息见下方消息。")
     tail = "".join(stderr_buf[-12:]).strip()
     reason = slot.get("reason")
     with _running_lock:
@@ -1755,13 +1897,19 @@ def _finish_turn(chat_id: str, result: dict, last_text: str, slot: dict) -> None
     line = f"✅ {label + ' ' if label else ''}完成（{_mode_label(chat_id)}） · 耗时 {dur:.1f}s · {turns} 轮对话"
     if cost:
         line += f" · ${cost:.3f}"
-    if result.get("is_error"):
+    is_err = bool(result.get("is_error"))
+    if is_err:
         line = "⚠️ 任务异常结束 · " + line
         low = (final_text or "").lower()
         if any(k in low for k in ("429", "rate limit", "quota",
                                   "insufficient", "balance", "credit")):
             line += "\n⚠️ 疑似供应商额度耗尽/限流——/provider 查看并切换。"
-    send_text(chat_id, line)
+    # 完成回执优先定格进 quiet 状态卡（转圈卡就此收口，豆包式体验）；没有活动
+    # 状态卡（非 quiet / 发卡失败）照旧发文本回执，信息不丢
+    summary = f"耗时 {dur:.1f}s · {turns} 轮对话" + (f" · ${cost:.3f}" if cost else "")
+    if not _stop_progress(chat_id, slot,
+                          "⚠️ 异常结束" if is_err else "✅ 完成", summary):
+        send_text(chat_id, line)
 
     denials = result.get("permission_denials") or []
     if denials:
@@ -3160,9 +3308,10 @@ def handle_command(chat_id: str, text: str) -> None:
     elif cmd == "/quiet":
         _quiet.add(chat_id)
         save_quiet()
-        send_text(chat_id, "🔕 本聊天已开启静默模式：思考过程和工具调用不再实时转发，"
-                           "只在需要你拍板时通知——权限确认卡片、每回合的最终结果、异常。"
-                           "/unquiet 恢复实时转发（仅本聊天生效，其他聊天不受影响）。")
+        send_text(chat_id, "🔕 本聊天已开启静默模式：思考过程和工具调用不再实时转发。"
+                           "每条消息改为发一张「思考中…」状态卡——转圈动画+已耗时+当前阶段"
+                           "（思考/工具/生成回复），回合一结束卡上定格「✅ 完成」，结果随即推送；"
+                           "权限确认卡片照常弹。/unquiet 恢复实时转发（仅本聊天生效）。")
     elif cmd == "/unquiet":
         _quiet.discard(chat_id)
         save_quiet()
