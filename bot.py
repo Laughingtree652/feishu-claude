@@ -2751,17 +2751,26 @@ def _qa_entries(sid: str, flt: str = "", limit: int = 15) -> tuple:
     except OSError:
         return (), "（问答档案读不到，稍后再试。）"
     flt = flt.strip().lower()
-    items, shown = [], 0
+    items, shown, last_q = [], 0, ""
     for ln in reversed(rows):
         try:
             r = json.loads(ln)
         except Exception:
             continue
-        if flt and flt not in (str(r.get("q") or "") + str(r.get("pv") or "")).lower():
+        q = str(r.get("q") or "")[:120]
+        # 相邻同问合并（11-08 用户反馈：中断后重发同一问题会连出两条重影，
+        # 实证 aea99029：18:25 那次认证挂了回答只有报错，重发后 18:27 才拿到真回答
+        # → 保留较新一条）。只合并紧挨着的同文本回合（隔天重问不受影响）；
+        # last_q 只记实际展示的行——被关键字过滤掉的行不占去重名额，
+        # 免得新条目不匹配关键字时把旧条目（pv 匹配）也一并吞掉。
+        if q and q == last_q:
             continue
+        if flt and flt not in (q + str(r.get("pv") or "")).lower():
+            continue
+        last_q = q
         shown += 1
         items.append({"no": shown, "ts_hm": _qa_ts_hm(str(r.get("ts") or "")),
-                      "q": str(r.get("q") or "")[:120],
+                      "q": q,
                       "pv": str(r.get("pv") or "")[:150],
                       "tp": str(r.get("tp") or ""), "q_uuid": str(r.get("q_uuid") or "")})
         if shown >= limit:
