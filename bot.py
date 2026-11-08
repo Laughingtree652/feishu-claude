@@ -5,7 +5,7 @@
 飞书发消息给机器人 → 调用本地 claude CLI（多轮会话自动续接）→
 Claude 的回复与工具调用实时转发回飞书，实现远程操控。
 
-可用命令：/help /new /exit /handover /stop /status /session /sessions /takeover /cwd /mode /mute /unmute /provider /roster
+可用命令：/help /new /exit /handover /stop /status /session /sessions /takeover /cwd /mode /mute /unmute /provider /roster /qa
 （会话独占：同一会话只归一个聊天，后接管者优先，被挤掉的聊天会收到通知）
 """
 import json
@@ -153,6 +153,7 @@ HELP_TEXT = """📖 命令列表
 /observe [序号|会话ID|latest|last] — 实时观察：转录有动静自动刷新快照卡片（last=上次让出的会话；观察中再 /ob 同一会话 = 重发新卡刷回底部）
 /unobserve — 停止实时观察
 /roster [项目关键字] — 花名册：查所有上过线的 Claude 窗口/分身（名字·完整ID·最近动静·桌面或飞书）
+/qa [序号|关键字] — 问答档案：当前绑定会话的提问历史（列表/过滤，/qa <序号> 重读完整回答）
 /provider [序号|名称] — 查看/切换 Claude 供应商（cc-switch 库；切换即换 key，新起进程生效）
 /unqueue — 取消排队接管
 /rename [名字] — 给当前会话起名（/sessions 列表优先显示名字）
@@ -196,6 +197,7 @@ HELP_MD = """**🧩 会话管理**
 - **/cwd** [路径] — 查看/切换 Claude 的工作目录
 - **/file** [路径] — 把本地文件作为文件消息发进本聊天（相对路径相对工作目录）
 - **/roster** [项目关键字] — 花名册：所有上过线的 Claude 窗口/分身（名字·完整ID·最近动静·桌面或飞书），SessionStart hook 自动登记
+- **/qa** [序号|关键字] — 问答档案：当前绑定会话的提问历史，每回合自动记录（Stop hook）；/qa 看列表、/qa <关键字> 过滤、/qa <序号> 从转录重读完整回答
 - **/provider** [序号|名称] — 查看/切换 Claude 供应商（cc-switch 库；切换即换 key，新起进程生效）
 - **/listen** — 群聊免 @ 模式：本群所有消息直接发给机器人（适合只有你+机器人的群）
 - **/mute · /unmute** — 暂停/恢复桌面事件推送（全局）
@@ -2711,6 +2713,114 @@ def _roster_card(limit: int = 20, flt: str = "") -> dict:
     return card
 
 
+# ---------------- 问答档案 /qa（记录层=全局 Stop hook qa_register.py + 回填 backfill_qa.py，
+# 数据按会话分文件 data/qa/<sid>.jsonl；查询只对当前聊天绑定的会话生效——11-08 用户需求：
+# 终端会话问过的问题没法记录/定位/重读。/qa 列表与过滤，/qa <序号> 现抽转录重读完整回答） ----------------
+QA_STORE = STATE_DIR / "qa"
+_qa_lock = threading.Lock()
+_qa_cache: dict = {}        # chat_id -> {"items": [条目], "ts": 时间}（上次列表，序号寻址用）
+
+
+def _qa_ts_hm(ts: str) -> str:
+    """转录 ISO 时间戳（UTC）→ 本地时区「11-08 18:23」短形态；残缺给 ?。
+    11-08 实测转录原生时间差 8 小时，用户看会错位——存储保持 UTC，显示端转换。"""
+    t = (ts or "").strip()
+    if len(t) >= 16 and t[10] == "T":
+        try:
+            dt = datetime.fromisoformat(t.replace("Z", "+00:00"))
+            return dt.astimezone().strftime("%m-%d %H:%M")
+        except ValueError:
+            return t[5:10] + " " + t[11:16]
+    return t[:16] or "?"
+
+
+def _qa_entries(sid: str, flt: str = "", limit: int = 15) -> tuple:
+    """绑定会话的问答档案尾部条目（倒序=最新在前）。返回 ([条目], 空态文案 or None)。
+    条目 = {no, ts_hm, q, pv, tp, q_uuid}；只读文件尾部 256KB（长会话也不全扫）。"""
+    f = QA_STORE / f"{sid}.jsonl"
+    if not f.exists():
+        return (), ("（这个会话还没有问答档案——新会话从下一回合开始记录；"
+                    "老会话先跑 backfill_qa.py 回填历史）")
+    try:
+        with f.open("rb") as fh:
+            size = f.stat().st_size
+            fh.seek(max(0, size - 262144))
+            if fh.tell():
+                fh.readline()          # 尾部窗口先跳半行
+            rows = fh.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return (), "（问答档案读不到，稍后再试。）"
+    flt = flt.strip().lower()
+    items, shown = [], 0
+    for ln in reversed(rows):
+        try:
+            r = json.loads(ln)
+        except Exception:
+            continue
+        if flt and flt not in (str(r.get("q") or "") + str(r.get("pv") or "")).lower():
+            continue
+        shown += 1
+        items.append({"no": shown, "ts_hm": _qa_ts_hm(str(r.get("ts") or "")),
+                      "q": str(r.get("q") or "")[:120],
+                      "pv": str(r.get("pv") or "")[:150],
+                      "tp": str(r.get("tp") or ""), "q_uuid": str(r.get("q_uuid") or "")})
+        if shown >= limit:
+            break
+    if not items:
+        return (), (f"（没有匹配「{flt}」的问答记录。" if flt else "（这个会话还没有问答记录。）")
+    return items, None
+
+
+def _qa_card(items: list, flt: str = "") -> dict:
+    """问答列表卡片（2.0，roster 同款形态）：每条独立 markdown 组件，
+    加粗头行=序号·时间·问题，引用块=回答预览。"""
+    card = {"schema": "2.0",
+            "header": {"title": {"tag": "plain_text",
+                                 "content": f"🔍 问答档案{(' · 「' + flt + '」') if flt else ''}"},
+                       "template": "blue"},
+            "body": {"elements": []}}
+    for it in items:
+        md = f"**{it['no']}. {it['ts_hm']} · {it['q']}**"
+        if it["pv"]:
+            md += f"\n\n> {it['pv']}"
+        card["body"]["elements"].append({"tag": "markdown", "content": md})
+    card["body"]["elements"].append(
+        {"tag": "markdown",
+         "content": "*重读完整回答 /qa <序号> · 过滤 /qa <关键字> · 只看当前绑定会话*"})
+    return card
+
+
+def _qa_lines(items: list, flt: str = "") -> list:
+    """文本降级渲染（发卡失败内容不丢）。"""
+    out = [f"🔍 问答档案{(' · 「' + flt + '」') if flt else ''}"]
+    for it in items:
+        out.append(f"{it['no']}. {it['ts_hm']} {it['q']}")
+        if it["pv"]:
+            out.append(f"   > {it['pv']}")
+    out.append("重读完整回答 /qa <序号> · 过滤 /qa <关键字>")
+    return out
+
+
+def _qa_answer(tp: str, q_uuid: str) -> str:
+    """转录里按 q_uuid 定位回合，现抽该回合全部回答文本（排除 thinking，
+    复用 qa_register 的扫描/过滤口径）。找不到给空串。"""
+    if not tp or not q_uuid:
+        return ""
+    f = Path(tp)
+    if not f.exists():
+        return ""
+    try:
+        from qa_register import scan_turns
+        with f.open("r", encoding="utf-8", errors="replace") as fh:
+            turns = scan_turns(fh)
+    except Exception:
+        return ""
+    for t in turns:
+        if t.get("q_uuid") == q_uuid:
+            return t.get("a") or ""
+    return ""
+
+
 # ---------------- Provider 供应商切换（cc-switch 库：额度耗尽时飞书直接换 key） ----------------
 CCSWITCH_DIR = Path.home() / ".cc-switch"
 CCSWITCH_DB = CCSWITCH_DIR / "cc-switch.db"
@@ -2970,7 +3080,7 @@ def _switch_provider(chat_id: str, arg: str) -> None:
 COMMANDS = ["/help", "/new", "/exit", "/stop", "/status", "/session", "/sessions",
             "/takeover", "/peek", "/observe", "/unobserve", "/unqueue", "/rename",
             "/cwd", "/file", "/mode", "/model", "/mute", "/unmute", "/quiet", "/unquiet",
-            "/listen", "/provider", "/handover", "/compact", "/roster"]
+            "/listen", "/provider", "/handover", "/compact", "/roster", "/qa"]
 
 
 def _expand_cmd(text: str):
@@ -3521,6 +3631,41 @@ def handle_command(chat_id: str, text: str) -> None:
         # 卡片优先（结构化整洁），发卡失败降级 markdown 文本、内容不丢
         if _send_card(chat_id, _roster_card(20, arg.strip())) is None:
             send_markdown(chat_id, "\n".join(_roster_lines(20, arg.strip())))
+    elif cmd == "/qa":
+        a = arg.strip()
+        # 只对当前绑定会话生效（11-08 用户要求）：没绑定直接引导
+        sess = _sessions.get(chat_id) or {}
+        sid = sess.get("session_id") or ""
+        if not sid:
+            send_text(chat_id, "❓ 本聊天还没绑定会话（发过任务后自动绑定，或 /takeover 手动绑定）。")
+        elif a.isdigit() and a:
+            # /qa <序号>：重读上次列表里第 N 条的完整回答（转录现抽）
+            with _qa_lock:
+                cache = _qa_cache.get(chat_id) or {}
+            items = cache.get("items") or []
+            n = int(a)
+            if not (1 <= n <= len(items)):
+                send_text(chat_id, f"序号超出范围（上次列表共 {len(items)} 条）。先 /qa 或 /qa <关键字> 看列表。")
+            else:
+                it = items[n - 1]
+                ans = _qa_answer(it["tp"], it["q_uuid"])
+                if not ans:
+                    send_text(chat_id, f"第 {n} 条的原回答抽不到了（转录缺失或被清理）。预览：{it['pv']}")
+                else:
+                    if len(ans) > 6000:
+                        ans = ans[:6000] + "\n\n……（回答过长已截断）"
+                    send_markdown(chat_id,
+                                  f"📖 **第 {n} 条 · {it['ts_hm']} · 问题：{it['q']}**\n\n"
+                                  "————— Claude 的回答 —————\n\n" + ans)
+        else:
+            items, empty = _qa_entries(sid, a)
+            if empty is not None:
+                send_text(chat_id, empty)
+            else:
+                with _qa_lock:      # 缓存列表供 /qa <序号> 寻址
+                    _qa_cache[chat_id] = {"items": items, "ts": time.time()}
+                if _send_card(chat_id, _qa_card(items, a)) is None:
+                    send_markdown(chat_id, "\n".join(_qa_lines(items, a)))
     elif cmd == "/mute":
         try:
             (STATE_DIR / "mute.flag").write_text(
