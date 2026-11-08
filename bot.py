@@ -10,6 +10,7 @@ Claude 的回复与工具调用实时转发回飞书，实现远程操控。
 """
 import json
 import os
+import re
 import shlex
 import shutil
 import socket
@@ -35,6 +36,7 @@ from lark_oapi.api.im.v1 import (
     CreateMessageRequestBody,
     CreateFileRequest,
     CreateFileRequestBody,
+    GetMessageRequest,
     PatchMessageRequest,
     PatchMessageRequestBody,
     P2ImMessageReceiveV1,
@@ -3698,12 +3700,123 @@ def on_message(event: P2ImMessageReceiveV1) -> None:
         text = text.strip()
         if not text:
             return
-        dispatch_text(chat_id, text)
+        dispatch_text(chat_id, text, parent_mid=(msg.parent_id or "").strip())
     except Exception as e:
         print(f"[处理消息出错] {e!r}")
 
 
-def dispatch_text(chat_id: str, text: str, sender_id: str = "") -> None:
+# ---------------- 引用回复（飞书回复消息带上被回复的原消息进 Claude） ----------------
+# 11-08 需求：用户在飞书里引用回复某条消息说"这个改成蓝色"，Claude 原来只能收到
+# 回复文本本身（on_message 只取 msg.content.text，parent_id 完全没碰），"这个"指向
+# 什么全靠猜。现在按 parent_id 拉原消息拼进 prompt——原消息可能是机器人的卡片，也
+# 可能是用户自己发的消息，按 message_id GET 不挑发送者。设计边界：
+# - 只影响 Claude 任务路径：命令/!shell/权限卡文字答复/排队接管都在前面提前 return，
+#   文本保持原样不被引用块污染（回复 "/roster" 照样当命令跑）；
+# - 全链路容错：拉不到（权限/已删除/超时）→ 静默降级为普通消息，绝不阻塞发消息。
+
+def _card_text(node, out: list) -> None:
+    """递归抽卡片 JSON 里的文本（按文档序）：2.0 markdown 组件、1.0 div/按钮/标题。
+    采集到内容即返回，防止 values 递归把同一段重复收集。"""
+    if isinstance(node, list):
+        for v in node:
+            _card_text(v, out)
+        return
+    if not isinstance(node, dict):
+        return
+    tag = node.get("tag")
+    if tag == "markdown":
+        c = node.get("content")
+        if isinstance(c, str) and c.strip():
+            out.append(c)
+        return
+    if tag == "div":
+        t = node.get("text") or {}
+        if isinstance(t, dict) and isinstance(t.get("content"), str) and t["content"].strip():
+            out.append(t["content"])
+        return
+    if tag in ("plain_text", "lark_md"):
+        c = node.get("content")
+        if isinstance(c, str) and c.strip():
+            out.append(c)
+        return
+    for v in node.values():
+        _card_text(v, out)
+
+
+def _parent_text_from_message(msg_type: str, content: str) -> str:
+    """从消息体提取可读文本：text 直取；post 拼段落；interactive 卡片抽组件；
+    其余类型（图片/文件等）给占位说明。空/异常一律返回空串（调用方降级）。"""
+    try:
+        d = json.loads(content) if (content or "").strip() else {}
+    except Exception:
+        return ""
+    if not isinstance(d, (dict, list)):
+        return ""
+    if msg_type == "text":
+        t = str(d.get("text") or "")
+    elif msg_type == "post":
+        out = []
+
+        def _walk(n):
+            if isinstance(n, dict):
+                if isinstance(n.get("text"), str) and n["text"].strip():
+                    out.append(n["text"])
+                for v in n.values():
+                    _walk(v)
+            elif isinstance(n, list):
+                for v in n:
+                    _walk(v)
+
+        _walk(d)
+        t = " ".join(out)
+    elif msg_type == "interactive":
+        out = []
+        _card_text(d, out)
+        t = "\n".join(x for x in out if x.strip())
+    else:
+        t = f"[{msg_type or '未知'} 类型消息，无法摘录原文]"
+    t = re.sub(r"@_user_\d+", "", t).strip()
+    return t
+
+
+def _fetch_quoted_text(message_id: str) -> str:
+    """按 message_id 拉被引用原消息的文本（本 SDK 版本响应体在 items[0].body.content）。
+    全程容错：拉不到/权限不够/已删除 → 空串，调用方按普通消息发。"""
+    try:
+        req = GetMessageRequest.builder().message_id(message_id).build()
+        resp = api.im.v1.message.get(req)
+        if not (resp and resp.success() and resp.data and resp.data.items):
+            return ""
+        m0 = resp.data.items[0]
+        body = getattr(m0, "body", None)
+        return _parent_text_from_message(m0.msg_type or "",
+                                         (body.content if body else "") or "")
+    except Exception as e:
+        log(f"[引用回复] 原消息拉取失败（降级为普通消息）: {e!r}")
+        return ""
+
+
+def _quoted_prompt(quote: str, reply: str) -> str:
+    """引用回复最终 prompt：原消息正文 + 分隔线 + 用户回复。过长截断保护上下文。"""
+    quote = (quote or "").strip()
+    if len(quote) > 800:
+        quote = quote[:800] + "……（原消息过长已截断）"
+    return ("[引用回复] 用户在飞书里引用回复了一条消息（原消息可能是机器人或用户自己发的），"
+            "请结合原消息理解下面的回复内容：\n"
+            "————— 引用的原消息 —————\n"
+            f"{quote}\n"
+            "————— 用户的回复 —————\n"
+            f"{reply}")
+
+
+def _run_task_with_quote(chat_id: str, text: str, parent_mid: str) -> None:
+    """引用回复的任务线程：拉原消息拼 prompt 后照常执行（拉不到就退回纯回复文本）。"""
+    quote = _fetch_quoted_text(parent_mid)
+    run_task(chat_id, _quoted_prompt(quote, text) if quote else text)
+
+
+def dispatch_text(chat_id: str, text: str, sender_id: str = "",
+                 parent_mid: str = "") -> None:
     """统一文本分发（消息与卡片按钮共用）：命令 / !shell / 排队接管 / Claude 任务。
 
     调用方负责白名单校验；按钮回调与 on_message 都走这里。
@@ -3753,7 +3866,12 @@ def dispatch_text(chat_id: str, text: str, sender_id: str = "") -> None:
         send_text(chat_id, f"📥 已排队（第 {queued} 条），等会话回合结束自动执行。/peek 看进度，/unqueue 取消。")
         return
 
-    threading.Thread(target=run_task, args=(chat_id, text), daemon=True).start()
+    if parent_mid:
+        # 引用回复：先拉原消息拼 prompt（工作线程里做，不占 WS 回调）
+        threading.Thread(target=_run_task_with_quote,
+                         args=(chat_id, text, parent_mid), daemon=True).start()
+    else:
+        threading.Thread(target=run_task, args=(chat_id, text), daemon=True).start()
 
 
 def _card_toast(content: str, type_: str = "success") -> "P2CardActionTriggerResponse":
