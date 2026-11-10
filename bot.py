@@ -1578,6 +1578,8 @@ PROGRESS_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"   # 盲文 spinner 10 帧，�
 PROGRESS_INTERVAL = 0.5                    # 刷帧间隔（秒）：0.5s/帧≈5秒一圈（5s 一刷太
                                            # 迟钝，11-07 用户实测要求更流畅；流式卡 1.2s 长期
                                            # 稳，0.5s 配失败容忍防 429 抖动杀卡）
+PROGRESS_BACKOFF = 4.0                     # 失败帧退避（秒）：ReadTimeout/频控时拉开帧距重试，
+                                           # 通道恢复自动回正常节拍（11-10 判死改退避）
 
 
 def _progress_card(title: str, md: str) -> dict:
@@ -1591,12 +1593,14 @@ def _progress_card(title: str, md: str) -> dict:
 def _patch_progress(slot: dict, title: str, md: str) -> bool:
     """状态卡整卡更新一次（只由 _progress_loop 单线程串行调用）。
 
-    业务失败（偶发 429/频控）连续 3 次才判死——单次只跳帧下帧重试；
-    网络挂起类异常（ReadTimeout 等，全局 5s 超时兜底）直接判死——通道真挂了，
-    重试只会让动画冻结更久。
+    11-10 改版：不再判死。旧版 ReadTimeout 一次判死 + 业务失败三连判死，
+    在 open.feishu.cn 偶发 5s 慢响应的网络上一天杀掉十几次动画（bot.log 实证
+    单发 ReadTimeout 高频零星分布），卡片定格成"永远思考中"。判死才是永久冻结；
+    新语义=本函数只报告成败，失败帧由 _progress_loop 退避后重试——断网期帧距
+    自动拉开（冻结但线程活着），恢复后自动续转。日志只在状态翻转时打（首次
+    失败打详情、恢复打一条），断网期不刷屏。
     """
     ok = False
-    timeout_hit = False
     try:
         req = PatchMessageRequest.builder() \
             .message_id(slot["p_msg_id"]) \
@@ -1607,21 +1611,18 @@ def _patch_progress(slot: dict, title: str, md: str) -> bool:
         resp = api.im.v1.message.patch(req)
         if resp.success():
             ok = True
-        else:
+        elif not slot.get("p_err"):
             log(f"[状态卡更新失败] code={resp.code} msg={resp.msg}")
     except Exception as e:
-        if "timeout" in type(e).__name__.lower():
-            timeout_hit = True
-        log(f"[状态卡更新异常] {e!r}")
+        if not slot.get("p_err"):
+            log(f"[状态卡更新异常] {e!r}")
     if ok:
-        slot["p_fail"] = 0
+        if slot.get("p_err"):
+            slot["p_err"] = False
+            log("[状态卡更新恢复] 失败后已自动续上")
         return True
-    if timeout_hit:
-        slot["p_ok"] = False
-        return False
-    slot["p_fail"] = slot.get("p_fail", 0) + 1
-    if slot["p_fail"] >= 3:
-        slot["p_ok"] = False
+    slot["p_err"] = True
+    return False
     return False
 
 
@@ -1645,8 +1646,7 @@ def _start_progress(chat_id: str, slot: dict, note: str = "") -> None:
         return
     slot["p_msg_id"] = msg_id
     slot["p_t0"] = time.time()
-    slot["p_ok"] = True
-    slot["p_fail"] = 0
+    slot["p_err"] = False
     slot["p_final"] = None
     slot["p_final_ok"] = False
     slot["p_stop"] = threading.Event()
@@ -1669,7 +1669,7 @@ def _progress_loop(chat_id: str, slot: dict) -> None:
         if slot["p_stop"].wait(max(0.01, next_t - time.time())):
             # 终态唤醒：单写者定格（此前帧 patch 已串行完成，顺序天然正确）
             final = slot.get("p_final")
-            if final and slot.get("p_ok"):
+            if final:
                 ok = _patch_progress(slot, final[0], final[1])
                 slot["p_final_ok"] = ok
                 if not ok and final[2]:
@@ -1677,9 +1677,6 @@ def _progress_loop(chat_id: str, slot: dict) -> None:
             slot["p_thread"] = None
             return
         next_t += PROGRESS_INTERVAL
-        if not slot.get("p_ok"):
-            slot["p_thread"] = None   # 通道已判死
-            return
         proc = slot.get("proc")
         if proc is not None and proc.poll() is not None:
             slot["p_thread"] = None   # 进程退出：读泵收尾消息即到，不抢戏
@@ -1691,7 +1688,10 @@ def _progress_loop(chat_id: str, slot: dict) -> None:
         if slot.get("p_tool_n"):
             md += f"\n\n本轮已调用工具 {slot['p_tool_n']} 次"
         # 卡片 header title 有长度限制（超长整卡被拒）：阶段标题独立截断
-        _patch_progress(slot, (stage[:23] + "…") if len(stage) > 24 else stage, md)
+        if not _patch_progress(slot, (stage[:23] + "…") if len(stage) > 24 else stage, md):
+            # 失败退避（11-10：判死改退避）：断网/频控期拉开帧距、线程保持活着，
+            # 通道恢复自动回到正常节拍继续转——卡片不再定格成"永远思考中"
+            next_t += PROGRESS_BACKOFF
 
 
 def _stop_progress(chat_id: str, slot: dict, title: str, md: str,
@@ -1699,15 +1699,15 @@ def _stop_progress(chat_id: str, slot: dict, title: str, md: str,
     """把状态卡定格成终态（✅ 完成 / ⚠️ 异常 / ⛔ 会话结束）。幂等。
 
     只置终态并唤醒刷帧线程，终帧由它单线程定格（见 _progress_loop）。
-    返回 False = 无活动状态卡或通道已判死，调用方据此立即回退文本回执；
-    返回 True 后定格若仍失败且给了 fallback，刷帧线程会文本补一句，信息不丢。
+    返回 False = 无活动状态卡，调用方据此立即回退文本回执；返回 True 后
+    定格若仍失败且给了 fallback，刷帧线程会文本补一句，信息不丢。
     """
     if not slot.get("p_stop"):
         return False
     if slot.get("p_thread") is None:
         return bool(slot.get("p_final_ok", False))   # 幂等：刷帧线程已退出
     slot["p_final"] = (title, md, fallback)
-    alive = bool(slot.get("p_ok"))
+    alive = slot.get("p_thread") is not None
     slot["p_stop"].set()
     return alive
 
