@@ -40,6 +40,7 @@ from lark_oapi.api.im.v1 import (
     PatchMessageRequest,
     PatchMessageRequestBody,
     P2ImMessageReceiveV1,
+    P2ImMessageRecalledV1,
 )
 from dotenv import load_dotenv
 
@@ -3854,9 +3855,73 @@ def on_message(event: P2ImMessageReceiveV1) -> None:
         text = text.strip()
         if not text:
             return
-        dispatch_text(chat_id, text, parent_mid=(msg.parent_id or "").strip())
+        dispatch_text(chat_id, text, parent_mid=(msg.parent_id or "").strip(),
+                      mid=(msg.message_id or "").strip())
     except Exception as e:
         print(f"[处理消息出错] {e!r}")
+
+
+# ---------------- 撤回处理（11-10：发出后撤回的消息） ----------------
+# 飞书撤回事件（im.message.recalled_v1）不带原文——撤回了自然拿不到——所以
+# bot 在把消息派给 Claude 的分叉点记账本（mid -> 原文）。撤回时查账：
+#   ① 还在排队接管的队列里 → 真撤：从队列移除，从未进会话，Claude 看不到；
+#   ② 已写进会话 stdin/上下文 → 物理上收不回（stdin 没有抽回机制），注入
+#     一条「作废忽略」通知，Claude 回合进行中在工具间隙读到、可中途转向。
+# 命令 / !shell / 待决策卡答复等不进 Claude 的路径不记账——撤回即静默。
+# 账本有界（bot 重启即清零）：撤回都是即时行为，隔夜的撤回没有作废价值。
+_recall_lock = threading.Lock()
+_recall_map: dict = {}        # message_id -> {"chat_id", "text"[:500], "ts"}
+_RECALL_KEEP = 300            # 只记最近 300 条（防无界增长）
+
+
+def _recall_remember(mid: str, chat_id: str, text: str) -> None:
+    """在消息确定将作为 Claude 输入时记账（撤回事件的原文只能从这里来）。"""
+    if not mid:
+        return
+    with _recall_lock:
+        _recall_map[mid] = {"chat_id": chat_id, "text": text[:500], "ts": time.time()}
+        while len(_recall_map) > _RECALL_KEEP:
+            _recall_map.pop(next(iter(_recall_map)))
+
+
+def on_recall(event: P2ImMessageRecalledV1) -> None:
+    """WebSocket 事件回调：用户撤回了一条消息。账本未命中（非 Claude 任务
+    消息/跨重启丢账）直接静默——撤一条命令、撤一条没处理过的消息，没有
+    需要作废的东西。"""
+    try:
+        data = event.event
+        if data is None:
+            return
+        mid = (data.message_id or "").strip()
+        with _recall_lock:
+            rec = _recall_map.pop(mid, None)
+        if not rec:
+            return
+        chat_id = rec["chat_id"]
+        if (data.chat_id or "").strip() and data.chat_id.strip() != chat_id:
+            return
+        # ① 排队接管窗口：消息还没发进会话，按原文从队列移除（真撤）
+        with _pending_lock:
+            pend = _pending.get(chat_id)
+            removed = pend is not None and rec["text"] in pend["queue"]
+            if removed:
+                pend["queue"].remove(rec["text"])
+        if removed:
+            send_text(chat_id, "↩️ 已撤回：消息还在排队没发进会话，已移除，Claude 不会看到它。")
+            return
+        # ② 已进会话：注入作废通知，复用全链路（互斥/流式卡片/✅ 回执照常）
+        send_text(chat_id, "↩️ 这条消息已进入会话收不回了——已给 Claude 补一条作废通知，"
+                           "让它不要基于这条继续（进行中的任务会在工具间隙读到）。")
+        threading.Thread(
+            target=run_task, daemon=True,
+            args=(chat_id,
+                  "[撤回通知] 用户在飞书撤回了下面这条消息，请作废并忽略它，"
+                  "不要基于它继续；若已经基于它产出/执行了什么，简单说明一句即可，"
+                  "不要再展开干活。\n"
+                  "————— 被撤回的消息 —————\n" + rec["text"]),
+        ).start()
+    except Exception as e:
+        print(f"[处理撤回出错] {e!r}")
 
 
 # ---------------- 引用回复（飞书回复消息带上被回复的原消息进 Claude） ----------------
@@ -3970,10 +4035,12 @@ def _run_task_with_quote(chat_id: str, text: str, parent_mid: str) -> None:
 
 
 def dispatch_text(chat_id: str, text: str, sender_id: str = "",
-                 parent_mid: str = "") -> None:
+                 parent_mid: str = "", mid: str = "") -> None:
     """统一文本分发（消息与卡片按钮共用）：命令 / !shell / 排队接管 / Claude 任务。
 
     调用方负责白名单校验；按钮回调与 on_message 都走这里。
+    mid = 飞书消息 ID（按钮回调没有）；凡将作为 Claude 输入的消息记账，
+    用户撤回时按它作废（见 on_recall）。
     """
     # 记录通知目标：桌面 hook 的 notify.py 读它把提醒推到这个聊天（最后活跃的聊天优先）
     if sender_id:
@@ -4017,9 +4084,11 @@ def dispatch_text(chat_id: str, text: str, sender_id: str = "",
             pend["queue"].append(text)
             queued = len(pend["queue"])
     if pend is not None:
+        _recall_remember(mid, chat_id, text)   # 将作为 Claude 输入：记账（撤回可真删）
         send_text(chat_id, f"📥 已排队（第 {queued} 条），等会话回合结束自动执行。/peek 看进度，/unqueue 取消。")
         return
 
+    _recall_remember(mid, chat_id, text)        # 将作为 Claude 输入：记账（撤回注入作废）
     if parent_mid:
         # 引用回复：先拉原消息拼 prompt（工作线程里做，不占 WS 回调）
         threading.Thread(target=_run_task_with_quote,
@@ -4316,6 +4385,7 @@ def main() -> None:
 
     handler = lark.EventDispatcherHandler.builder("", "") \
         .register_p2_im_message_receive_v1(on_message) \
+        .register_p2_im_message_recalled_v1(on_recall) \
         .register_p2_card_action_trigger(on_card_action) \
         .register_p2_application_application_app_version_audit_v6(on_app_version) \
         .build()
