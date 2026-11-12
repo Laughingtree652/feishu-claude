@@ -45,6 +45,7 @@ from lark_oapi.api.im.v1 import (
     CreatePinRequestBody,
     DeletePinRequest,
     DeleteMessageRequest,
+    GetMessageResourceRequest,
 )
 from dotenv import load_dotenv
 
@@ -3059,6 +3060,149 @@ def _hud_record(chat_id: str, slot: dict, result: dict) -> None:
         log(f"[HUD记录异常] {e!r}")
 
 
+# ---------------- 飞书文件接收（11-12 用户批准：发文件→bot 下载→Claude 读取分析） ----------------
+# 旧口径 on_message 只认 text（其余拒收），用户实际需要发 md/pdf/doc/docx/txt/图片
+# 让 Claude 读取分析。技术链路（SDK 现成）：WS file/image 事件 content 带 file_key/
+# image_key → GET /im/v1/messages/:id/resources/:key（MessageResource.get，响应
+# .file=BytesIO 二进制流）→ 存会话工作目录 uploads/ → 转路径给 Claude。
+# 关键设计——多模态解耦（用户问"PDF 不支持多模态的模型会不会有问题"）：
+# Claude Code 的 Read 读 PDF 是渲染成图走视觉，provider 模型是否支持 image block
+# 不可赌；所以 bot 侧先把 PDF 文本层抽出来（PyMuPDF）存 .txt，docx 同款
+# （python-docx）——主体类型（md/txt/docx/文本型 PDF）全部纯文本化，任何模型
+# 能读；扫描件（抽不出文本）/图片才真依赖视觉，模型不支持时 Claude 会自然反馈。
+# 惰性 import：没装 PyMuPDF/python-docx 时仅抽取降级，bot 本体不受影响。
+# 下载放工作线程：on_message 是 SDK 回调线程，大文件不能阻塞事件泵。
+
+
+def _sanitize_name(name: str, fallback: str = "file") -> str:
+    """清洗用户可控的文件名（路径穿越防御+Windows 非法字符+长度截断）。"""
+    name = (name or "").strip().replace("\\", "/")
+    name = name.split("/")[-1]                        # 穿越/盘符全砍只剩 base
+    name = re.sub(r'[\\/:*?"<>|\r\n\t]', "_", name)   # Windows 保留字符
+    return name[:80] or fallback
+
+
+def _extract_pdf_text(pdf_path) -> str:
+    """PDF 文本层抽取（PyMuPDF）。扫描件返回空串（调用方据此判定）。"""
+    try:
+        import pymupdf
+        with pymupdf.open(pdf_path) as d:
+            text = "\n".join(page.get_text() for page in d)
+        return text.strip()
+    except Exception as e:
+        log(f"[PDF抽取失败] {e!r}")
+        return ""
+
+
+def _extract_docx_text(docx_path) -> str:
+    """docx 文本抽取（python-docx）：段落按序 + 表格单元格（含标题行）。"""
+    try:
+        import docx as _dx
+        d = _dx.Document(docx_path)
+        parts = [p.text for p in d.paragraphs if p.text.strip()]
+        for tb in d.tables:
+            for row in tb.rows:
+                cells = [c.text.strip() for c in row.cells if c.text.strip()]
+                if cells:
+                    parts.append(" | ".join(cells))
+        return "\n".join(parts).strip()
+    except Exception as e:
+        log(f"[docx抽取失败] {e!r}")
+        return ""
+
+
+def _ingest_file_worker(chat_id: str, mid: str, fkey: str, rtype: str,
+                        fname: str) -> None:
+    """文件下载→分流抽取→转 Claude（工作线程，慢下载不阻塞 WS 事件泵）。"""
+    try:
+        try:
+            resp = api.im.v1.message_resource.get(
+                GetMessageResourceRequest.builder()
+                .message_id(mid).file_key(fkey).type(rtype).build())
+        except Exception as e:
+            send_text(chat_id, f"⚠️ 文件下载异常：{e!r}")
+            return
+        if not resp.success() or resp.file is None:
+            send_text(chat_id, f"⚠️ 文件下载失败（code={resp.code} {resp.msg}），"
+                               "可重发一次试试。")
+            return
+        data = resp.file.read()
+        if not data:
+            send_text(chat_id, "⚠️ 下载到空文件，可重发一次试试。")
+            return
+
+        # 存盘：工作目录 uploads/（会话进程 cwd 即工作目录，Claude 相对路径可读；
+        # 时间戳前缀防重名撞车；文件名用户可控必须清洗）
+        safe = _sanitize_name(fname)          # 空名兜底 "file"
+        if rtype == "image" and (not fname or safe == "file"):
+            # 图片消息不带文件名：魔数判定扩展名
+            head = data[:8]
+            safe = "image" + (".png" if head.startswith(b"\x89PNG")
+                              else ".jpg" if head[:3] == b"\xff\xd8\xff" else ".img")
+        updir = _chat_work_dir(chat_id) / "uploads"
+        updir.mkdir(parents=True, exist_ok=True)
+        ts_tag = datetime.now().strftime("%H%M%S")
+        fpath = updir / f"{ts_tag}_{safe}"
+        fpath.write_bytes(data)
+
+        # 分流抽取：PDF/docx 抽文本层（纯文本化给非多模态模型兜底），其余原样
+        disp, ext_note = fpath.name, ""
+        ext = fpath.suffix.lower()
+        if ext == ".pdf":
+            t = _extract_pdf_text(fpath)
+            if t:
+                tpath = fpath.with_suffix(".pdf.txt")
+                tpath.write_text(t, "utf-8")
+                ext_note = f"文本层已抽取到 {tpath.name}（{len(t)} 字）。扫描件/图表请读原 PDF。"
+            else:
+                ext_note = "（未能抽出文本层——疑似扫描件：需要模型视觉能力读原 PDF，" \
+                           "若当前模型不支持图片可能读不了，可换多模态模型或贴文字）"
+        elif ext == ".docx":
+            t = _extract_docx_text(fpath)
+            if t:
+                tpath = fpath.with_suffix(".docx.md")
+                tpath.write_text(t, "utf-8")
+                ext_note = f"文本已抽取到 {tpath.name}（{len(t)} 字，含表格）。"
+        elif ext == ".doc":
+            ext_note = "（.doc 老格式 python 库不直接支持——Claude 可尝试 pandoc/Word 转" \
+                       "docx；建议发件时另存为 .docx）"
+
+        size_kb = max(1, len(data) // 1024)
+        prompt = (f"[文件] 用户发来了文件「{disp}」（约 {size_kb} KB），已保存到：\n"
+                  f"{fpath}\n"
+                  + (ext_note + "\n" if ext_note else "")
+                  + "请先读取文件内容（优先读抽取好的文本文件），简要确认你看到了什么"
+                    "（一句话概括即可），然后等待用户的具体分析指示。")
+        dispatch_text(chat_id, prompt, mid=mid)
+    except Exception as e:
+        log(f"[文件接收异常] {e!r}")
+        try:
+            send_text(chat_id, "⚠️ 文件处理异常，可重发一次试试。")
+        except Exception:
+            pass
+
+
+def _ingest_message_file(chat_id: str, msg, sender_id: str) -> None:
+    """on_message 的文件/图片分叉入口：解析 content、校验、起工作线程。"""
+    try:
+        content = json.loads(msg.content or "{}")
+    except json.JSONDecodeError:
+        send_text(chat_id, "⚠️ 文件消息解析失败，可重发一次试试。")
+        return
+    if msg.message_type == "image":
+        fkey, rtype = content.get("image_key") or "", "image"
+        fname = ""
+    else:
+        fkey, rtype = content.get("file_key") or "", "file"
+        fname = content.get("file_name") or ""
+    if not fkey:
+        send_text(chat_id, "⚠️ 文件消息缺少下载键，可重发一次试试。")
+        return
+    threading.Thread(target=_ingest_file_worker,
+                     args=(chat_id, msg.message_id, fkey, rtype, fname),
+                     daemon=True).start()
+
+
 # ---------------- Provider 供应商切换（cc-switch 库：额度耗尽时飞书直接换 key） ----------------
 CCSWITCH_DIR = Path.home() / ".cc-switch"
 CCSWITCH_DB = CCSWITCH_DIR / "cc-switch.db"
@@ -4065,8 +4209,8 @@ def on_message(event: P2ImMessageReceiveV1) -> None:
         if msg is None:
             return
         chat_id = msg.chat_id
-        if msg.message_type != "text":
-            send_text(chat_id, "⚠️ 目前只支持文本消息。")
+        if msg.message_type not in ("text", "file", "image"):
+            send_text(chat_id, "⚠️ 目前只支持文本/文件/图片消息。")
             return
 
         sender_id = ""
@@ -4101,6 +4245,16 @@ def on_message(event: P2ImMessageReceiveV1) -> None:
         if _chat_types.get(chat_id) != msg.chat_type:   # 类型只在变化时落盘（低频）
             _chat_types[chat_id] = msg.chat_type
             save_chat_types()
+
+        # 文件/图片消息（11-12）：下载→分流抽取→转 Claude 读取分析。
+        # 群聊与文本同口径：仅 /listen 开启的群响应（文件消息不带 @ 机制）。
+        if msg.message_type in ("file", "image"):
+            if msg.chat_type == "group":
+                with _listen_lock:
+                    if chat_id not in _listen:
+                        return
+            _ingest_message_file(chat_id, msg, sender_id)
+            return
         if msg.chat_type == "group":
             with _listen_lock:
                 listen = chat_id in _listen
