@@ -5,7 +5,7 @@
 飞书发消息给机器人 → 调用本地 claude CLI（多轮会话自动续接）→
 Claude 的回复与工具调用实时转发回飞书，实现远程操控。
 
-可用命令：/help /new /exit /handover /stop /status /session /sessions /takeover /cwd /mode /mute /unmute /provider /roster /qa
+可用命令：/help /new /exit /handover /stop /status /session /sessions /takeover /cwd /mode /mute /unmute /provider /roster /qa /hud
 （会话独占：同一会话只归一个聊天，后接管者优先，被挤掉的聊天会收到通知）
 """
 import json
@@ -41,6 +41,10 @@ from lark_oapi.api.im.v1 import (
     PatchMessageRequestBody,
     P2ImMessageReceiveV1,
     P2ImMessageRecalledV1,
+    CreatePinRequest,
+    CreatePinRequestBody,
+    DeletePinRequest,
+    DeleteMessageRequest,
 )
 from dotenv import load_dotenv
 
@@ -155,6 +159,7 @@ HELP_TEXT = """📖 命令列表
 /unobserve — 停止实时观察
 /roster [项目关键字] — 花名册：查所有上过线的 Claude 窗口/分身（名字·完整ID·最近动静·桌面或飞书）
 /qa [序号|关键字] — 问答档案：当前绑定会话的提问历史（列表/过滤，/qa <序号> 重读完整回答）
+/hud [on|off] — 会话监控 HUD：置顶区常驻卡显示 Context/缓存/首响/吞吐（带基线），劣化变黄红给建议
 /provider [序号|名称] — 查看/切换 Claude 供应商（cc-switch 库；切换即换 key，新起进程生效）
 /unqueue — 取消排队接管
 /rename [名字] — 给当前会话起名（/sessions 列表优先显示名字）
@@ -199,6 +204,7 @@ HELP_MD = """**🧩 会话管理**
 - **/file** [路径] — 把本地文件作为文件消息发进本聊天（相对路径相对工作目录）
 - **/roster** [项目关键字] — 花名册：所有上过线的 Claude 窗口/分身（名字·完整ID·最近动静·桌面或飞书），SessionStart hook 自动登记
 - **/qa** [序号|关键字] — 问答档案：当前绑定会话的提问历史，每回合自动记录（Stop hook）；/qa 看列表、/qa <关键字> 过滤、/qa <序号> 从转录重读完整回答
+- **/hud** [on|off] — 会话监控 HUD：置顶区常驻卡片显示 Context 占用/缓存命中/首响/吞吐（带本会话基线），劣化自动变黄红并给建议（/compact 等），回合结束自动刷新
 - **/provider** [序号|名称] — 查看/切换 Claude 供应商（cc-switch 库；切换即换 key，新起进程生效）
 - **/listen** — 群聊免 @ 模式：本群所有消息直接发给机器人（适合只有你+机器人的群）
 - **/mute · /unmute** — 暂停/恢复桌面事件推送（全局）
@@ -2014,6 +2020,10 @@ def _finish_turn(chat_id: str, result: dict, last_text: str, slot: dict) -> None
         except (BrokenPipeError, OSError, ValueError):
             pass
 
+    # HUD 记账+刷新（11-12）：result 事件一把拿指标（ttft/吞吐/context/缓存），
+    # 静默容错绝不影响回执路径；非 HUD 聊天只记账（打开即有历史基线）
+    _hud_record(chat_id, slot, result)
+
     # /handover 等收尾的聊天：收尾总结回合一结束就落地移交（进程稍后由 _finalize 杀掉）
     if _handovers:
         _finalize_handover(chat_id, forced=False)
@@ -2831,6 +2841,224 @@ def _qa_answer(tp: str, q_uuid: str) -> str:
     return ""
 
 
+# ---------------- 会话监控 HUD（置顶常驻卡，11-12 用户批准） ----------------
+# 动机（用户原话）：模仿 Claude HUD 监控当前会话指标（context 占用/吞吐等），
+# 显著劣化时提醒压缩上下文。展示位=聊天置顶 pin（用户钦点：只放关键信息、
+# 不遮盖文本、兼顾移动端）——pin 横条是折叠摘要，点开才见整卡，天然克制。
+# 技术前提 11-12 实测全通：pin.create 现有 scope 直接可用、卡片 pin 后横条
+# 正常渲染（卡片/纯文本都支持）、message.patch 持续刷新、delete_pin 的
+# path=message_id 全链路统一。
+# 指标全取自 stream-json 的 result 事件（一把拿，reader 泵零改动；11-12 实测
+# 字段）：首响=ttft_stream_ms（API 口径首 token，不含进程冷启动）、吞吐=
+# output_tokens/duration_api_ms、context=输入+缓存读+缓存写+输出（上限从
+# modelUsage.contextWindow 现拿不硬编码）、缓存命中=cache_read/总输入。
+# 注意 usage.speed 不是速度——实测值是服务档位字符串 'standard'，勿用。
+# 阈值校准自存量 64 会话 usage 分布（11-12 扫描：命中 p50=99%、ctx p95=160k）。
+# 判定双保险：相对基线（本会话非冷启动回合中位数，ttft>1.5× 或吞吐<0.6×
+# 转 黄）抓劣化 + 绝对底线（ttft>8s / 吞吐<10 / ctx>0.8 window 红）防
+# "开局就慢基线也慢"；新起进程首回合冷启动巨慢（实测 haiku 首回合 ttft 20s）
+# 不进基线。更新节奏=回合级（_finish_turn 一次），不碰 230020 频控红线。
+HUD_FILE = STATE_DIR / "hud.json"
+_hud_lock = threading.Lock()
+_hud: dict = {}          # chat_id -> 卡片 message_id（/hud on 的生命周期，重启后接上原卡继续 patch）
+_hud_fail: dict = {}     # chat_id -> 连续刷新失败计数（≥2 判卡被删，自动重建恢复置顶）
+_hud_hist: dict = {}     # sid -> [回合指标 dict]（最新在后，重启即弃——基线重新采）
+_HUD_HIST_KEEP = 24      # 每会话保留回合数（基线最多前 20 + 当前 + 裕量）
+_HUD_BASE_MIN = 5        # 基线最少非冷启动样本（不足显示"采集中"，只做绝对判定）
+if HUD_FILE.exists():
+    try:
+        _hud = json.loads(HUD_FILE.read_text("utf-8"))
+    except Exception:
+        _hud = {}
+
+
+def _hud_save() -> None:
+    try:
+        HUD_FILE.write_text(json.dumps(_hud, ensure_ascii=False), "utf-8")
+    except OSError:
+        pass
+
+
+def _hud_metrics_from_result(result: dict, slot: dict) -> dict:
+    """从 result 事件抽本回合指标（字段缺失容错为 None，展示端打 '—'）。"""
+    u = result.get("usage") or {}
+    inp = u.get("input_tokens") or 0
+    cr = u.get("cache_read_input_tokens") or 0
+    cc = u.get("cache_creation_input_tokens") or 0
+    ot = u.get("output_tokens") or 0
+    total_in = inp + cr + cc
+    d_api = (result.get("duration_api_ms") or 0) / 1000
+    ttft = (result.get("ttft_stream_ms") or 0) / 1000
+    win = 0
+    for v in (result.get("modelUsage") or {}).values():
+        try:
+            win = max(win, int(v.get("contextWindow") or 0))
+        except (TypeError, ValueError):
+            pass
+    return {"ts": time.time(), "cold": not slot.get("hud_seen"),
+            "ttft": ttft or None,
+            "tok": (ot / d_api) if (ot and d_api) else None,
+            "ctx": total_in + ot, "win": win or 200000,
+            "hit": (cr / total_in) if total_in else None}
+
+
+def _hud_base(hist: list) -> dict:
+    """基线=剔除最近 3 回合后的非冷启动样本中位数（抗单回合抖动；最多前 20）。
+    样本不足返回 {}（相对判定自动关闭，只剩绝对底线）。"""
+    samples = [h for h in hist[:-3] if not h.get("cold")][-20:]
+    if len(samples) < _HUD_BASE_MIN:
+        return {}
+
+    def _med(key: str):
+        vals = sorted(h[key] for h in samples if h.get(key) is not None)
+        return vals[len(vals) // 2] if vals else None
+
+    return {"ttft": _med("ttft"), "tok": _med("tok")}
+
+
+def _hud_level(cur: dict, base: dict):
+    """健康色（header 模板色）+ 告警行文案。返回 (level, [行])。"""
+    warns: list = []
+    red = yellow = False
+    ratio = (cur.get("ctx") or 0) / (cur.get("win") or 200000)
+    if ratio >= 0.8:
+        warns.append("上下文接近上限 → 建议 /compact 或 /new")
+        red = True
+    elif ratio >= 0.6:
+        warns.append("上下文偏大 → 建议 /compact")
+        yellow = True
+    ttft, tok = cur.get("ttft"), cur.get("tok")
+    if ttft and ttft > 8:
+        warns.append(f"首响应过慢（{ttft:.0f}s）")
+        red = True
+    if tok is not None and tok < 10:
+        warns.append(f"生成速度过低（{tok:.0f} tok/s）")
+        red = True
+    if base:
+        # 相对劣化：区分类型（首响慢+吞吐正常=上下文冷读特征→compact 有用；
+        # 吞吐也掉=网络/负载→压缩无用，别乱建议）
+        if ttft and base.get("ttft") and ttft > base["ttft"] * 1.5:
+            warns.append(f"首响比基线慢（{ttft:.1f}s vs {base['ttft']:.1f}s）→ "
+                         "上下文过大特征，建议 /compact")
+            yellow = True
+        if tok and base.get("tok") and tok < base["tok"] * 0.6:
+            warns.append(f"吞吐比基线低（{tok:.0f} vs {base['tok']:.0f} tok/s）→ "
+                         "网络/负载问题，压缩无帮助")
+            yellow = True
+    return ("red" if red else "yellow" if yellow else "green"), warns
+
+
+def _hud_card(chat_id: str, sid: str) -> dict:
+    """HUD 卡构造：单列 markdown 四行内（移动端窄屏友好——多列组件窄屏会
+    堆叠变长，刻意全单列）。空会话给空态卡，开了 HUD 就有形。"""
+    label = _chat_label(chat_id) or (sid[:8] if sid else "未绑定")
+    with _hud_lock:
+        hist = list(_hud_hist.get(sid) or [])
+    if not hist:
+        md = ("*等待回合数据——本会话下一个回合结束后开始记录。*\n"
+              "*回合计入基线后启用劣化判定（前 5 个正常回合） · /hud off 关闭*")
+        return {"schema": "2.0",
+                "header": {"title": {"tag": "plain_text",
+                                     "content": f"🩺 会话监控 · {label}"},
+                           "template": "blue"},
+                "body": {"elements": [{"tag": "markdown", "content": md}]}}
+    cur = hist[-1]
+    base = _hud_base(hist)
+    level, warns = _hud_level(cur, base)
+    lines = [f"**Context {cur['ctx'] / cur['win']:.0%}** · "
+             f"{cur['ctx'] / 1000:.0f}k / {cur['win'] // 1000}k"]
+    if cur.get("hit") is not None:
+        lines[0] += f" · 缓存 {cur['hit']:.0%}"
+
+    def _v(cur_v, base_v, fmt):
+        s = fmt(cur_v) if cur_v is not None else "—"
+        return s + (f"（基线 {fmt(base_v)}）" if base_v else "")
+
+    lines.append(f"首响 {_v(cur.get('ttft'), base.get('ttft'), lambda x: f'{x:.1f}s')}"
+                 f" · 吞吐 {_v(cur.get('tok'), base.get('tok'), lambda x: f'{x:.0f} tok/s')}")
+    if not base:
+        lines.append("基线采集中（前 5 个正常回合后启用劣化判定）")
+    for w in warns:
+        lines.append(f"⚠️ {w}")
+    ts = datetime.fromtimestamp(cur["ts"]).strftime("%m-%d %H:%M")
+    lines.append(f"*{ts} 更新 · /hud off 关闭*")
+    return {"schema": "2.0",
+            "header": {"title": {"tag": "plain_text",
+                                 "content": f"🩺 会话监控 · {label}"},
+                       "template": level},
+            "body": {"elements": [{"tag": "markdown", "content": "\n".join(lines)}]}}
+
+
+def _hud_rebuild(chat_id: str) -> None:
+    """/hud on 与自动重建共用：发卡 → pin → 记 message_id 持久化。全链路静默。"""
+    try:
+        sid = _lookup_session(chat_id) or ""
+        mid = _send_card(chat_id, _hud_card(chat_id, sid))
+        if not mid:
+            return
+        try:
+            api.im.v1.pin.create(
+                CreatePinRequest.builder().request_body(
+                    CreatePinRequestBody.builder().message_id(mid).build()).build())
+        except Exception as e:
+            log(f"[HUD置顶失败] {e!r}（卡片仍发在聊天区）")
+        with _hud_lock:
+            _hud[chat_id] = mid
+            _hud_fail[chat_id] = 0
+            _hud_save()
+    except Exception as e:
+        log(f"[HUD重建异常] {e!r}")
+
+
+def _hud_patch(chat_id: str) -> None:
+    """刷新 HUD 卡（每回合一次的频率，远离频控红线）。失败状态翻转制 log：
+    连续 2 次失败判卡被删，自动重建恢复置顶。"""
+    with _hud_lock:
+        mid = _hud.get(chat_id)
+    if not mid:
+        return
+    try:
+        sid = _lookup_session(chat_id) or ""
+        req = PatchMessageRequest.builder() \
+            .message_id(mid) \
+            .request_body(PatchMessageRequestBody.builder()
+                           .content(json.dumps(_hud_card(chat_id, sid),
+                                              ensure_ascii=False))
+                           .build()) \
+            .build()
+        resp = api.im.v1.message.patch(req)
+        if resp.success():
+            if _hud_fail.get(chat_id):
+                log("[HUD] 已自动续上（刷新恢复）")
+            _hud_fail[chat_id] = 0
+        else:
+            n = _hud_fail.get(chat_id, 0) + 1
+            _hud_fail[chat_id] = n
+            log(f"[HUD刷新失败] 第 {n} 次 code={resp.code} msg={resp.msg}")
+            if n >= 2:
+                _hud_rebuild(chat_id)
+    except Exception as e:
+        log(f"[HUD刷新异常] {e!r}")
+
+
+def _hud_record(chat_id: str, slot: dict, result: dict) -> None:
+    """回合收尾记录指标并触发 HUD 刷新（异步 patch 不阻塞回执）。
+    首个 result 后置 hud_seen：此后回合为"热"样本进基线。"""
+    try:
+        m = _hud_metrics_from_result(result, slot)
+        slot["hud_seen"] = True
+        sid = slot.get("sid") or chat_id
+        with _hud_lock:
+            hist = _hud_hist.setdefault(sid, [])
+            hist.append(m)
+            del hist[:-_HUD_HIST_KEEP]
+        if chat_id in _hud:
+            threading.Thread(target=_hud_patch, args=(chat_id,),
+                             daemon=True).start()
+    except Exception as e:
+        log(f"[HUD记录异常] {e!r}")
+
+
 # ---------------- Provider 供应商切换（cc-switch 库：额度耗尽时飞书直接换 key） ----------------
 CCSWITCH_DIR = Path.home() / ".cc-switch"
 CCSWITCH_DB = CCSWITCH_DIR / "cc-switch.db"
@@ -3090,7 +3318,8 @@ def _switch_provider(chat_id: str, arg: str) -> None:
 COMMANDS = ["/help", "/new", "/exit", "/stop", "/status", "/session", "/sessions",
             "/takeover", "/peek", "/observe", "/unobserve", "/unqueue", "/rename",
             "/cwd", "/file", "/mode", "/model", "/mute", "/unmute", "/quiet", "/unquiet",
-            "/listen", "/provider", "/handover", "/compact", "/roster", "/qa"]
+            "/listen", "/provider", "/handover", "/compact", "/roster", "/qa",
+            "/hud"]
 
 
 def _expand_cmd(text: str):
@@ -3676,6 +3905,44 @@ def handle_command(chat_id: str, text: str) -> None:
                     _qa_cache[chat_id] = {"items": items, "ts": time.time()}
                 if _send_card(chat_id, _qa_card(items, a)) is None:
                     send_markdown(chat_id, "\n".join(_qa_lines(items, a)))
+    elif cmd == "/hud":
+        a = arg.strip().lower()
+        if a == "off":
+            with _hud_lock:
+                mid = _hud.pop(chat_id, None)
+                _hud_fail.pop(chat_id, None)
+                _hud_save()
+            if mid:
+                # 撤 pin + 删卡（聊天区不留尸体）；API 失败也当关了——状态已清，
+                # 下次 /hud on 重新发新卡，不依赖这条旧消息
+                try:
+                    api.im.v1.pin.delete(
+                        DeletePinRequest.builder().message_id(mid).build())
+                    api.im.v1.message.delete(
+                        DeleteMessageRequest.builder().message_id(mid).build())
+                except Exception as e:
+                    log(f"[HUD关闭清理异常] {e!r}")
+            send_text(chat_id, "🔕 HUD 已关闭（置顶卡已撤）。/hud 重新开启。")
+        else:
+            # /hud 或 /hud on：无卡发卡+置顶；有卡立即刷新一次
+            with _hud_lock:
+                mid = _hud.get(chat_id)
+            if mid:
+                threading.Thread(target=_hud_patch, args=(chat_id,),
+                                 daemon=True).start()
+                send_text(chat_id, "🩺 HUD 已在置顶（刷新一下）。/hud off 关闭。")
+            else:
+                _hud_rebuild(chat_id)
+                with _hud_lock:
+                    on = chat_id in _hud
+                if on:
+                    send_text(chat_id, "🩺 HUD 已开启：置顶区常驻会话监控卡\n"
+                                       "· Context 占用 / 缓存命中 / 首响 / 吞吐（带基线）\n"
+                                       "· 劣化自动变黄红并给建议（/compact 等）\n"
+                                       "· 回合结束自动刷新，机器人重启自动接上\n"
+                                       "· /hud off 关闭")
+                else:
+                    send_text(chat_id, "❌ HUD 卡片发送失败，稍后再试 /hud。")
     elif cmd == "/mute":
         try:
             (STATE_DIR / "mute.flag").write_text(
