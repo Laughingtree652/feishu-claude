@@ -2860,10 +2860,11 @@ def _qa_answer(tp: str, q_uuid: str) -> str:
 # "开局就慢基线也慢"；新起进程首回合冷启动巨慢（实测 haiku 首回合 ttft 20s）
 # 不进基线。更新节奏=回合级（_finish_turn 一次），不碰 230020 频控红线。
 HUD_FILE = STATE_DIR / "hud.json"
+HUD_HIST_FILE = STATE_DIR / "hud_hist.json"   # 指标历史（跨重启——持续记录+展示层模型，11-13 用户定调）
 _hud_lock = threading.Lock()
 _hud: dict = {}          # chat_id -> 卡片 message_id（/hud on 的生命周期，重启后接上原卡继续 patch）
 _hud_fail: dict = {}     # chat_id -> 连续刷新失败计数（≥2 判卡被删，自动重建恢复置顶）
-_hud_hist: dict = {}     # sid -> [回合指标 dict]（最新在后，重启即弃——基线重新采）
+_hud_hist: dict = {}     # sid -> [回合指标 dict]（最新在后，每回合写盘跨重启接基线）
 _HUD_HIST_KEEP = 24      # 每会话保留回合数（基线最多前 20 + 当前 + 裕量）
 _HUD_BASE_MIN = 5        # 基线最少非冷启动样本（不足显示"采集中"，只做绝对判定）
 if HUD_FILE.exists():
@@ -2871,6 +2872,22 @@ if HUD_FILE.exists():
         _hud = json.loads(HUD_FILE.read_text("utf-8"))
     except Exception:
         _hud = {}
+if HUD_HIST_FILE.exists():
+    try:
+        loaded = json.loads(HUD_HIST_FILE.read_text("utf-8"))
+        if isinstance(loaded, dict):
+            _hud_hist = {k: v[-_HUD_HIST_KEEP:] for k, v in loaded.items()
+                         if isinstance(v, list)}
+    except Exception:
+        _hud_hist = {}
+
+
+def _hud_hist_save() -> None:
+    """指标历史落盘（回合级频率+几 KB 体量，锁内直写可忽略）。"""
+    try:
+        HUD_HIST_FILE.write_text(json.dumps(_hud_hist, ensure_ascii=False), "utf-8")
+    except OSError:
+        pass
 
 
 def _hud_save() -> None:
@@ -2956,8 +2973,9 @@ def _hud_card(chat_id: str, sid: str) -> dict:
     with _hud_lock:
         hist = list(_hud_hist.get(sid) or [])
     if not hist:
-        md = ("*等待回合数据——本会话下一个回合结束后开始记录。*\n"
-              "*回合计入基线后启用劣化判定（前 5 个正常回合） · /hud off 关闭*")
+        md = ("*本会话还没有回合数据（从未跑过任务）。指标在后台持续记录，"
+              "下个回合起生效。*\n"
+              "*前 5 个正常回合后启用劣化判定 · /hud off 关闭*")
         return {"schema": "2.0",
                 "header": {"title": {"tag": "plain_text",
                                      "content": f"🩺 会话监控 · {label}"},
@@ -3053,6 +3071,7 @@ def _hud_record(chat_id: str, slot: dict, result: dict) -> None:
             hist = _hud_hist.setdefault(sid, [])
             hist.append(m)
             del hist[:-_HUD_HIST_KEEP]
+            _hud_hist_save()   # 跨重启接基线（11-13 用户定调：持续记录+展示层）
         if chat_id in _hud:
             threading.Thread(target=_hud_patch, args=(chat_id,),
                              daemon=True).start()
