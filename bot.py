@@ -4258,8 +4258,12 @@ def on_message(event: P2ImMessageReceiveV1) -> None:
         if msg is None:
             return
         chat_id = msg.chat_id
-        if msg.message_type not in ("text", "file", "image"):
-            send_text(chat_id, "⚠️ 目前只支持文本/文件/图片消息。")
+        if msg.message_type not in ("text", "file", "image", "merge_forward"):
+            # 拒收前留全量实样：下次遇到新类型（语音/sticker/分享卡片等）直接
+            # 有原始 content 可查，不用再猜结构（merge_forward 接入就是这么补的课）
+            log(f"[未支持消息类型] type={msg.message_type} content={msg.content}")
+            send_text(chat_id, f"⚠️ 暂不支持「{msg.message_type}」类型消息"
+                               "（已记录原始报文，可让 bot 补充支持）。")
             return
 
         sender_id = ""
@@ -4303,6 +4307,19 @@ def on_message(event: P2ImMessageReceiveV1) -> None:
                     if chat_id not in _listen:
                         return
             _ingest_message_file(chat_id, msg, sender_id)
+            return
+        if msg.message_type == "merge_forward":
+            # 合并转发聊天记录（11-14）：群聊口径同 file/image（不带 @ 机制，
+            # 仅 /listen 群响应）；原始 content 落日志校准结构，转述走 dispatch
+            # 全链路（排队/互斥/quiet/撤回记账 mid 全兼容）
+            if msg.chat_type == "group":
+                with _listen_lock:
+                    if chat_id not in _listen:
+                        return
+            log(f"[聊天记录原始报文] {msg.content}")
+            prompt = _merge_forward_to_prompt(msg.content or "")
+            dispatch_text(chat_id, prompt, sender_id=sender_id,
+                          mid=(msg.message_id or "").strip())
             return
         if msg.chat_type == "group":
             with _listen_lock:
@@ -4466,6 +4483,82 @@ def _parent_text_from_message(msg_type: str, content: str) -> str:
         t = f"[{msg_type or '未知'} 类型消息，无法摘录原文]"
     t = re.sub(r"@_user_\d+", "", t).strip()
     return t
+
+
+def _merge_forward_to_prompt(content_str: str) -> str:
+    """合并转发聊天记录（merge_forward）→ 结构化 prompt。
+
+    官方文档站 SPA 拿不到实样，结构按社区已知形态防御式解析：content 顶层
+    {"title", "list"}，list 是子消息数组（可能是 JSON 字符串形态需二次解析）；
+    每条子消息 {"sender_id"(dict或str), "create_time"(ms), "message_type", "content"}。
+    任何形态出入都走兜底（原文 JSON 进 prompt），且 on_message 分发时落原始
+    content 日志，上线重发一条即可校准真实结构。
+    """
+    try:
+        d = json.loads(content_str or "{}")
+    except json.JSONDecodeError:
+        return f"[聊天记录] 消息体解析失败，原始内容：\n{content_str}"
+    if not isinstance(d, dict):
+        return f"[聊天记录] 非常规消息体，原始内容：\n{content_str}"
+    title = str(d.get("title") or "").strip() or "（无标题）"
+    raw = d.get("list")
+    if isinstance(raw, str):   # list 字段字符串化形态（社区反馈存在）
+        try:
+            raw = json.loads(raw)
+        except json.JSONDecodeError:
+            raw = None
+    if not isinstance(raw, list):
+        return (f"[聊天记录 · {title}] 子消息列表形态不符预期（可能 bot 侧结构"
+                f"需校准），原始消息体：\n{content_str[:2000]}")
+    lines, members, order = [], {}, []
+    total = len(raw)
+    for it in raw:
+        if not isinstance(it, dict):
+            lines.append(f"· {it!r}")
+            continue
+        # 发送者聚合：同 ID 同成员序号（open_id 对 Claude 无意义，成员A/B 可读性强）
+        sid = it.get("sender_id")
+        if isinstance(sid, dict):
+            sid = sid.get("open_id") or sid.get("union_id") or json.dumps(sid, ensure_ascii=False)
+        sid = str(sid or "")
+        if sid not in members:
+            members[sid] = f"成员{chr(ord('A') + len(order))}"
+            order.append(sid)
+        who = members[sid]
+        ts = it.get("create_time")
+        hm = ""
+        try:
+            hm = datetime.fromtimestamp(int(ts) / 1000).strftime("%H:%M") + " " if int(ts) > 0 else ""
+        except (TypeError, ValueError, OSError):
+            pass
+        sub_type = str(it.get("message_type") or "")
+        sub_content = it.get("content")
+        if not isinstance(sub_content, str):
+            sub_content = json.dumps(sub_content, ensure_ascii=False) if sub_content is not None else ""
+        body = _parent_text_from_message(sub_type, sub_content)
+        if sub_type not in ("text", "post", "interactive"):
+            # 占位类型补充标注（[图片] [文件: xxx]），_parent_text_from_message 的
+            # 兜底文案是给引用回复的，聊天记录场景信息要更具体
+            try:
+                sub = json.loads(sub_content or "{}")
+            except json.JSONDecodeError:
+                sub = {}
+            if sub_type == "image":
+                body = "[图片]"
+            elif sub_type == "file":
+                body = f"[文件：{sub.get('file_name') or '未命名'}]"
+            elif sub_type == "merge_forward":
+                body = "[嵌套聊天记录]"
+            elif sub_type == "audio" or sub_type == "media":
+                body = f"[{sub_type} 语音/媒体]"
+            else:
+                body = f"[{sub_type or '未知'} 类型消息]"
+        lines.append(f"{who} {hm}{body}".strip())
+    if len(lines) > 300:   # 超长截断（子消息数上限；正常聊天记录到不了这个量）
+        lines = lines[:300] + [f"…（共 {total} 条，已截断）"]
+    return (f"[聊天记录] 用户转发了合并聊天记录「{title}」，共 {total} 条：\n"
+            + "\n".join(lines)
+            + "\n请阅读这段聊天记录（用户可能基于它提问或交代任务）。")
 
 
 def _fetch_quoted_text(message_id: str) -> str:
