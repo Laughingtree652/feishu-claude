@@ -4258,7 +4258,7 @@ def on_message(event: P2ImMessageReceiveV1) -> None:
         if msg is None:
             return
         chat_id = msg.chat_id
-        if msg.message_type not in ("text", "file", "image", "merge_forward"):
+        if msg.message_type not in ("text", "post", "file", "image", "merge_forward"):
             # 拒收前留全量实样：下次遇到新类型（语音/sticker/分享卡片等）直接
             # 有原始 content 可查，不用再猜结构（merge_forward 接入就是这么补的课）
             log(f"[未支持消息类型] type={msg.message_type} content={msg.content}")
@@ -4290,7 +4290,12 @@ def on_message(event: P2ImMessageReceiveV1) -> None:
             return
 
         try:
-            text = json.loads(msg.content or "{}").get("text", "")
+            if msg.message_type == "post":
+                # 富文本消息（11-14：带格式复制粘贴进飞书会变成这个类型，
+                # 不是纯文本）——复用引用回复已有的段落抽取器拿纯文本
+                text = _parent_text_from_message("post", msg.content or "")
+            else:
+                text = json.loads(msg.content or "{}").get("text", "")
         except json.JSONDecodeError:
             return
 
@@ -4461,20 +4466,37 @@ def _parent_text_from_message(msg_type: str, content: str) -> str:
     if msg_type == "text":
         t = str(d.get("text") or "")
     elif msg_type == "post":
-        out = []
+        # 富文本：content 是段落数组（每段是一串 segment），段内不加分隔符
+        # 直接拼接（segment 的 text 字段自带必要的空格/标点邻接），段落间
+        # 用换行——11-14 实测长文档粘贴成 post 后若不分段会整篇拍成一行，
+        # 表格/列表结构全丢，Claude 读不出层次
+        lines = []
+        for para in d.get("content") or []:
+            if not isinstance(para, list):
+                continue
+            seg_texts = [seg.get("text") for seg in para
+                        if isinstance(seg, dict) and isinstance(seg.get("text"), str) and seg.get("text")]
+            line = "".join(seg_texts).strip()
+            if line:
+                lines.append(line)
+        t = "\n".join(lines)
+        if not t:
+            # content 形态不是预期的段落数组（旧 bug 兜底）：退回扁平抽取，
+            # 好歹不丢文本
+            out = []
 
-        def _walk(n):
-            if isinstance(n, dict):
-                if isinstance(n.get("text"), str) and n["text"].strip():
-                    out.append(n["text"])
-                for v in n.values():
-                    _walk(v)
-            elif isinstance(n, list):
-                for v in n:
-                    _walk(v)
+            def _walk(n):
+                if isinstance(n, dict):
+                    if isinstance(n.get("text"), str) and n["text"].strip():
+                        out.append(n["text"])
+                    for v in n.values():
+                        _walk(v)
+                elif isinstance(n, list):
+                    for v in n:
+                        _walk(v)
 
-        _walk(d)
-        t = " ".join(out)
+            _walk(d)
+            t = " ".join(out)
     elif msg_type == "interactive":
         out = []
         _card_text(d, out)
