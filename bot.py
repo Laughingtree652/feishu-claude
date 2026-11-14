@@ -72,6 +72,9 @@ _MIGRATE_FILES = [
     "handoff_requests.json", "pending_perm.json", "pending_user.json",
     "desktop_route.json", "notify_target.json", "last.json",
     "observe.json", "mute.flag", "bot.log",
+    "roster.jsonl", "qa", "boot_notice_target.json",
+    "boot_notify.ts", "boot_reason.flag", "chat_types.json",
+    "hud.json", "hud_hist.json",
 ]
 
 
@@ -1588,6 +1591,22 @@ PROGRESS_INTERVAL = 0.5                    # 刷帧间隔（秒）：0.5s/帧≈
 PROGRESS_BACKOFF = 4.0                     # 失败帧退避（秒）：ReadTimeout/频控时拉开帧距重试，
                                            # 通道恢复自动回正常节拍（11-10 判死改退避）
 
+_API_ERR_CN = {   # stdout api_retry 行的 error 字段 → 展示文案（实测 mock 500 值为 server_error）
+    "server_error": "服务器错误",
+    "rate_limit_error": "限流",
+    "overloaded_error": "过载",
+    "invalid_request_error": "请求异常",
+    "authentication_error": "认证失败",
+    "permission_error": "无权限",
+    "timeout_error": "超时",
+    "api_connection_error": "网络连接失败",
+    "api_error": "接口错误",
+}
+
+
+def _api_err_cn(err: str) -> str:
+    return _API_ERR_CN.get((err or "").strip(), err or "未知错误")
+
 
 def _progress_card(title: str, md: str) -> dict:
     """状态卡外壳（2.0 + markdown）：patch 的 content 是整卡 JSON，标题随阶段换。"""
@@ -1645,6 +1664,7 @@ def _start_progress(chat_id: str, slot: dict, note: str = "") -> None:
         return
     slot["p_stage"] = "🧠 思考中"
     slot["p_tool_n"] = 0
+    slot["p_retry_n"] = 0
     md = f"{PROGRESS_FRAMES[0]} 🧠 思考中 · 0秒"
     if note:
         md += f"\n\n{note}"
@@ -1694,8 +1714,14 @@ def _progress_loop(chat_id: str, slot: dict) -> None:
         md = f"{PROGRESS_FRAMES[i % len(PROGRESS_FRAMES)]} {stage} · {secs // 60}分{secs % 60:02d}秒"
         if slot.get("p_tool_n"):
             md += f"\n\n本轮已调用工具 {slot['p_tool_n']} 次"
+        rn = slot.get("p_retry_n") or 0
+        title = stage
+        if rn:
+            # API 重试中（11-14）：title 换重试态最醒目，正文补错误类别；恢复后自动回退
+            title = f"⚠️ API 重试×{rn}"
+            md += f"\n\n⚠️ 上游 API 报错（{_api_err_cn(slot.get('p_retry_err'))}），自动重试中 第 {rn} 次"
         # 卡片 header title 有长度限制（超长整卡被拒）：阶段标题独立截断
-        if not _patch_progress(slot, (stage[:23] + "…") if len(stage) > 24 else stage, md):
+        if not _patch_progress(slot, (title[:23] + "…") if len(title) > 24 else title, md):
             # 失败退避（11-10：判死改退避）：断网/频控期拉开帧距、线程保持活着，
             # 通道恢复自动回到正常节拍继续转——卡片不再定格成"永远思考中"
             next_t += PROGRESS_BACKOFF
@@ -1820,8 +1846,6 @@ def _spawn_claude(chat_id: str, session_id):
     )
 
 
-_rate_warn_ts: dict = {}   # 聊天 → 上次限流提醒时间（stderr 限流报错实时提醒的节流器）
-
 
 def _session_reader(chat_id: str, key: str, slot: dict) -> None:
     """长驻进程输出泵：转发回复/工具调用，逐回合汇报；进程退出时收尾并清理。"""
@@ -1830,20 +1854,10 @@ def _session_reader(chat_id: str, key: str, slot: dict) -> None:
 
     def _drain_stderr() -> None:
         for line in proc.stderr:
+            # 只收尾诊断用：重试期提醒已统一走 stdout 的 system/api_retry 事件
+            # （11-14 覆盖全部错误类别且带状态卡次数展示，stderr 关键词匹配
+            # 覆盖面窄还容易和非 quiet 聊天的 api_retry 提醒双发同一条消息）
             stderr_buf.append(line)
-            # 限流/额度类报错实时提醒：CLI 对 429 是内部退避重试，期间 stdout
-            # 没有任何事件——不盯 stderr 的话飞书侧就是一片寂静（回合正常结束
-            # 和进程退出的报错路径此前已有，这里补的是"重试挂起中"这个窗口）。
-            # 同一聊天节流 10 分钟：退避重试会反复刷同样的 warning，只提醒一次。
-            low = line.lower()
-            if any(k in low for k in ("429", "rate limit", "rate_limit", "rate-limit",
-                                      "quota", "insufficient", "balance", "credit")):
-                now = time.time()
-                if now - _rate_warn_ts.get(chat_id, 0) >= 600:
-                    _rate_warn_ts[chat_id] = now
-                    if chat_id not in _quiet:
-                        send_text(chat_id, "⚠️ 上游限流/额度报错，Claude 正在自动退避重试"
-                                           "（可能要等几分钟）。/provider 可切换供应商。")
 
     threading.Thread(target=_drain_stderr, daemon=True).start()
 
@@ -1873,7 +1887,21 @@ def _session_reader(chat_id: str, key: str, slot: dict) -> None:
                             if s is slot and k != sid:
                                 del _running[k]
                         _running.setdefault(sid, slot)
+            elif etype == "system" and evt.get("subtype") == "api_retry":
+                # API 报错自动重试（11-14 用户报障：重试期 stdout 没有任何产出型
+                # 事件，状态卡永远「思考中」；mock 实测 10 次指数退避最长能拖
+                # 3 分钟起，真实场景每次失败前还有请求耗时，能拖几十分钟）。
+                # api_retry 行只带错误类别一个字段，次数 bot 自己数；下一个
+                # assistant/stream_event 到达 = 重试成功，帧文案自动恢复。
+                slot["p_retry_n"] = slot.get("p_retry_n", 0) + 1
+                slot["p_retry_err"] = str(evt.get("error") or "")
+                if slot["p_retry_n"] == 1 and chat_id not in _quiet:
+                    extra = "，可 /provider 切换供应商" if "rate" in slot["p_retry_err"] else ""
+                    send_text(chat_id, "⚠️ 上游 API 报错（" + _api_err_cn(slot["p_retry_err"]) +
+                             "），Claude 正在自动重试（最多 10 次，可能要等几分钟" + extra + "）…")
             elif etype == "stream_event":
+                if slot.get("p_retry_n"):
+                    slot["p_retry_n"] = 0   # 增量开始流动 = 上次重试已成功
                 # 流式增量（--include-partial-messages）：只关心回复文本，
                 # thinking_delta / 工具入参增量不展示（静默诉求：思考过程不打扰）。
                 # 增量类型顺手维护 p_stage（quiet 状态卡的当前阶段；非 quiet 聊天
@@ -1891,6 +1919,8 @@ def _session_reader(chat_id: str, key: str, slot: dict) -> None:
                                 live = _LiveReply(chat_id)
                             live.feed(d["text"])
             elif etype == "assistant":
+                if slot.get("p_retry_n"):
+                    slot["p_retry_n"] = 0   # 成块响应到达 = 上次重试已成功
                 for block in (evt.get("message") or {}).get("content") or []:
                     btype = block.get("type")
                     if btype == "text" and (block.get("text") or "").strip():

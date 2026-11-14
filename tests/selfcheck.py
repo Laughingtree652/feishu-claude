@@ -76,8 +76,8 @@ gi = (ROOT / ".gitignore").read_text(encoding="utf-8")
 check(".gitignore 覆盖 data/ 与 logs/", "data/" in gi and "logs/" in gi)
 
 # ---------------- 3. 纯函数行为（ast 提取，exec 到受控命名空间） ----------------
-WANTED_FUNCS = {"_is_table_sep", "_md_tables_need_blank", "_split_chunks"}
-WANTED_ASSIGNS = {"MAX_CHUNK"}
+WANTED_FUNCS = {"_is_table_sep", "_md_tables_need_blank", "_split_chunks", "_api_err_cn"}
+WANTED_ASSIGNS = {"MAX_CHUNK", "_API_ERR_CN"}
 ns = {"os": os, "sys": sys}
 got = set()
 for node in tree.body:
@@ -118,6 +118,13 @@ if got == WANTED_FUNCS:
           all(any(ln in seg for seg in tight) for ln in text.splitlines() if ln.strip()))
     atomic = f_chunk(table, cap=400)
     check("表头与分隔行不被切开", any("| 阶段 |" in seg and "| --- |" in seg for seg in atomic))
+
+    # _api_err_cn：stdout api_retry 错误类别 → 中文（命中/保原词/空值兜底）
+    f_err = ns["_api_err_cn"]
+    check("_api_err_cn 命中映射", f_err("server_error") == "服务器错误"
+          and f_err("rate_limit_error") == "限流")
+    check("_api_err_cn 未命中保原词", f_err("weird_x") == "weird_x")
+    check("_api_err_cn 空值兜底", f_err("") == "未知错误")
 
 # ---------------- 汇总 ----------------
 print(f"\n{'=' * 46}\n{'全部通过' if not failures else '失败 ' + str(len(failures)) + ' 项: ' + '; '.join(failures)}")
