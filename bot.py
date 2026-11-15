@@ -20,6 +20,7 @@ import urllib.request
 import sys
 import threading
 import time
+import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -4765,6 +4766,32 @@ WATCH_STALE_CONN = int(os.environ.get("WATCH_STALE_CONN_SECONDS", "14400"))  # 4
 WATCH_STALE_IDLE = int(os.environ.get("WATCH_STALE_IDLE_SECONDS", "7200"))   # 2 小时
 _ws_ev = {"last": time.time()}   # 最近一次飞书 WS 推送时刻（消息/卡片动作都算）
 
+# 重连卡死判死（11-15 事故实证）：SDK 重连协程 `await self._connect()`
+# 没包超时——一次网络抽风能把这一等卡到天荒地老，当天实测卡了 80 多分钟
+# 全靠用户手动发现才重启。TCP 握手往往已 ESTABLISHED（卡在更上层的 WS
+# 升级/SDK 内部状态机），老的"零出站连接"判据完全看不出异常，4 小时/2 小时
+# 的半开判死阈值是为另一种场景（夜间切网 FIN 丢失）设计的，太长不管用。
+# 挂到 SDK 的 "Lark" logger 上纯观察重连生命周期打点：开始重连记时刻，
+# 重连成功清零；看门狗发现"正在重连"状态卡住超阈值直接判死，不等以上两条。
+RECONNECT_STUCK_SECONDS = int(os.environ.get("WS_RECONNECT_STUCK_SECONDS", "120"))
+_ws_reconnect = {"pending": False, "since": 0.0}
+
+
+class _LarkReconnectWatch(logging.Handler):
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            msg = record.getMessage()
+        except Exception:
+            return
+        if "trying to reconnect" in msg:
+            _ws_reconnect["pending"] = True
+            _ws_reconnect["since"] = time.time()
+        elif "connected to wss" in msg:
+            _ws_reconnect["pending"] = False
+
+
+logging.getLogger("Lark").addHandler(_LarkReconnectWatch())
+
 
 def _ws_watchdog() -> None:
     """WS 连接看门狗：飞书长连接首连失败/重连卡死时，bot 会"活着但聋"——
@@ -4777,7 +4804,14 @@ def _ws_watchdog() -> None:
     健康，实际永远收不到消息（11-01 事故：bot 聋了 7 小时）。判据：
     出站连接集合长时间纹丝不动 + 期间零飞书推送（on_message /
     卡片动作都会刷新 _ws_ev）→ 疑似半开，主动自杀换新连接。白天
-    有消息推送就不会触发，只在静默期兜底。"""
+    有消息推送就不会触发，只在静默期兜底。
+
+    另盯重连卡死（11-15 事故：bot 哑了 80 多分钟全靠用户手动发现）：
+    SDK 重连协程的 connect 调用没包超时，一次网络抽风能把它卡到天荒地老，
+    而 TCP 握手往往已 ESTABLISHED——"零出站连接"判据看不出异常，
+    4 小时/2 小时的半开判死阈值也等不起。靠 _LarkReconnectWatch 挂到
+    SDK logger 上纯观察重连生命周期打点，卡住超 RECONNECT_STUCK_SECONDS
+    直接判死，不等以上两条慢判据。"""
     def _exit_with_notice(reason: str) -> None:
         log(f"[WS 看门狗] {reason}，自杀待外部拉起")
         try:
@@ -4794,6 +4828,8 @@ def _ws_watchdog() -> None:
     same_since = time.time()
     while True:
         time.sleep(90)
+        if _ws_reconnect["pending"] and time.time() - _ws_reconnect["since"] > RECONNECT_STUCK_SECONDS:
+            _exit_with_notice(f"WS 重连尝试卡死超过 {RECONNECT_STUCK_SECONDS}s 未返回")
         try:
             conns = psutil.Process(os.getpid()).net_connections("tcp")
             probed = True
