@@ -4639,7 +4639,12 @@ def dispatch_text(chat_id: str, text: str, sender_id: str = "",
             pass
 
     if text.startswith("/"):
-        handle_command(chat_id, text)
+        # 命令丢线程执行（11-15 用户反馈：有时发消息要隔一会才显示收到）——
+        # dispatch_text 在 asyncio 的 WS 回调里同步执行，handle_command 内部
+        # 大量 send_text/send_markdown 是阻塞网络调用（单次最长 3 次重试×5s
+        # 超时=15s+），之前直接同步跑会堵住整条 WS 事件循环，其间飞书来的
+        # 任何消息（不论哪个聊天）都排在后面，表现为"隔一段时间才收到"。
+        threading.Thread(target=handle_command, args=(chat_id, text), daemon=True).start()
         return
 
     # !command：直通 shell（相当于桌面终端的 bash 模式），不经 Claude、不排队
@@ -4659,8 +4664,10 @@ def dispatch_text(chat_id: str, text: str, sender_id: str = "",
     if routed:
         # 回执：文字被当作对挂着的卡的答复处理了。不说一声用户会以为消息
         # 石沉大海（11-02：用户“咋样了？”被凌晨挂着的权限卡吃掉，以为 bot 又挂）
-        send_text(chat_id, f"💬 已把这条消息作为对「{entry.get('title') or '待确认卡片'}」"
-                           "的答复处理；若本意是发任务，请重发一条。")
+        # send_text 是阻塞网络调用，丢线程不占 WS 回调（同上 11-15 修复）
+        threading.Thread(target=send_text, args=(chat_id,
+            f"💬 已把这条消息作为对「{entry.get('title') or '待确认卡片'}」"
+            "的答复处理；若本意是发任务，请重发一条。"), daemon=True).start()
         return
 
     # 排队接管中：消息入队，等目标会话回合结束后由 _wait_and_drain 自动执行
@@ -4671,7 +4678,9 @@ def dispatch_text(chat_id: str, text: str, sender_id: str = "",
             queued = len(pend["queue"])
     if pend is not None:
         _recall_remember(mid, chat_id, text)   # 将作为 Claude 输入：记账（撤回可真删）
-        send_text(chat_id, f"📥 已排队（第 {queued} 条），等会话回合结束自动执行。/peek 看进度，/unqueue 取消。")
+        threading.Thread(target=send_text, args=(chat_id,
+            f"📥 已排队（第 {queued} 条），等会话回合结束自动执行。/peek 看进度，/unqueue 取消。"),
+            daemon=True).start()
         return
 
     _recall_remember(mid, chat_id, text)        # 将作为 Claude 输入：记账（撤回注入作废）
