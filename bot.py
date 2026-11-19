@@ -2935,7 +2935,16 @@ def _hud_metrics_from_result(result: dict, slot: dict) -> dict:
     cr = u.get("cache_read_input_tokens") or 0
     cc = u.get("cache_creation_input_tokens") or 0
     ot = u.get("output_tokens") or 0
+    # 网关 usage 双计防御（11-19 实测）：自定义网关（GLM）在缓存激活的回合会把
+    # 同一批 token 同时塞进 input_tokens 和 cache_read_input_tokens（两个几乎等量
+    # 并存，官方口径二者互斥——命中记 cache_read、未命中记 input）。实测 8d25974e
+    # 会话 11-16 08:43:17 单条 in=525,219 + cr=522,496，ctx 直接虚到 105 万（真实
+    # ~52.5 万），HUD 显示 Context 450% 就是这个造成的。检测特征：两字段都 >0 且
+    # 较小值/较大值 > 0.6（正常回合一个为 0 或只占零头）。命中时总量取 max 而非求和。
     total_in = inp + cr + cc
+    if inp and cr and min(inp, cr) / max(inp, cr) > 0.6:
+        total_in = max(inp, cr) + cc
+        cr = min(inp, cr)   # 命中率分子仍用较小值口径（真实命中部分）
     d_api = (result.get("duration_api_ms") or 0) / 1000
     ttft = (result.get("ttft_stream_ms") or 0) / 1000
     win = 0
