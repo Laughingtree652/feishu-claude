@@ -75,7 +75,7 @@ _MIGRATE_FILES = [
     "observe.json", "mute.flag", "bot.log",
     "roster.jsonl", "qa", "boot_notice_target.json",
     "boot_notify.ts", "boot_reason.flag", "chat_types.json",
-    "hud.json", "hud_hist.json",
+    "hud.json", "hud_hist.json", "schedules.json",
 ]
 
 
@@ -165,6 +165,7 @@ HELP_TEXT = """📖 命令列表
 /roster [项目关键字] — 花名册：查所有上过线的 Claude 窗口/分身（名字·完整ID·最近动静·桌面或飞书）
 /qa [序号|关键字] — 问答档案：当前绑定会话的提问历史（列表/过滤，/qa <序号> 重读完整回答）
 /hud [on|off] — 会话监控 HUD：置顶区常驻卡显示 Context/缓存/首响/吞吐（带基线），劣化变黄红给建议
+/schedule daily 08:30 <指令> — 定时任务：每天到点把指令注入本聊天会话（探索日报等；list/off/on/del 管理）
 /provider [序号|名称] — 查看/切换 Claude 供应商（cc-switch 库；切换即换 key，新起进程生效）
 /unqueue — 取消排队接管
 /rename [名字] — 给当前会话起名（/sessions 列表优先显示名字）
@@ -210,6 +211,7 @@ HELP_MD = """**🧩 会话管理**
 - **/roster** [项目关键字] — 花名册：所有上过线的 Claude 窗口/分身（名字·完整ID·最近动静·桌面或飞书），SessionStart hook 自动登记
 - **/qa** [序号|关键字] — 问答档案：当前绑定会话的提问历史，每回合自动记录（Stop hook）；/qa 看列表、/qa <关键字> 过滤、/qa <序号> 从转录重读完整回答
 - **/hud** [on|off] — 会话监控 HUD：置顶区常驻卡片显示 Context 占用/缓存命中/首响/吞吐（带本会话基线），劣化自动变黄红并给建议（/compact 等），回合结束自动刷新
+- **/schedule** daily 08:30 <指令> — 定时任务：每天到点把指令注入本聊天绑定的会话（探索日报等场景；/schedule list 查看，off|on 暂停恢复，del 删除）
 - **/provider** [序号|名称] — 查看/切换 Claude 供应商（cc-switch 库；切换即换 key，新起进程生效）
 - **/listen** — 群聊免 @ 模式：本群所有消息直接发给机器人（适合只有你+机器人的群）
 - **/mute · /unmute** — 暂停/恢复桌面事件推送（全局）
@@ -3119,6 +3121,171 @@ def _hud_record(chat_id: str, slot: dict, result: dict) -> None:
         log(f"[HUD记录异常] {e!r}")
 
 
+# ---------------- 定时探索任务（11-20 用户批准：探索会话定时注入指令） ----------------
+# 场景：每日例行探索（如 AI 前沿日报）——专用群绑定专用会话，调度到点把注册时
+# 存好的固定 prompt 注入该会话。会话不需保活：run_task 按需 --resume 拉起，
+# 跑完闲置回收自动收，下次到点再拉。任务定义（prompt）存调度表稳定层，
+# 追踪状态（昨天报过什么）由会话记忆承担 → prompt 写成可重复执行的模板
+# （"对比你记忆中此前的报告，只报新增"），增量日报据此成立。
+SCHEDULE_FILE = STATE_DIR / "schedules.json"
+_SCHEDULE_LOCK = threading.Lock()
+_schedules: list = []   # [{"id","chat_id","hhmm","prompt","enabled","last_run","created"}]
+_SCHEDULE_CATCHUP = 12 * 3600   # 错过触发后的补跑窗口（秒）：bot 挂了半天内重启仍补跑一次
+
+
+def _schedule_load() -> None:
+    global _schedules
+    try:
+        d = json.loads(SCHEDULE_FILE.read_text("utf-8"))
+        _schedules = d if isinstance(d, list) else []
+    except (OSError, json.JSONDecodeError):
+        _schedules = []
+
+
+def _schedule_save() -> None:
+    try:
+        SCHEDULE_FILE.write_text(json.dumps(_schedules, ensure_ascii=False), "utf-8")
+    except OSError:
+        pass
+
+
+def _schedule_due(row: dict, now: datetime) -> bool:
+    """今天到点未跑（补跑窗口内）→ True。last_run 记日期，一天最多一跑。"""
+    if not row.get("enabled", True):
+        return False
+    try:
+        h, m = (int(x) for x in str(row.get("hhmm") or "").split(":"))
+        if not (0 <= h < 24 and 0 <= m < 60):
+            return False
+    except ValueError:
+        return False
+    fire = now.replace(hour=h, minute=m, second=0, microsecond=0)
+    if fire > now:
+        return False
+    if row.get("last_run") == now.strftime("%Y-%m-%d"):
+        return False
+    if (now - fire).total_seconds() > _SCHEDULE_CATCHUP:
+        return False   # 错过太久（bot 挂了一整天），今天不补，等明天
+    return True
+
+
+def _schedule_tick() -> None:
+    """单轮调度检查（线程循环逐次调用；先记 last_run 后执行防异常重入）。"""
+    now = datetime.now()
+    with _SCHEDULE_LOCK:
+        due = []
+        for row in _schedules:
+            if _schedule_due(row, now):
+                row["last_run"] = now.strftime("%Y-%m-%d")
+                due.append(dict(row))
+        if due:
+            _schedule_save()
+    for row in due:
+        label = _chat_label(row["chat_id"]) or (row["chat_id"] or "?")[-6:]
+        log(f"[定时触发] {label} {row['hhmm']}「{row['prompt'][:40]}…」")
+        if row["chat_id"] not in _quiet:
+            send_text(row["chat_id"], f"⏰ 定时任务触发（{row['hhmm']}），开始执行…")
+        run_task(row["chat_id"], row["prompt"])
+
+
+def _schedule_loop() -> None:
+    while True:
+        try:
+            _schedule_tick()
+        except Exception as e:
+            log(f"[调度线程异常] {e!r}")
+        time.sleep(30)
+
+
+def _schedule_cmd(chat_id: str, arg: str) -> None:
+    """/schedule 命令入口（独立函数便于单测打桩）。
+    注册：/schedule daily 08:30 <prompt>；管理：list / del <id> / off|on <id>。"""
+    parts2 = arg.split(None, 2)
+    sub = parts2[0].lower() if parts2 else ""
+    if sub in ("daily", "add"):
+        if len(parts2) < 3 or ":" not in parts2[1]:
+            send_text(chat_id, "用法：/schedule daily 08:30 <探索指令>\n\n"
+                               "到点后每天把这段指令注入本聊天绑定的会话（--resume 跨次"
+                               "续接，会话记得此前跑过什么）。建议把指令写成可重复执行"
+                               "的模板，如「搜索过去24小时 AI 领域前沿动态，整理成不超过"
+                               "10 条的日报，对比你记忆中此前的报告只报新增」。")
+            return
+        hhmm, prompt = parts2[1], parts2[2].strip()
+        try:
+            h, m = (int(x) for x in hhmm.split(":"))
+            if not (0 <= h < 24 and 0 <= m < 60):
+                raise ValueError
+        except ValueError:
+            send_text(chat_id, f"❌ 时间格式不对：{hhmm}（应为 HH:MM，如 08:30）")
+            return
+        if not prompt:
+            send_text(chat_id, "❌ 缺少探索指令（prompt 不能为空）。")
+            return
+        with _SCHEDULE_LOCK:
+            sid = max((int(r.get("id") or 0) for r in _schedules), default=0) + 1
+            row = {"id": sid, "chat_id": chat_id, "hhmm": f"{h:02d}:{m:02d}",
+                   "prompt": prompt, "enabled": True, "last_run": "",
+                   "created": time.time()}
+            _schedules.append(row)
+            _schedule_save()
+        send_text(chat_id, f"⏰ 定时任务 #{sid} 已注册：每天 {hhmm}\n"
+                           f"「{prompt[:60]}{'…' if len(prompt) > 60 else ''}」\n"
+                           "· 注入本聊天绑定的会话（到点自动 --resume 拉起，跑完自动回收）\n"
+                           "· /schedule list 查看 · /schedule off " + str(sid) + " 暂停 · /schedule del " + str(sid) + " 删除")
+    elif sub in ("list", ""):
+        with _SCHEDULE_LOCK:
+            rows = list(_schedules)
+        if not rows:
+            send_text(chat_id, "还没有定时任务。注册：/schedule daily 08:30 <探索指令>")
+            return
+        lines = []
+        for r in rows:
+            mark = "✅" if r.get("enabled", True) else "⏸"
+            here = "（本聊天）" if r["chat_id"] == chat_id else ""
+            label = (_chat_label(r["chat_id"]) or (r["chat_id"] or "?")[-6:]) + here
+            last = r.get("last_run") or "从未"
+            pv = r["prompt"][:36] + ("…" if len(r["prompt"]) > 36 else "")
+            lines.append(f"{mark} #{r['id']} 每天 {r['hhmm']} → {label}｜上次 {last}\n"
+                         f"    {pv}")
+        send_text(chat_id, "⏰ 定时任务（共 %d 条）\n\n%s\n\n"
+                           "管理：/schedule off|on|del <序号>" % (len(rows), "\n".join(lines)))
+    elif sub in ("del", "rm"):
+        try:
+            tid = int(parts2[1])
+        except (IndexError, ValueError):
+            send_text(chat_id, "用法：/schedule del <序号>")
+            return
+        with _SCHEDULE_LOCK:
+            hit = next((r for r in _schedules if r.get("id") == tid), None)
+            if hit:
+                _schedules.remove(hit)
+                _schedule_save()
+        if hit:
+            send_text(chat_id, f"🗑 定时任务 #{tid} 已删除。")
+        else:
+            send_text(chat_id, f"❌ 没有找到 #{tid}（/schedule list 查看序号）。")
+    elif sub in ("off", "on"):
+        try:
+            tid = int(parts2[1])
+        except (IndexError, ValueError):
+            send_text(chat_id, f"用法：/schedule {sub} <序号>")
+            return
+        with _SCHEDULE_LOCK:
+            hit = next((r for r in _schedules if r.get("id") == tid), None)
+            if hit:
+                hit["enabled"] = (sub == "on")
+                _schedule_save()
+        if hit:
+            send_text(chat_id, f"{'▶️ 已恢复' if sub == 'on' else '⏸ 已暂停'} 定时任务 #{tid}"
+                               f"（每天 {hit['hhmm']}）。")
+        else:
+            send_text(chat_id, f"❌ 没有找到 #{tid}（/schedule list 查看序号）。")
+    else:
+        send_text(chat_id, "用法：/schedule daily 08:30 <探索指令>  注册\n"
+                           "　　　/schedule list  列表　/schedule off|on <序号>  暂停/恢复\n"
+                           "　　　/schedule del <序号>  删除")
+
+
 # ---------------- 飞书文件接收（11-12 用户批准：发文件→bot 下载→Claude 读取分析） ----------------
 # 旧口径 on_message 只认 text（其余拒收），用户实际需要发 md/pdf/doc/docx/txt/图片
 # 让 Claude 读取分析。技术链路（SDK 现成）：WS file/image 事件 content 带 file_key/
@@ -3522,7 +3689,7 @@ COMMANDS = ["/help", "/new", "/exit", "/stop", "/status", "/session", "/sessions
             "/takeover", "/peek", "/observe", "/unobserve", "/unqueue", "/rename",
             "/cwd", "/file", "/mode", "/model", "/mute", "/unmute", "/quiet", "/unquiet",
             "/listen", "/provider", "/handover", "/compact", "/roster", "/qa",
-            "/hud"]
+            "/hud", "/schedule"]
 
 
 def _expand_cmd(text: str):
@@ -4073,6 +4240,8 @@ def handle_command(chat_id: str, text: str) -> None:
         # 卡片优先（结构化整洁），发卡失败降级 markdown 文本、内容不丢
         if _send_card(chat_id, _roster_card(20, arg.strip())) is None:
             send_markdown(chat_id, "\n".join(_roster_lines(20, arg.strip())))
+    elif cmd == "/schedule":
+        _schedule_cmd(chat_id, arg)
     elif cmd == "/qa":
         a = arg.strip()
         # 只对当前绑定会话生效（11-08 用户要求）：没绑定直接引导
@@ -5043,6 +5212,8 @@ def main() -> None:
     threading.Thread(target=_perm_server, daemon=True).start()
     if psutil:
         threading.Thread(target=_ws_watchdog, daemon=True).start()
+    _schedule_load()   # 定时任务（持久化调度表，重启不丢；错过的在补跑窗口内补一次）
+    threading.Thread(target=_schedule_loop, daemon=True).start()
     print("   等待消息中…（Ctrl+C 退出）")
     _boot_notice()   # 重启完成通知（后台延时发私聊，只报一声，不影响主流程）
     ws.start()  # 阻塞，断线自动重连
