@@ -1496,6 +1496,9 @@ def _write_to_session(slot: dict, text: str) -> bool:
         slot["last_event"] = time.time()
         slot["turn_start"] = time.time()
         slot["in_turn"] = True
+        # 新消息清上一回合的末文本块（_finish_turn 兜底用）：本回合的回复只会
+        # 出现在这条消息之后的 assistant 块里，不清会把旧回合答案重发一遍
+        slot["last_text_block"] = ""
         return True
     except (BrokenPipeError, OSError, ValueError):
         return False
@@ -1928,6 +1931,7 @@ def _session_reader(chat_id: str, key: str, slot: dict) -> None:
                     btype = block.get("type")
                     if btype == "text" and (block.get("text") or "").strip():
                         final = block["text"].strip()
+                        slot["last_text_block"] = final   # _finish_turn 的兜底（见其注释）
                         if live is not None:
                             # 流式卡片收尾定格（超长续卡 / 通道失败降级都在里面）
                             if not live.close(final):
@@ -2009,7 +2013,13 @@ def _session_reader(chat_id: str, key: str, slot: dict) -> None:
 
 def _finish_turn(chat_id: str, result: dict, last_text: str, slot: dict) -> None:
     """单个回合结束的汇报（长驻进程里每条消息各有一个 result 事件）。"""
-    final_text = (result.get("result") or "").strip()
+    # result.result 兜底（11-23 实证）：GLM 网关组合下 result 事件的 result 字段
+    # 恒为空（8095050d 会话 10/10 回合验证）——quiet 聊天的回复唯一出口就是这个
+    # 字段，恒空导致「思考很久只收到✅完成通知、答案永远不发」的报障。兜底取
+    # reader 记录的本回合最后一个 assistant 文本块；非 quiet 时它与 last_sent
+    # 相同会被下方去重跳过，不会双发。旧消息写入时已清零，无跨回合串答案风险。
+    final_text = ((result.get("result") or "").strip()
+                  or (slot.pop("last_text_block", "") or "").strip())
     if final_text and final_text != last_text:
         # markdown 卡片渲染（飞书 text 消息不渲染 markdown——quiet 结果此前原样
         # 显示标记）。非 quiet 的正常路径 last_sent=final_text 会跳过这里
