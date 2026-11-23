@@ -1499,6 +1499,9 @@ def _write_to_session(slot: dict, text: str) -> bool:
         # 新消息清上一回合的末文本块（_finish_turn 兜底用）：本回合的回复只会
         # 出现在这条消息之后的 assistant 块里，不清会把旧回合答案重发一遍
         slot["last_text_block"] = ""
+        # 同理清上一回合的末次 usage（HUD 上下文数据源）：回合零 assistant 事件的
+        # 边缘路径（起手就报错）退回 result.usage，宁可少记不记错的
+        slot["last_usage"] = None
         return True
     except (BrokenPipeError, OSError, ValueError):
         return False
@@ -1927,6 +1930,12 @@ def _session_reader(chat_id: str, key: str, slot: dict) -> None:
             elif etype == "assistant":
                 if slot.get("p_retry_n"):
                     slot["p_retry_n"] = 0   # 成块响应到达 = 上次重试已成功
+                # HUD 上下文数据源（11-23）：每个 assistant 事件带本次 API 调用的
+                # usage，回合内最后一个 = 回合末真实上下文。result.usage 是整回合
+                # 累计值不可用（见 _hud_metrics_from_result 注释）。
+                mu = (evt.get("message") or {}).get("usage")
+                if isinstance(mu, dict) and mu.get("input_tokens") is not None:
+                    slot["last_usage"] = mu
                 for block in (evt.get("message") or {}).get("content") or []:
                     btype = block.get("type")
                     if btype == "text" and (block.get("text") or "").strip():
@@ -2942,7 +2951,15 @@ def _hud_save() -> None:
 
 def _hud_metrics_from_result(result: dict, slot: dict) -> dict:
     """从 result 事件抽本回合指标（字段缺失容错为 None，展示端打 '—'）。"""
-    u = result.get("usage") or {}
+    # 上下文取数源（11-23 定谳）：result.usage 是整回合所有 API 调用的**累计值**
+    # ——长回合 100+ 次调用 × 每次 ~80 万 cache_read，HUD 曾记出 7991%/7900 万的
+    # 荒谬值（2e0557f8 11-23 18:58 实证；同日最后一条 assistant usage 同回合只有
+    # in=410+cr=803,072 的健康值=真实上下文）。回合末上下文的正确数据源是
+    # reader 记录的最后一个 assistant 响应 usage（slot["last_usage"]，写入新消息
+    # 时清零）；没有时才退回 result.usage（单调用回合两者相同，多调用回合退回值
+    # 会偏大——聊胜于无）。
+    u = (slot.get("last_usage") if isinstance(slot.get("last_usage"), dict) else None) \
+        or result.get("usage") or {}
     inp = u.get("input_tokens") or 0
     cr = u.get("cache_read_input_tokens") or 0
     cc = u.get("cache_creation_input_tokens") or 0
@@ -2965,10 +2982,16 @@ def _hud_metrics_from_result(result: dict, slot: dict) -> dict:
             win = max(win, int(v.get("contextWindow") or 0))
         except (TypeError, ValueError):
             pass
+    win = win or 200000
+    # 物理上限钳制（兜底）：真实上下文不可能超过窗口（输入超窗直接被 API 拒绝）。
+    # 双计/累计两种污染形态修掉后仍超窗（网关对 last_usage 也撒谎的极端情况），
+    # 钳到窗口值——显示 100% 满窗，至少不再出现 7991% 这种荒谬读数。
+    if total_in > win:
+        total_in = win
     return {"ts": time.time(), "cold": not slot.get("hud_seen"),
             "ttft": ttft or None,
             "tok": (ot / d_api) if (ot and d_api) else None,
-            "ctx": total_in + ot, "win": win or 200000,
+            "ctx": total_in + ot, "win": win,
             "hit": (cr / total_in) if total_in else None}
 
 
