@@ -3185,7 +3185,14 @@ def _schedule_tick() -> None:
         log(f"[定时触发] {label} {row['hhmm']}「{row['prompt'][:40]}…」")
         if row["chat_id"] not in _quiet:
             send_text(row["chat_id"], f"⏰ 定时任务触发（{row['hhmm']}），开始执行…")
-        run_task(row["chat_id"], row["prompt"])
+        # 上下文包裹（11-23 实证教训：prompt 里的「每天」会被模型理解成自己该建
+        # 定时器——探索会话实测模型自调 CronCreate 建了每日 00:07 的 durable 任务，
+        # 与 bot 调度重复且会污染同项目其他会话）。注入时明说外部调度器的存在。
+        prompt = ("[定时任务例行触发（{}）——本指令由飞书机器人的外部调度器每天自动注入，"
+                  "你不需要也不应该使用 CronCreate/ScheduleWakeup 等工具给自己创建任何"
+                  "定时任务，明天到点外部调度器会再次注入本指令。直接执行即可。]\n\n{}"
+                  ).format(row["hhmm"], row["prompt"])
+        run_task(row["chat_id"], prompt)
 
 
 def _schedule_loop() -> None:
