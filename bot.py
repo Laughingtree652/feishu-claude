@@ -634,6 +634,60 @@ def kill_task(proc: subprocess.Popen) -> None:
         pass
 
 
+def _kill_orphan_children() -> int:
+    """启动自愈：清理上一轮 bot 进程遗留的孤儿 claude 子进程（11-24 实证事故）。
+
+    bot 自杀/被外部重启（看门狗判死、restart.ps1）只杀 bot.py 自己，不碰它
+    spawn 出去的 cmd.exe→claude.exe 子进程树——Windows 不会因为父进程死了就
+    带走子进程。新 bot.py 的 _running 是纯内存字典，重启即空，对这些孤儿一无
+    所知；下条消息一来就对同一 sid 又 spawn 一个新进程，两个进程同时写同一份
+    转录（实测会话 8095050d：孤儿 21:49:58 起，bot 02:22 自杀/02:24 重启，
+    次日 09:34 用户发消息又起一个新进程，/takeover 探测到"正在运行"弹出接管
+    选择卡——这就是用户看到的"同时出了两个会话"）。而且孤儿的输出没有任何
+    读泵在消费（老读泵线程跟着老 bot.py 一起死了）——它干什么、算出什么结果
+    都传不到飞书，纯占资源占会话文件的"运行中"锁，继续活着零价值只有风险，
+    杀掉是唯一正确选择。
+
+    识别依据：_spawn_claude 给子进程环境变量打了 FEISHU_BOT_CHILD=1 标记——
+    本函数在自己 spawn 任何子进程之前运行，所以扫到的全部是上一轮的遗留。
+    psutil 不可用时跳过（纯时间判定场景没有这个能力，静默降级）。
+    """
+    if psutil is None:
+        return 0
+    candidates = []
+    for p in psutil.process_iter(["pid", "name"]):
+        name = (p.info.get("name") or "").lower()
+        if name not in ("cmd.exe", "claude.exe", "node.exe"):
+            continue
+        try:
+            env = p.environ()
+        except (psutil.AccessDenied, psutil.NoSuchProcess, OSError):
+            continue
+        if env.get("FEISHU_BOT_CHILD") == "1":
+            candidates.append(p)
+    if not candidates:
+        return 0
+    cand_pids = {p.pid for p in candidates}
+    killed = 0
+    for p in candidates:
+        try:
+            if p.ppid() in cand_pids:
+                continue   # 非树根：/T 整树杀会连带处理，跳过避免重复 taskkill
+        except (psutil.NoSuchProcess, OSError):
+            continue
+        try:
+            chat = p.environ().get("FEISHU_CHAT_ID", "?")
+        except Exception:
+            chat = "?"
+        try:
+            subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"], capture_output=True)
+            killed += 1
+            log(f"[启动自愈] 清理孤儿进程树 PID={p.pid} chat={chat[-6:] if chat != '?' else '?'}")
+        except Exception as e:
+            log(f"[启动自愈] 清理孤儿进程失败 PID={p.pid}: {e!r}")
+    return killed
+
+
 def _active_child_count(proc: subprocess.Popen) -> int:
     """数 claude 驻留进程名下还在跑的工具子进程（后台编译/巡检之类）。
 
@@ -5194,6 +5248,13 @@ def main() -> None:
         log(f"[智能回收] psutil {psutil.__version__} 已加载（闲置回收前检查活跃子进程）")
     else:
         log("[智能回收] psutil 未安装，退回纯时间判定（请跑 uv sync 安装依赖）")
+
+    # 启动自愈：清理上一轮遗留的孤儿 claude 子进程（见 _kill_orphan_children 注释；
+    # 11-24 实证——不清会被下条消息触发同一会话双进程并发写转录）。必须在 ws.start()
+    # 之前、本轮任何 _spawn_claude 之前执行，否则会误杀自己刚起的子进程。
+    orphans = _kill_orphan_children()
+    if orphans:
+        log(f"[启动自愈] 共清理 {orphans} 个孤儿进程树")
 
     # 启动自愈：清理旧版遗留的「同一会话绑多个聊天」脏状态（会话独占规则，
     # 运行期由 _bind_session 的抢占维持）。保留 updated 最新的绑定，其余解绑并通知。
