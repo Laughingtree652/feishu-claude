@@ -152,14 +152,24 @@ def tool_create_task(args: dict) -> dict:
     if not summary:
         return {"error": "summary 不能为空（一句话任务名）"}
     chat_id = os.environ.get("FEISHU_CHAT_ID", "")
+    # 来源标识（11-24 用户定调「来源具体到群聊」）：群聊名优先（bot 注入
+    # FEISHU_CHAT_NAME，im.v1.chat.get 实测通），单聊/查询失败退回会话标签。
+    # 标题带群名=任务中心列表一眼认群；描述首行带「群名｜项目·会话」双定位。
+    chat_name = os.environ.get("FEISHU_CHAT_NAME", "").strip()
     label = os.environ.get("FEISHU_CHAT_LABEL", "").strip()
-    full_summary = f"[{label}] {summary}" if label else summary
+    origin_tag = chat_name or label.strip("[]") or "飞书机器人会话"
+    full_summary = f"[{origin_tag}] {summary}"
     cfg = _cfg()
     uid = (cfg.get("ALLOWED_USERS", "").split(",")[0] or "").strip()
+    # 描述首行自动带来源（11-24 定谳）：origin.refer_resources 第三方写入无效
+    # （t100003 实测服务端不采纳），UI「来源」区靠不传 origin 让飞书自动标
+    # 「来自 Claude Bot」应用身份；群聊级溯源=标题群名+描述首行双定位。
     desc = (args.get("description") or "").strip()
+    head = f"来源：{origin_tag}" + (f"｜{label}" if label and label.strip("[]") != origin_tag else "")
+    desc = f"{head}\n\n{desc}" if desc else f"{head}（任务进行中，进展见下方时间线）"
     body = (InputTask.builder()
             .summary(full_summary[:200])
-            .description(desc or "（任务进行中，进展见下方时间线）")
+            .description(desc)
             .members([Member.builder().id(uid).type("user").role("assignee").build()] if uid else None)
             .build())
     req = (CreateTaskRequest.builder()

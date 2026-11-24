@@ -47,6 +47,7 @@ from lark_oapi.api.im.v1 import (
     DeletePinRequest,
     DeleteMessageRequest,
     GetMessageResourceRequest,
+    GetChatRequest,
 )
 from dotenv import load_dotenv
 
@@ -76,6 +77,7 @@ _MIGRATE_FILES = [
     "roster.jsonl", "qa", "boot_notice_target.json",
     "boot_notify.ts", "boot_reason.flag", "chat_types.json",
     "hud.json", "hud_hist.json", "schedules.json", "agent_tasks",
+    "chat_names.json",
 ]
 
 
@@ -415,6 +417,41 @@ def _chat_label(chat_id: str) -> str:
     proj = Path(sess.get("work_dir") or str(WORK_DIR)).name
     tag = _names.get(sid) or (sid[:8] + "…")
     return f"[{proj}·{tag}]"
+
+
+CHAT_NAMES_FILE = STATE_DIR / "chat_names.json"
+_chat_names_lock = threading.Lock()
+_chat_names: dict = {}   # chat_id -> 群名（首次查询后缓存；单聊/查询失败无缓存条目）
+
+if CHAT_NAMES_FILE.exists():
+    try:
+        _chat_names = json.loads(CHAT_NAMES_FILE.read_text("utf-8"))
+    except (OSError, json.JSONDecodeError):
+        _chat_names = {}
+
+
+def _chat_name(chat_id: str) -> str:
+    """群聊显示名（任务来源标识用，11-24：用户要任务归属具体到群聊）。
+    im.v1.chat.get 查询 + 磁盘缓存（群名不常变）；单聊拿不到名字、API 失败
+    都静默退 ""——调用方退回会话标签。"""
+    with _chat_names_lock:
+        if chat_id in _chat_names:
+            return _chat_names[chat_id]
+    try:
+        req = GetChatRequest.builder().chat_id(chat_id).build()
+        resp = api.im.v1.chat.get(req)
+        name = (resp.data.name if resp.success() and resp.data else "") or ""
+    except Exception:
+        return ""
+    with _chat_names_lock:
+        if name:
+            _chat_names[chat_id] = name
+            try:
+                CHAT_NAMES_FILE.write_text(
+                    json.dumps(_chat_names, ensure_ascii=False), "utf-8")
+            except OSError:
+                pass
+    return name
 
 
 def _mode_label(chat_id: str) -> str:
@@ -1916,12 +1953,15 @@ def _spawn_claude(chat_id: str, session_id):
 
     # FEISHU_BOT_CHILD=1：让 notify.py 跳过机器人自己的 claude 子进程，避免重复通知
     # FEISHU_CHAT_ID/FEISHU_PERM_PORT：perm_mcp.py 借此路由卡片和连回本进程
-    # FEISHU_CHAT_LABEL：task_mcp.py 任务标题前缀用（会话标签，总览时区分来源）
+    # FEISHU_CHAT_LABEL：task_mcp.py 任务溯源用（项目·会话标签）
+    # FEISHU_CHAT_NAME：task_mcp.py 任务来源优先标识（群聊名，11-24 用户定调
+    #   「来源具体到群聊」；拿不到（单聊/查询失败）时 task_mcp 退回会话标签）
     # CLAUDE_CODE_GIT_BASH_PATH：强制分身用 Bash 工具（Git Bash），白名单里的
     #   Bash(...) 规则才能命中——否则 Windows 非交互 spawn 默认 PowerShell 工具
     child_env = {**os.environ, "FEISHU_BOT_CHILD": "1",
                  "FEISHU_CHAT_ID": chat_id, "FEISHU_PERM_PORT": str(PERM_PORT),
-                 "FEISHU_CHAT_LABEL": _chat_label(chat_id) or ""}
+                 "FEISHU_CHAT_LABEL": _chat_label(chat_id) or "",
+                 "FEISHU_CHAT_NAME": _chat_name(chat_id)}
     if GIT_BASH:
         child_env["CLAUDE_CODE_GIT_BASH_PATH"] = GIT_BASH
     return subprocess.Popen(
