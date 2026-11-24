@@ -165,7 +165,7 @@ HELP_TEXT = """📖 命令列表
 /roster [项目关键字] — 花名册：查所有上过线的 Claude 窗口/分身（名字·完整ID·最近动静·桌面或飞书）
 /qa [序号|关键字] — 问答档案：当前绑定会话的提问历史（列表/过滤，/qa <序号> 重读完整回答）
 /hud [on|off] — 会话监控 HUD：置顶区常驻卡显示 Context/缓存/首响/吞吐（带基线），劣化变黄红给建议
-/schedule daily 08:30 <指令> — 定时任务：每天到点把指令注入本聊天会话（探索日报等；list/off/on/del 管理）
+/schedule daily 08:30 <指令> — 定时任务：每天到点把指令注入本聊天会话（探索日报等）；every Nm <指令> = 间隔监控（无变化静默不汇报）；list/off/on/del 管理
 /provider [序号|名称] — 查看/切换 Claude 供应商（cc-switch 库；切换即换 key，新起进程生效）
 /unqueue — 取消排队接管
 /rename [名字] — 给当前会话起名（/sessions 列表优先显示名字）
@@ -211,7 +211,7 @@ HELP_MD = """**🧩 会话管理**
 - **/roster** [项目关键字] — 花名册：所有上过线的 Claude 窗口/分身（名字·完整ID·最近动静·桌面或飞书），SessionStart hook 自动登记
 - **/qa** [序号|关键字] — 问答档案：当前绑定会话的提问历史，每回合自动记录（Stop hook）；/qa 看列表、/qa <关键字> 过滤、/qa <序号> 从转录重读完整回答
 - **/hud** [on|off] — 会话监控 HUD：置顶区常驻卡片显示 Context 占用/缓存命中/首响/吞吐（带本会话基线），劣化自动变黄红并给建议（/compact 等），回合结束自动刷新
-- **/schedule** daily 08:30 <指令> — 定时任务：每天到点把指令注入本聊天绑定的会话（探索日报等场景；/schedule list 查看，off|on 暂停恢复，del 删除）
+- **/schedule** daily 08:30 <指令> — 定时任务：每天到点把指令注入本聊天绑定的会话（探索日报）；**every 30m <指令>** — 间隔监控：每 N 分钟检查一次，无变化只回 [NO-CHANGE] 静默不汇报，变了才详细汇报（建议配 /quiet）；/schedule list 查看，off|on 暂停恢复，del 删除
 - **/provider** [序号|名称] — 查看/切换 Claude 供应商（cc-switch 库；切换即换 key，新起进程生效）
 - **/listen** — 群聊免 @ 模式：本群所有消息直接发给机器人（适合只有你+机器人的群）
 - **/mute · /unmute** — 暂停/恢复桌面事件推送（全局）
@@ -938,6 +938,18 @@ def _info_card(title: str, md: str, template: str = "blue") -> dict:
             "header": {"title": {"tag": "plain_text", "content": title},
                        "template": template},
             "body": {"elements": [{"tag": "markdown", "content": _md_tables_need_blank(md)}]}}
+
+
+def _delete_message(msg_id: str) -> None:
+    """删一条机器人消息（监控静默回合的流式卡收尾用）。失败静默——
+    删不掉的卡片内容只是"[NO-CHANGE]"占位，留着无害。"""
+    if not msg_id:
+        return
+    try:
+        api.im.v1.message.delete(
+            DeleteMessageRequest.builder().message_id(msg_id).build())
+    except Exception:
+        pass
 
 
 class _LiveReply:
@@ -1995,6 +2007,15 @@ def _session_reader(chat_id: str, key: str, slot: dict) -> None:
                     if btype == "text" and (block.get("text") or "").strip():
                         final = block["text"].strip()
                         slot["last_text_block"] = final   # _finish_turn 的兜底（见其注释）
+                        if final == _NO_CHANGE:
+                            # 监控静默协议（见 _schedule_tick）：无变化回合零痕迹——
+                            # 流式卡直接删除（删失败留着也无妨，反正是"无变化"占
+                            # 位），不发任何文本。last_sent 置标记防 result 兜底补发
+                            if live is not None:
+                                _delete_message(live.msg_id)
+                                live = None
+                            last_sent = final
+                            continue
                         if live is not None:
                             # 流式卡片收尾定格（超长续卡 / 通道失败降级都在里面）
                             if not live.close(final):
@@ -2083,6 +2104,10 @@ def _finish_turn(chat_id: str, result: dict, last_text: str, slot: dict) -> None
     # 相同会被下方去重跳过，不会双发。旧消息写入时已清零，无跨回合串答案风险。
     final_text = ((result.get("result") or "").strip()
                   or (slot.pop("last_text_block", "") or "").strip())
+    # 监控静默协议：无变化回合连兜底都不发（_schedule_tick 注入的协议约定模型
+    # 只回 [NO-CHANGE]，reader 层已删流式卡，这里堵住最后一条出口）
+    if final_text == _NO_CHANGE:
+        final_text = ""
     if final_text and final_text != last_text:
         # markdown 卡片渲染（飞书 text 消息不渲染 markdown——quiet 结果此前原样
         # 显示标记）。非 quiet 的正常路径 last_sent=final_text 会跳过这里
@@ -3216,8 +3241,14 @@ def _hud_record(chat_id: str, slot: dict, result: dict) -> None:
 # （"对比你记忆中此前的报告，只报新增"），增量日报据此成立。
 SCHEDULE_FILE = STATE_DIR / "schedules.json"
 _SCHEDULE_LOCK = threading.Lock()
-_schedules: list = []   # [{"id","chat_id","hhmm","prompt","enabled","last_run","created"}]
+# kind="daily"：{"id","chat_id","hhmm","prompt","enabled","last_run","created"}
+#   每天到点一次，last_run 记日期字符串，错过的在补跑窗口内补一次
+# kind="every"：+{"interval_min"}，last_run_ts 记上次触发时间戳。间隔监控形态：
+#   到期即触发（错过的不积欠——bot 恢复后第一拍跑一次，然后按节拍继续）。
+#   注入时带 [NO-CHANGE] 静默协议（变了才汇报，见 _schedule_tick）。
+_schedules: list = []
 _SCHEDULE_CATCHUP = 12 * 3600   # 错过触发后的补跑窗口（秒）：bot 挂了半天内重启仍补跑一次
+_NO_CHANGE = "[NO-CHANGE]"      # 监控回合无变化的静默标记（模型按协议回复，bot 抑制转发）
 
 
 def _schedule_load() -> None:
@@ -3237,9 +3268,16 @@ def _schedule_save() -> None:
 
 
 def _schedule_due(row: dict, now: datetime) -> bool:
-    """今天到点未跑（补跑窗口内）→ True。last_run 记日期，一天最多一跑。"""
+    """daily：今天到点未跑（补跑窗口内）；every：距上次触发已满间隔。"""
     if not row.get("enabled", True):
         return False
+    if row.get("kind") == "every":
+        interval = (row.get("interval_min") or 0) * 60
+        if interval <= 0:
+            return False
+        last_ts = float(row.get("last_run_ts") or 0)
+        return time.time() - last_ts >= interval   # 从未跑过（0）→ 立即触发首拍
+    # daily（无 kind 字段的旧条目同样落到这里）
     try:
         h, m = (int(x) for x in str(row.get("hhmm") or "").split(":"))
         if not (0 <= h < 24 and 0 <= m < 60):
@@ -3257,29 +3295,47 @@ def _schedule_due(row: dict, now: datetime) -> bool:
 
 
 def _schedule_tick() -> None:
-    """单轮调度检查（线程循环逐次调用；先记 last_run 后执行防异常重入）。"""
+    """单轮调度检查（线程循环逐次调用；先记运行时间后执行防异常重入）。"""
     now = datetime.now()
     with _SCHEDULE_LOCK:
         due = []
         for row in _schedules:
             if _schedule_due(row, now):
-                row["last_run"] = now.strftime("%Y-%m-%d")
+                if row.get("kind") == "every":
+                    row["last_run_ts"] = time.time()
+                else:
+                    row["last_run"] = now.strftime("%Y-%m-%d")
                 due.append(dict(row))
         if due:
             _schedule_save()
     for row in due:
         label = _chat_label(row["chat_id"]) or (row["chat_id"] or "?")[-6:]
-        log(f"[定时触发] {label} {row['hhmm']}「{row['prompt'][:40]}…」")
+        if row.get("kind") == "every":
+            period = f"每 {row['interval_min']} 分钟"
+            log(f"[定时触发] {label} {period}「{row['prompt'][:40]}…」")
+            # 静默协议（变了才汇报）：无变化时模型只回 [NO-CHANGE]，bot 在转发层
+            # 抑制（不发流式卡收尾/不发文本），聊天区零痕迹。协议是结构化出口
+            # 而非自然语言期望——模型对「不用说话」的理解天然不稳，对「回这个
+            # 固定标记」的遵循度接近 100%（实测任务卡片场景同类协议）。
+            head = (f"[定时监控例行触发（{period}）——本指令由飞书机器人的外部调度器"
+                    f"按间隔自动注入，你不需要也不应该使用 CronCreate/ScheduleWakeup "
+                    f"等工具给自己创建任何定时任务。检查完毕后：**如果状态与你上次"
+                    f"检查时相比没有变化，请只回复一行 {_NO_CHANGE}（不要有任何其他"
+                    f"文字）**，系统会静默处理不打扰用户；有变化则正常详细汇报。]\n\n")
+        else:
+            period = row["hhmm"]
+            log(f"[定时触发] {label} {period}「{row['prompt'][:40]}…」")
+            # 上下文包裹（11-23 实证教训：prompt 里的「每天」会被模型理解成自己
+            # 该建定时器——探索会话实测模型自调 CronCreate 建了每日 00:07 的
+            # durable 任务，与 bot 调度重复且会污染同项目其他会话）。明说外部
+            # 调度器的存在。
+            head = (f"[定时任务例行触发（{period}）——本指令由飞书机器人的外部调度器"
+                    f"每天自动注入，你不需要也不应该使用 CronCreate/ScheduleWakeup "
+                    f"等工具给自己创建任何定时任务，明天到点外部调度器会再次注入本"
+                    f"指令。直接执行即可。]\n\n")
         if row["chat_id"] not in _quiet:
-            send_text(row["chat_id"], f"⏰ 定时任务触发（{row['hhmm']}），开始执行…")
-        # 上下文包裹（11-23 实证教训：prompt 里的「每天」会被模型理解成自己该建
-        # 定时器——探索会话实测模型自调 CronCreate 建了每日 00:07 的 durable 任务，
-        # 与 bot 调度重复且会污染同项目其他会话）。注入时明说外部调度器的存在。
-        prompt = ("[定时任务例行触发（{}）——本指令由飞书机器人的外部调度器每天自动注入，"
-                  "你不需要也不应该使用 CronCreate/ScheduleWakeup 等工具给自己创建任何"
-                  "定时任务，明天到点外部调度器会再次注入本指令。直接执行即可。]\n\n{}"
-                  ).format(row["hhmm"], row["prompt"])
-        run_task(row["chat_id"], prompt)
+            send_text(row["chat_id"], f"⏰ 定时任务触发（{period}），开始执行…")
+        run_task(row["chat_id"], head + row["prompt"])
 
 
 def _schedule_loop() -> None:
@@ -3293,10 +3349,53 @@ def _schedule_loop() -> None:
 
 def _schedule_cmd(chat_id: str, arg: str) -> None:
     """/schedule 命令入口（独立函数便于单测打桩）。
-    注册：/schedule daily 08:30 <prompt>；管理：list / del <id> / off|on <id>。"""
+    注册：daily 08:30 <prompt> / every 30m <prompt>；管理：list / del <id> / off|on <id>。"""
     parts2 = arg.split(None, 2)
     sub = parts2[0].lower() if parts2 else ""
-    if sub in ("daily", "add"):
+    if sub == "every":
+        # 间隔监控（11-24 用户定调「盯状态变化，变了才汇报」）：注入带静默协议，
+        # 无变化回合模型只回 [NO-CHANGE]，bot 抑制转发。建议配专用群 + /quiet。
+        if len(parts2) < 3:
+            send_text(chat_id, "用法：/schedule every 30m <监控指令>\n\n"
+                               "每 N 分钟注入一次（支持如 10m/30m/1h）。注入时自带"
+                               "静默协议：状态无变化时模型只回 [NO-CHANGE]，bot "
+                               "静默处理不发消息——聊天区只在有变化时出现汇报。\n"
+                               "建议：专用群承载 + /quiet 开静默（状态卡转圈定格"
+                               "就是「轮询还活着」的心跳信号）。\n"
+                               "注意：任务一轮没跑完下一拍会排队（模型在工具间隙"
+                               "读到），间隔别设得比任务耗时短太多。")
+            return
+        unit_str, prompt = parts2[1].lower(), parts2[2].strip()
+        try:
+            if unit_str.endswith("h"):
+                interval_min = int(unit_str[:-1]) * 60
+            elif unit_str.endswith("m"):
+                interval_min = int(unit_str[:-1])
+            else:
+                raise ValueError
+            if not (1 <= interval_min <= 24 * 60):
+                raise ValueError
+        except ValueError:
+            send_text(chat_id, f"❌ 间隔格式不对：{parts2[1]}（应为 Nm 或 Nh，如 30m、2h）")
+            return
+        if not prompt:
+            send_text(chat_id, "❌ 缺少监控指令（prompt 不能为空）。")
+            return
+        with _SCHEDULE_LOCK:
+            sid = max((int(r.get("id") or 0) for r in _schedules), default=0) + 1
+            row = {"id": sid, "chat_id": chat_id, "kind": "every",
+                   "interval_min": interval_min, "prompt": prompt,
+                   "enabled": True, "last_run_ts": 0, "created": time.time()}
+            _schedules.append(row)
+            _schedule_save()
+        disp = f"{interval_min} 分钟" if interval_min < 60 else f"{interval_min // 60} 小时"
+        send_text(chat_id, f"⏰ 监控任务 #{sid} 已注册：每 {disp}\n"
+                           f"「{prompt[:60]}{'…' if len(prompt) > 60 else ''}」\n"
+                           "· 无变化 → 模型只回 [NO-CHANGE]，bot 静默处理不发消息\n"
+                           "· 有变化 → 正常详细汇报\n"
+                           "· 建议本群 /quiet（状态卡定格✅=轮询存活心跳）\n"
+                           "· /schedule list 查看 · /schedule off " + str(sid) + " 暂停 · /schedule del " + str(sid) + " 删除")
+    elif sub in ("daily", "add"):
         if len(parts2) < 3 or ":" not in parts2[1]:
             send_text(chat_id, "用法：/schedule daily 08:30 <探索指令>\n\n"
                                "到点后每天把这段指令注入本聊天绑定的会话（--resume 跨次"
@@ -3330,17 +3429,27 @@ def _schedule_cmd(chat_id: str, arg: str) -> None:
         with _SCHEDULE_LOCK:
             rows = list(_schedules)
         if not rows:
-            send_text(chat_id, "还没有定时任务。注册：/schedule daily 08:30 <探索指令>")
+            send_text(chat_id, "还没有定时任务。注册：/schedule daily 08:30 <探索指令>"
+                               " 或 /schedule every 30m <监控指令>（变了才汇报）")
             return
         lines = []
         for r in rows:
             mark = "✅" if r.get("enabled", True) else "⏸"
             here = "（本聊天）" if r["chat_id"] == chat_id else ""
             label = (_chat_label(r["chat_id"]) or (r["chat_id"] or "?")[-6:]) + here
-            last = r.get("last_run") or "从未"
             pv = r["prompt"][:36] + ("…" if len(r["prompt"]) > 36 else "")
-            lines.append(f"{mark} #{r['id']} 每天 {r['hhmm']} → {label}｜上次 {last}\n"
-                         f"    {pv}")
+            if r.get("kind") == "every":
+                iv = r.get("interval_min") or 0
+                period = f"{iv} 分钟" if iv < 60 else f"{iv // 60} 小时"
+                ts = float(r.get("last_run_ts") or 0)
+                last = ("从未" if ts <= 0 else
+                        datetime.fromtimestamp(ts).strftime("%m-%d %H:%M"))
+                lines.append(f"{mark} #{r['id']} 每 {period} → {label}｜上次 {last}\n"
+                             f"    {pv}")
+            else:
+                last = r.get("last_run") or "从未"
+                lines.append(f"{mark} #{r['id']} 每天 {r['hhmm']} → {label}｜上次 {last}\n"
+                             f"    {pv}")
         send_text(chat_id, "⏰ 定时任务（共 %d 条）\n\n%s\n\n"
                            "管理：/schedule off|on|del <序号>" % (len(rows), "\n".join(lines)))
     elif sub in ("del", "rm"):
@@ -3370,8 +3479,12 @@ def _schedule_cmd(chat_id: str, arg: str) -> None:
                 hit["enabled"] = (sub == "on")
                 _schedule_save()
         if hit:
+            if hit.get("kind") == "every":
+                when = f"每 {hit['interval_min']} 分钟"
+            else:
+                when = f"每天 {hit['hhmm']}"
             send_text(chat_id, f"{'▶️ 已恢复' if sub == 'on' else '⏸ 已暂停'} 定时任务 #{tid}"
-                               f"（每天 {hit['hhmm']}）。")
+                               f"（{when}）。")
         else:
             send_text(chat_id, f"❌ 没有找到 #{tid}（/schedule list 查看序号）。")
     else:
