@@ -75,7 +75,7 @@ _MIGRATE_FILES = [
     "observe.json", "mute.flag", "bot.log",
     "roster.jsonl", "qa", "boot_notice_target.json",
     "boot_notify.ts", "boot_reason.flag", "chat_types.json",
-    "hud.json", "hud_hist.json", "schedules.json",
+    "hud.json", "hud_hist.json", "schedules.json", "agent_tasks",
 ]
 
 
@@ -166,6 +166,7 @@ HELP_TEXT = """📖 命令列表
 /qa [序号|关键字] — 问答档案：当前绑定会话的提问历史（列表/过滤，/qa <序号> 重读完整回答）
 /hud [on|off] — 会话监控 HUD：置顶区常驻卡显示 Context/缓存/首响/吞吐（带基线），劣化变黄红给建议
 /schedule daily 08:30 <指令> — 定时任务：每天到点把指令注入本聊天会话（探索日报等）；every Nm <指令> = 间隔监控（无变化静默不汇报）；list/off/on/del 管理
+/tasks — 本聊天的 agent 任务跟踪列表（agent 长任务自动建；总览在飞书任务中心「Claude 任务」清单）
 /provider [序号|名称] — 查看/切换 Claude 供应商（cc-switch 库；切换即换 key，新起进程生效）
 /unqueue — 取消排队接管
 /rename [名字] — 给当前会话起名（/sessions 列表优先显示名字）
@@ -212,6 +213,7 @@ HELP_MD = """**🧩 会话管理**
 - **/qa** [序号|关键字] — 问答档案：当前绑定会话的提问历史，每回合自动记录（Stop hook）；/qa 看列表、/qa <关键字> 过滤、/qa <序号> 从转录重读完整回答
 - **/hud** [on|off] — 会话监控 HUD：置顶区常驻卡片显示 Context 占用/缓存命中/首响/吞吐（带本会话基线），劣化自动变黄红并给建议（/compact 等），回合结束自动刷新
 - **/schedule** daily 08:30 <指令> — 定时任务：每天到点把指令注入本聊天绑定的会话（探索日报）；**every 30m <指令>** — 间隔监控：每 N 分钟检查一次，无变化只回 [NO-CHANGE] 静默不汇报，变了才详细汇报（建议配 /quiet）；/schedule list 查看，off|on 暂停恢复，del 删除
+- **/tasks** — 本聊天的 agent 任务跟踪列表（agent 执行长任务时自动建飞书任务并更新进展；全局总览在飞书任务中心「Claude 任务」清单）
 - **/provider** [序号|名称] — 查看/切换 Claude 供应商（cc-switch 库；切换即换 key，新起进程生效）
 - **/listen** — 群聊免 @ 模式：本群所有消息直接发给机器人（适合只有你+机器人的群）
 - **/mute · /unmute** — 暂停/恢复桌面事件推送（全局）
@@ -691,8 +693,10 @@ def _kill_orphan_children() -> int:
 def _active_child_count(proc: subprocess.Popen) -> int:
     """数 claude 驻留进程名下还在跑的工具子进程（后台编译/巡检之类）。
 
-    排除常驻"脊柱"：claude.cmd 垫片 → node(cli.js) → perm_mcp.py——它们随主进程
-    生灭，不算活跃工作。psutil 不可用/查询失败返回 0（退回纯时间判定）。"""
+    排除常驻"脊柱"：claude.cmd 垫片 → node(cli.js) → perm_mcp.py / task_mcp.py
+    （MCP server 与 claude 同生命周期，永远在——不排除会让闲置回收永久推迟）
+    ——它们随主进程生灭，不算活跃工作。psutil 不可用/查询失败返回 0（退回纯
+    时间判定）。"""
     if psutil is None:
         return 0
     try:
@@ -705,7 +709,7 @@ def _active_child_count(proc: subprocess.Popen) -> int:
             cl = " ".join(k.cmdline()).lower()
         except Exception:
             cl = ""
-        if "cli.js" in cl or "perm_mcp" in cl or "claude.cmd" in cl:
+        if "cli.js" in cl or "perm_mcp" in cl or "task_mcp" in cl or "claude.cmd" in cl:
             continue
         active += 1
     return active
@@ -1889,13 +1893,18 @@ def _spawn_claude(chat_id: str, session_id):
     mode = _chat_mode(chat_id)
     if mode and mode != "default":   # CLI 的 --permission-mode 不收 "default"，省略即默认
         cmd += ["--permission-mode", mode]
-    # 权限确认走飞书卡片：claude 遇到权限提示时调用 MCP 工具
-    # （perm_mcp.py → 本地 socket → 卡片/文字回复）。bypassPermissions 不会产生提示，跳过。
+    # MCP 面组装（11-24）：任务工具（task_mcp.py，所有模式挂载——长任务过程跟踪是
+    # 通用能力，bypassPermissions 的会话同样需要）+ 权限确认（仅非 bypass 模式：
+    # bypassPermissions 不产生权限提示）。权限工具与任务工具分属两个 server：
+    # perm_mcp 依赖 bot 存活的 socket 通道，task_mcp 直调 API 与 bot 解耦。
+    mcp_servers = {"feishu_task": {
+        "command": sys.executable, "args": [str(BASE_DIR / "task_mcp.py")]}}
     if mode != "bypassPermissions":
-        mcp_config = {"mcpServers": {"feishu": {
-            "command": sys.executable, "args": [str(BASE_DIR / "perm_mcp.py")]}}}
-        cmd += ["--permission-prompt-tool", "mcp__feishu__request_permission",
-                "--mcp-config", json.dumps(mcp_config, separators=(",", ":"))]
+        mcp_servers["feishu"] = {
+            "command": sys.executable, "args": [str(BASE_DIR / "perm_mcp.py")]}
+        cmd += ["--permission-prompt-tool", "mcp__feishu__request_permission"]
+    cmd += ["--mcp-config", json.dumps({"mcpServers": mcp_servers},
+                                       separators=(",", ":"))]
     if CLAUDE_EXTRA_ARGS:
         cmd += shlex.split(CLAUDE_EXTRA_ARGS)
     # 聊天级模型（/model 设置）：显式指定优先级最高，压过 settings.json 与 env 别名
@@ -1907,10 +1916,12 @@ def _spawn_claude(chat_id: str, session_id):
 
     # FEISHU_BOT_CHILD=1：让 notify.py 跳过机器人自己的 claude 子进程，避免重复通知
     # FEISHU_CHAT_ID/FEISHU_PERM_PORT：perm_mcp.py 借此路由卡片和连回本进程
+    # FEISHU_CHAT_LABEL：task_mcp.py 任务标题前缀用（会话标签，总览时区分来源）
     # CLAUDE_CODE_GIT_BASH_PATH：强制分身用 Bash 工具（Git Bash），白名单里的
     #   Bash(...) 规则才能命中——否则 Windows 非交互 spawn 默认 PowerShell 工具
     child_env = {**os.environ, "FEISHU_BOT_CHILD": "1",
-                 "FEISHU_CHAT_ID": chat_id, "FEISHU_PERM_PORT": str(PERM_PORT)}
+                 "FEISHU_CHAT_ID": chat_id, "FEISHU_PERM_PORT": str(PERM_PORT),
+                 "FEISHU_CHAT_LABEL": _chat_label(chat_id) or ""}
     if GIT_BASH:
         child_env["CLAUDE_CODE_GIT_BASH_PATH"] = GIT_BASH
     return subprocess.Popen(
@@ -3896,7 +3907,7 @@ COMMANDS = ["/help", "/new", "/exit", "/stop", "/status", "/session", "/sessions
             "/takeover", "/peek", "/observe", "/unobserve", "/unqueue", "/rename",
             "/cwd", "/file", "/mode", "/model", "/mute", "/unmute", "/quiet", "/unquiet",
             "/listen", "/provider", "/handover", "/compact", "/roster", "/qa",
-            "/hud", "/schedule"]
+            "/hud", "/schedule", "/tasks"]
 
 
 def _expand_cmd(text: str):
@@ -4449,6 +4460,28 @@ def handle_command(chat_id: str, text: str) -> None:
             send_markdown(chat_id, "\n".join(_roster_lines(20, arg.strip())))
     elif cmd == "/schedule":
         _schedule_cmd(chat_id, arg)
+    elif cmd == "/tasks":
+        # agent 任务跟踪清单（11-24）：task_mcp.py 按聊天分文件登记，这里只读
+        try:
+            rows = json.loads((STATE_DIR / "agent_tasks" / f"{chat_id}.json")
+                              .read_text("utf-8"))
+            rows = rows if isinstance(rows, list) else []
+        except (OSError, json.JSONDecodeError):
+            rows = []
+        if not rows:
+            send_text(chat_id, "本聊天还没有 agent 任务跟踪。agent 执行长任务时会自动"
+                               " create_task（也可直接对它说「建个任务跟踪这个」）。")
+        else:
+            lines = []
+            for r in reversed(rows):
+                mark = "✅" if r.get("status") == "done" else "🟢"
+                ts = datetime.fromtimestamp(r.get("created") or 0).strftime("%m-%d %H:%M")
+                lines.append(f"{mark} {r.get('summary') or '?'}｜{ts}")
+                if r.get("url"):
+                    lines.append(f"   {r['url']}")
+            send_text(chat_id, f"📋 本聊天的 agent 任务（共 {len(rows)} 个）\n\n"
+                               + "\n".join(lines)
+                               + "\n\n总览入口：飞书任务中心「Claude 任务」清单")
     elif cmd == "/qa":
         a = arg.strip()
         # 只对当前绑定会话生效（11-08 用户要求）：没绑定直接引导

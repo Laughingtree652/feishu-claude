@@ -13,7 +13,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-SOURCES = ["bot.py", "notify.py", "perm_mcp.py", "perm_gate.py"]
+SOURCES = ["bot.py", "notify.py", "perm_mcp.py", "perm_gate.py", "task_mcp.py"]
 
 failures: list = []
 
@@ -42,10 +42,10 @@ gate_src = sources.get("perm_gate.py", "")
 
 # ---------------- 2. 目录布局约定（静态断言） ----------------
 # bot.py：状态文件一律走 STATE_DIR、日志走 LOGS_DIR；BASE_DIR 只许引用
-# .env / perm_mcp.py / 目录定义 / 迁移循环里的变量形式
+# .env / perm_mcp.py / task_mcp.py（MCP server 代码文件）/ 目录定义 / 迁移循环变量
 bad = [ln.strip() for ln in bot_src.splitlines()
        if 'BASE_DIR / "' in ln and not any(
-           k in ln for k in ('".env"', '"perm_mcp.py"', '"data"', '"logs"', 'BASE_DIR / name'))]
+           k in ln for k in ('".env"', '"perm_mcp.py"', '"task_mcp.py"', '"data"', '"logs"', 'BASE_DIR / name'))]
 check("bot.py 无根目录状态文件残留", not bad, "; ".join(bad[:3]))
 
 # bot.py：所有 STATE_DIR 落点必须登记进 _MIGRATE_FILES（新增状态文件别忘迁移）
