@@ -419,6 +419,25 @@ def _chat_label(chat_id: str) -> str:
     return f"[{proj}·{tag}]"
 
 
+def _agent_name(chat_id: str) -> str:
+    """飞书分身在 Claude Code 跨会话协作网络（ListAgents/SendMessage）里的稳定
+    显示名（11-25 定谳，用户报障：进程被闲置回收重建后，另一个会话 SendMessage
+    报"找不到"）。
+
+    根因实测：claude CLI 用 `-n/--name` 显式指定时 nameSource 变成 "user"，
+    且跨 --resume 重启（哪怕换了 PID）这个名字原样保留——但 bot.py 原先没传
+    这个参数，CLI 会按 "nameSource":"derived" 自动派生一个基于 cwd+随机后缀
+    的名字，每次新起进程都会换一批随机字符（实测转录自述"换代现役名"现象）。
+    记住旧名字的协作方下次 SendMessage 自然找不到。
+
+    种子必须用 chat_id 而非 session_id：sid 会因 /new、/takeover 换绑而变，
+    但 chat_id（这个飞书群的身份）永远不变——协作方要找的是"当前负责这个
+    飞书群的分身"，不是某个抽象会话ID，chat_id 语义上更贴切也更稳定。
+    不用项目名做种子（/cwd 切换会导致名字漂移）。
+    """
+    return f"feishu-{chat_id[-6:]}"
+
+
 CHAT_NAMES_FILE = STATE_DIR / "chat_names.json"
 _chat_names_lock = threading.Lock()
 _chat_names: dict = {}   # chat_id -> 群名（首次查询后缓存；单聊/查询失败无缓存条目）
@@ -1926,7 +1945,8 @@ def _spawn_claude(chat_id: str, session_id):
     注意：提示词通过 stdin 传入，避免经 .cmd 垫片时被 cmd.exe 解析特殊字符。
     """
     cmd = [CLAUDE_PATH, "-p", "--input-format", "stream-json",
-           "--output-format", "stream-json", "--verbose", "--include-partial-messages"]
+           "--output-format", "stream-json", "--verbose", "--include-partial-messages",
+           "--name", _agent_name(chat_id)]
     mode = _chat_mode(chat_id)
     if mode and mode != "default":   # CLI 的 --permission-mode 不收 "default"，省略即默认
         cmd += ["--permission-mode", mode]
@@ -4101,7 +4121,9 @@ def handle_command(chat_id: str, text: str) -> None:
         label = _chat_label(chat_id)
         lines += ["", "**🧠 本聊天的 Claude 会话**",
                   f"- 会话：{label[1:-1] if label else '未绑定（下一条消息开新会话）'}",
-                  f"- 工作目录：{_chat_work_dir(chat_id)}"]
+                  f"- 工作目录：{_chat_work_dir(chat_id)}",
+                  f"- 协作名：`{_agent_name(chat_id)}`（其他 Claude 会话 SendMessage 找本聊天分身用这个，"
+                  "不随进程重启/换绑变化）"]
         cur_key = _task_key(chat_id)
         if slots:
             for k, v in slots:
