@@ -77,7 +77,7 @@ _MIGRATE_FILES = [
     "roster.jsonl", "qa", "boot_notice_target.json",
     "boot_notify.ts", "boot_reason.flag", "chat_types.json",
     "hud.json", "hud_hist.json", "schedules.json", "agent_tasks",
-    "chat_names.json",
+    "chat_names.json", "idle_timeouts.json",
 ]
 
 
@@ -169,6 +169,7 @@ HELP_TEXT = """📖 命令列表
 /hud [on|off] — 会话监控 HUD：置顶区常驻卡显示 Context/缓存/首响/吞吐（带基线），劣化变黄红给建议
 /schedule daily 08:30 <指令> — 定时任务：每天到点把指令注入本聊天会话（探索日报等）；every Nm <指令> = 间隔监控（无变化静默不汇报）；list/off/on/del 管理
 /tasks — 本聊天的 agent 任务跟踪列表（agent 长任务自动建；总览在飞书任务中心「Claude 任务」清单）
+/idle [分钟] — 本聊天闲置回收时长（查看/设置；不活跃多久后杀进程，上下文不丢自动续接；reset 恢复全局默认）
 /provider [序号|名称] — 查看/切换 Claude 供应商（cc-switch 库；切换即换 key，新起进程生效）
 /unqueue — 取消排队接管
 /rename [名字] — 给当前会话起名（/sessions 列表优先显示名字）
@@ -1597,7 +1598,28 @@ def shell_task(chat_id: str, command: str) -> None:
 
 
 # ---------------- 长驻会话进程（stream-json 双向，2026-10-27 实测工具间隙可注入） ----------------
-SESSION_IDLE_TIMEOUT = int(os.environ.get("SESSION_IDLE_TIMEOUT", "900"))  # 闲置回收（秒）
+SESSION_IDLE_TIMEOUT = int(os.environ.get("SESSION_IDLE_TIMEOUT", "3600"))  # 闲置回收（秒），11-25 从 900 提到 3600
+IDLE_TIMEOUTS_FILE = STATE_DIR / "idle_timeouts.json"
+_idle_timeouts: dict = {}   # chat_id -> 分钟（本聊天独立设置；未设置用全局默认）
+
+if IDLE_TIMEOUTS_FILE.exists():
+    try:
+        _idle_timeouts = json.loads(IDLE_TIMEOUTS_FILE.read_text("utf-8"))
+    except (OSError, json.JSONDecodeError):
+        _idle_timeouts = {}
+
+
+def _chat_idle_timeout(chat_id: str) -> int:
+    """本聊天的闲置回收秒数（聊天级可调，/idle 命令；未设置用全局默认）。"""
+    m = _idle_timeouts.get(chat_id)
+    return int(m) * 60 if m else SESSION_IDLE_TIMEOUT
+
+
+def save_idle_timeouts() -> None:
+    try:
+        IDLE_TIMEOUTS_FILE.write_text(json.dumps(_idle_timeouts, ensure_ascii=False, indent=1), "utf-8")
+    except OSError:
+        pass
 
 
 def _user_msg_line(text: str) -> str:
@@ -2250,7 +2272,7 @@ def _session_watchdog(chat_id: str, key: str, slot: dict) -> None:
             return
         # 闲置回收只在该回合已结束时做：长工具执行期间可能长时间无输出，
         # 但回合没结束就不算闲置（in_turn 保护）
-        if not slot.get("in_turn") and now - slot.get("last_event", now) > SESSION_IDLE_TIMEOUT:
+        if not slot.get("in_turn") and now - slot.get("last_event", now) > _chat_idle_timeout(chat_id):
             # 智能回收：回合虽已结束，但 claude 名下还有活跃子进程（后台编译/巡检
             # 等 run_in_background 任务）时推迟回收，长任务不误杀
             active = _active_child_count(proc)
@@ -3967,7 +3989,7 @@ COMMANDS = ["/help", "/new", "/exit", "/stop", "/status", "/session", "/sessions
             "/takeover", "/peek", "/observe", "/unobserve", "/unqueue", "/rename",
             "/cwd", "/file", "/mode", "/model", "/mute", "/unmute", "/quiet", "/unquiet",
             "/listen", "/provider", "/handover", "/compact", "/roster", "/qa",
-            "/hud", "/schedule", "/tasks"]
+            "/hud", "/schedule", "/tasks", "/idle"]
 
 
 def _expand_cmd(text: str):
@@ -4132,8 +4154,9 @@ def handle_command(chat_id: str, text: str) -> None:
                 if v.get("in_turn"):
                     lines.append(f"- 进程状态：🔴 {who} 工作中（最近活动 {idle_s}s 前；/stop 可中断）")
                 else:
+                    idle_m = _chat_idle_timeout(chat_id) // 60
                     lines.append(f"- 进程状态：🟢 {who} 空闲驻留（{idle_s}s 无活动，"
-                                 f"{SESSION_IDLE_TIMEOUT // 60} 分钟后自动回收，消息直达进程）")
+                                 f"{idle_m} 分钟后自动回收，消息直达进程）")
         else:
             lines.append("- 进程状态：⚪ 无驻留进程（发消息自动 --resume 续接上下文）")
         if qn:
@@ -4701,6 +4724,34 @@ def handle_command(chat_id: str, text: str) -> None:
                                "会在本回合结束后用新模式重建）{warn}")
         else:
             send_text(chat_id, f"❌ 无效模式 {arg}\n可选：{' | '.join(sorted(PERMISSION_MODES))}")
+    elif cmd == "/idle":
+        # 闲置回收时长（11-25 用户需求，聊天级）：延长驻留=减少 --resume 冷启动，
+        # 代价是闲置进程的内存驻留。全局默认在 .env SESSION_IDLE_TIMEOUT（秒），
+        # /idle 是分钟、仅本聊天、立即生效（看门狗每 15s 现读现用）。
+        if not arg:
+            cur = _chat_idle_timeout(chat_id)
+            src = "本聊天独立设置" if chat_id in _idle_timeouts else "全局默认（.env）"
+            send_text(chat_id, f"⏳ 本聊天闲置回收：{cur // 60} 分钟（{src}）\n"
+                               "· 任务全部跑完且持续无活动达此时长，进程被回收（上下文不丢，"
+                               "下条消息自动 --resume 续接）\n"
+                               "· 回合没结束/后台子进程还在跑都不会回收\n"
+                               "· 设置：/idle <分钟>（如 /idle 30），仅本聊天，立即生效")
+        elif arg.lower() in ("reset", "default"):
+            _idle_timeouts.pop(chat_id, None)
+            save_idle_timeouts()
+            send_text(chat_id, f"✅ 已恢复全局默认：{SESSION_IDLE_TIMEOUT // 60} 分钟（仅本聊天）。")
+        else:
+            try:
+                minutes = int(arg)
+                if not (1 <= minutes <= 24 * 60):
+                    raise ValueError
+            except ValueError:
+                send_text(chat_id, f"❌ 无效分钟数 {arg}（1 ~ {24 * 60} 之间，或 reset 恢复默认）")
+                return
+            _idle_timeouts[chat_id] = minutes
+            save_idle_timeouts()
+            send_text(chat_id, f"✅ 本聊天闲置回收已设为 {minutes} 分钟（立即生效；"
+                               f"全局默认仍为 {SESSION_IDLE_TIMEOUT // 60} 分钟，其他聊天不受影响）")
     elif cmd == "/compact":
         # 手动压缩上下文：headless stdin 里的 slash 命令会被 CLI 解释执行而非发给模型
         # （11-04 双实验实测：空会话喂 /compact 得 <synthetic> 合成回复零计费；
