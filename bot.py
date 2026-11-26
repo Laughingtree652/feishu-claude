@@ -1408,6 +1408,9 @@ def _perm_conn(conn) -> None:
                 pslot = _running.get(_task_key(chat_id))
                 if pslot is not None:
                     pslot["p_stage"] = "⏸ 等待权限确认（见上方 🔐 卡片）"
+                    with _progress_lock:
+                        pslot.setdefault("p_trail", []).append("⏸ 等待权限确认")
+                        del pslot["p_trail"][:-PROGRESS_TRAIL_KEEP]
             except Exception:
                 pass
             kind, val = _ask_choice(
@@ -1747,6 +1750,9 @@ PROGRESS_INTERVAL = 0.5                    # 刷帧间隔（秒）：0.5s/帧≈
                                            # 稳，0.5s 配失败容忍防 429 抖动杀卡）
 PROGRESS_BACKOFF = 4.0                     # 失败帧退避（秒）：ReadTimeout/频控时拉开帧距重试，
                                            # 通道恢复自动回正常节拍（11-10 判死改退避）
+PROGRESS_TRAIL_KEEP = 6                    # 状态卡活动轨迹保留步数（11-25 quiet 想看 agent
+                                           # 干活但不被刷屏：滚动展示最近 6 步，旧的挤掉）
+_progress_lock = threading.Lock()          # p_trail 写者=reader 线程，读者=刷帧线程
 
 _API_ERR_CN = {   # stdout api_retry 行的 error 字段 → 展示文案（实测 mock 500 值为 server_error）
     "server_error": "服务器错误",
@@ -1822,6 +1828,7 @@ def _start_progress(chat_id: str, slot: dict, note: str = "") -> None:
     slot["p_stage"] = "🧠 思考中"
     slot["p_tool_n"] = 0
     slot["p_retry_n"] = 0
+    slot["p_trail"] = []   # 活动轨迹随新卡清空（上一回合的轨迹不留到这张卡）
     md = f"{PROGRESS_FRAMES[0]} 🧠 思考中 · 0秒"
     if note:
         md += f"\n\n{note}"
@@ -1871,6 +1878,12 @@ def _progress_loop(chat_id: str, slot: dict) -> None:
         md = f"{PROGRESS_FRAMES[i % len(PROGRESS_FRAMES)]} {stage} · {secs // 60}分{secs % 60:02d}秒"
         if slot.get("p_tool_n"):
             md += f"\n\n本轮已调用工具 {slot['p_tool_n']} 次"
+        # 活动轨迹（11-25）：滚动展示最近几步工具调用/回复，agent 在干什么一目
+        # 了然；只进状态卡不进聊天区，refresh 由 0.5s 刷帧节拍兜着（自带节流）
+        with _progress_lock:
+            trail = list(slot.get("p_trail") or [])
+        if trail:
+            md += "\n\n" + "\n".join(t[:80] for t in trail)
         rn = slot.get("p_retry_n") or 0
         title = stage
         if rn:
@@ -2100,6 +2113,11 @@ def _session_reader(chat_id: str, key: str, slot: dict) -> None:
                     if btype == "text" and (block.get("text") or "").strip():
                         final = block["text"].strip()
                         slot["last_text_block"] = final   # _finish_turn 的兜底（见其注释）
+                        # 回复成块 = 本步工具活动收束，轨迹换行（11-25）
+                        with _progress_lock:
+                            trail = slot.setdefault("p_trail", [])
+                            trail.append(f"💬 {final[:60].replace(chr(10), ' ')}")
+                            del trail[:-PROGRESS_TRAIL_KEEP]
                         if final == _NO_CHANGE:
                             # 监控静默协议（见 _schedule_tick）：无变化回合零痕迹——
                             # 流式卡直接删除（删失败留着也无妨，反正是"无变化"占
@@ -2123,8 +2141,15 @@ def _session_reader(chat_id: str, key: str, slot: dict) -> None:
                     elif btype == "tool_use":
                         # quiet 状态卡阶段+计数（所有模式都维护，只有 quiet 有线程消费）
                         slot["p_tool_n"] = slot.get("p_tool_n", 0) + 1
-                        slot["p_stage"] = "🔧 " + _tool_summary(
-                            block.get("name", "?"), block.get("input"))[:50]
+                        summary = _tool_summary(block.get("name", "?"),
+                                                block.get("input"))
+                        slot["p_stage"] = "🔧 " + summary[:50]
+                        # 工具活动轨迹（11-25 用户定调：quiet 想看到 agent 在干活但
+                        # 不被零散过程刷屏）——状态卡里滚动展示最近 N 步，聊天区零打扰
+                        with _progress_lock:
+                            trail = slot.setdefault("p_trail", [])
+                            trail.append(f"🔧 {summary}")
+                            del trail[:-PROGRESS_TRAIL_KEEP]
                         if FORWARD_TOOLS and chat_id not in _quiet:
                             if live is not None:   # 文本后紧跟工具调用：先定格卡片再发 🔧
                                 live.close()
