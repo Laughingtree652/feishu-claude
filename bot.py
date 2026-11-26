@@ -480,6 +480,65 @@ def _mode_label(chat_id: str) -> str:
     return f"⚠️{m}" if m == "bypassPermissions" else m
 
 
+# ---------------- 群公告角色注入（11-26 用户需求：群公告=该群 bot 的角色提示词） ----------------
+# 用户把角色设定写在群公告里，spawn 时现拉现注入——改公告立即生效（下一条消息
+# 就是新人格），不用命令不用重启。技术链路（11-26 实测）：新版公告是 docx 云文档
+# 形态，旧 im.v1 GetChatAnnouncement 报 232097 拒读；docx.v1 域 Get（拿 revision）
+# + ListChatAnnouncementBlock（拿 blocks）双 API 全通。revision 比对做缓存——
+# 公告没变不重复拉块内容（Get 一次轻调用 vs List 拉全量块）。
+_announce_lock = threading.Lock()
+_announce_cache: dict = {}   # chat_id -> {"revision": int, "text": str, "ts": float}
+_ANNOUNCE_TTL = 300          # revision 比对的间隔（秒）：两次 spawn 间公告可能刚改
+
+_ROLE_HEADER = ("[本群设定——以下内容来自本群公告，由用户维护，是这个聊天里你的"
+                "角色设定/职责说明，请始终遵循]\n")
+
+
+def _chat_announcement_text(chat_id: str) -> str:
+    """拉群公告纯文本（角色提示词注入用）。空公告/单聊/权限失败/网络异常都
+    静默退 ""（注入方判空跳过）——公告是增益不是依赖，绝不阻塞消息链路。"""
+    try:
+        from lark_oapi.api.docx.v1 import (GetChatAnnouncementRequest,
+                                           ListChatAnnouncementBlockRequest)
+        now = time.time()
+        with _announce_lock:
+            c = _announce_cache.get(chat_id) or {}
+        # revision 比对有 TTL：刚拉过的直接用缓存文本（改公告后 TTL 内的旧文本
+        # 最多再生效一条消息，下一条就是新的）
+        if c.get("text") and now - c.get("ts", 0) < _ANNOUNCE_TTL:
+            return c["text"]
+        resp = api.docx.v1.chat_announcement.get(
+            GetChatAnnouncementRequest.builder().chat_id(chat_id).build())
+        if not (resp.success() and resp.data):
+            return c.get("text") or ""
+        rev = getattr(resp.data, "revision_id", None)
+        if rev is not None and rev == c.get("revision") and c.get("text") is not None:
+            # revision 没变：只刷时间戳，不拉块
+            with _announce_lock:
+                _announce_cache[chat_id] = {"revision": rev, "text": c["text"], "ts": now}
+            return c["text"]
+        resp2 = api.docx.v1.chat_announcement_block.list(
+            ListChatAnnouncementBlockRequest.builder().chat_id(chat_id).page_size(500).build())
+        if not (resp2.success() and resp2.data):
+            return c.get("text") or ""
+        lines = []
+        for it in (resp2.data.items or []):
+            t = getattr(it, "text", None)
+            if t is None:
+                continue   # 非文本块（图片/文件等）跳过——角色设定用不上
+            seg = "".join((getattr(e.text_run, "content", "") or "")
+                          for e in (t.elements or [])
+                          if getattr(e, "text_run", None))
+            if seg.strip():
+                lines.append(seg.strip())
+        text = "\n".join(lines)
+        with _announce_lock:
+            _announce_cache[chat_id] = {"revision": rev, "text": text, "ts": now}
+        return text
+    except Exception:
+        return ""
+
+
 # ---------------- 运行中的任务（键=会话ID或chat_id -> {"chat_id","proc","started","reason"}） ----------------
 # 互斥/排队的粒度是「会话」：不同会话的任务互不阻塞（哪怕同一聊天先后 /takeover
 # 切换）；同一会话同时只跑一个——两个聊天绑同一会话时后到的直接拒绝（防交错写）。
@@ -1636,10 +1695,15 @@ def _write_to_session(slot: dict, text: str) -> bool:
     """把用户消息写进长驻进程的 stdin（运行中会在工具间隙被读取；空闲则开启下一回合）。
 
     写入需按 slot 锁串行化（可能多线程同时递消息）；管道断裂返回 False，由上层重建。
+    群公告角色注入（11-26）：每次写消息都现拉公告（带 TTL/revision 缓存）拼头部——
+    对运行中进程的追加消息同样生效，用户改公告后下一条消息即切换人格。
     """
     proc = slot.get("proc")
     if proc is None or proc.poll() is not None:
         return False
+    ann = _chat_announcement_text(slot.get("chat_id") or "")
+    if ann:
+        text = _ROLE_HEADER + ann + "\n\n" + text
     try:
         with slot["wlock"]:
             proc.stdin.write(_user_msg_line(text))
