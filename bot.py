@@ -6,8 +6,7 @@
 Claude 的回复与工具调用实时转发回飞书，实现远程操控。
 
 可用命令：/help /new /exit /handover /stop /status /session /sessions /takeover /cwd /mode /mute /unmute /provider /roster /qa /hud
-（会话独占：同一会话只归一个聊天，后接管者优先，被挤掉的聊天会收到通知）
-"""
+（会话独占：同一会话只归一个聊天，后接管者优先，被挤掉的聊天会收到通知）"""
 import json
 import os
 import re
@@ -77,7 +76,7 @@ _MIGRATE_FILES = [
     "roster.jsonl", "qa", "boot_notice_target.json",
     "boot_notify.ts", "boot_reason.flag", "chat_types.json",
     "hud.json", "hud_hist.json", "schedules.json", "agent_tasks",
-    "chat_names.json", "idle_timeouts.json",
+    "chat_names.json", "idle_timeouts.json", "chat_providers.json",
 ]
 
 
@@ -170,7 +169,7 @@ HELP_TEXT = """📖 命令列表
 /schedule daily 08:30 <指令> — 定时任务：每天到点把指令注入本聊天会话（探索日报等）；every Nm <指令> = 间隔监控（无变化静默不汇报）；list/off/on/del 管理
 /tasks — 本聊天的 agent 任务跟踪列表（agent 长任务自动建；总览在飞书任务中心「Claude 任务」清单）
 /idle [分钟] — 本聊天闲置回收时长（查看/设置；不活跃多久后杀进程，上下文不丢自动续接；reset 恢复全局默认）
-/provider [序号|名称] — 查看/切换 Claude 供应商（cc-switch 库；切换即换 key，新起进程生效）
+/provider [序号|名称] — 查看/切换全局 Claude 供应商；local 子命令绑定本聊天（/provider local <序号|名称>，reset 解绑）
 /unqueue — 取消排队接管
 /rename [名字] — 给当前会话起名（/sessions 列表优先显示名字）
 /cwd [路径] — 查看 / 切换 Claude 的工作目录
@@ -217,7 +216,7 @@ HELP_MD = """**🧩 会话管理**
 - **/hud** [on|off] — 会话监控 HUD：置顶区常驻卡片显示 Context 占用/缓存命中/首响/吞吐（带本会话基线），劣化自动变黄红并给建议（/compact 等），回合结束自动刷新
 - **/schedule** daily 08:30 <指令> — 定时任务：每天到点把指令注入本聊天绑定的会话（探索日报）；**every 30m <指令>** — 间隔监控：每 N 分钟检查一次，无变化只回 [NO-CHANGE] 静默不汇报，变了才详细汇报（建议配 /quiet）；/schedule list 查看，off|on 暂停恢复，del 删除
 - **/tasks** — 本聊天的 agent 任务跟踪列表（agent 执行长任务时自动建飞书任务并更新进展；全局总览在飞书任务中心「Claude 任务」清单）
-- **/provider** [序号|名称] — 查看/切换 Claude 供应商（cc-switch 库；切换即换 key，新起进程生效）
+- **/provider** [序号|名称] — 查看/切换全局 Claude 供应商（cc-switch 库；切换即换 key，新起进程生效）；**local 子命令**绑定本聊天：/provider local <序号|名称> 只影响本聊天分身（env 注入子进程，全局不动），/provider local 查看，reset 解绑回全局
 - **/listen** — 群聊免 @ 模式：本群所有消息直接发给机器人（适合只有你+机器人的群）
 - **/mute · /unmute** — 暂停/恢复桌面事件推送（全局）
 - **/quiet · /unquiet** — 静默模式（本聊天）：只推状态卡、最终结果和权限确认
@@ -1684,6 +1683,46 @@ def save_idle_timeouts() -> None:
         pass
 
 
+# ---------------- 会话级供应商绑定（/provider local，11-27） ----------------
+# cc-switch 切换是全局的（settings.json 整块换 env）——所有聊天共用一个 key。
+# 有些群想固定用特定供应商（比如探索群固定 GLM、任务群固定便宜网关），聊天级绑定：
+# spawn 时把该供应商的 env 塞进子进程环境变量。优先级实证（11-27 冒烟）：
+# 环境变量 > settings.json（--settings 注入坏 BASE_URL 时不生效，os.environ 生效），
+# 所以用 child_env 覆盖，全局配置和 cc-switch 状态完全不动。
+CHAT_PROVIDERS_FILE = STATE_DIR / "chat_providers.json"
+_chat_providers: dict = {}   # chat_id -> provider 名（cc-switch 库里的名字）
+_providers_guard = threading.Lock()   # _chat_providers 的读写锁（命令线程并发）
+
+if CHAT_PROVIDERS_FILE.exists():
+    try:
+        _chat_providers = json.loads(CHAT_PROVIDERS_FILE.read_text("utf-8"))
+    except (OSError, json.JSONDecodeError):
+        _chat_providers = {}
+
+
+def save_chat_providers() -> None:
+    try:
+        CHAT_PROVIDERS_FILE.write_text(json.dumps(_chat_providers, ensure_ascii=False, indent=1), "utf-8")
+    except OSError:
+        pass
+
+
+def _chat_provider(chat_id: str) -> dict:
+    """本聊天绑定的供应商存档（_providers() 里的一条）；未绑定/名字已失效返回 {}。"""
+    name = _chat_providers.get(chat_id)
+    if not name:
+        return {}
+    hit = next((p for p in _providers() if p["name"] == name), None)
+    if hit is None:
+        # 绑定的供应商在 cc-switch 里删掉了：绑定失效回全局（顺手清掉死绑定）
+        with _providers_guard:
+            if _chat_providers.get(chat_id) == name:
+                _chat_providers.pop(chat_id, None)
+        save_chat_providers()
+        return {}
+    return hit
+
+
 def _user_msg_line(text: str) -> str:
     """stream-json 输入格式的一行用户消息。"""
     return json.dumps({"type": "user", "message": {"role": "user",
@@ -2083,6 +2122,14 @@ def _spawn_claude(chat_id: str, session_id):
                  "FEISHU_CHAT_NAME": _chat_name(chat_id)}
     if GIT_BASH:
         child_env["CLAUDE_CODE_GIT_BASH_PATH"] = GIT_BASH
+    # 会话级供应商（/provider local）：把绑定供应商的 env 直接盖进子进程环境。
+    # 环境变量优先级高于 settings.json（11-27 冒烟实证），分身连的就是绑定的
+    # 那家；全局 settings.json 和 cc-switch 状态不动，其他聊天不受影响。
+    # 污染存档拒用（脏存档 env 缺模型映射键/形态不对，灌进去会弄坏分身）；
+    # 空 env（官方 OAuth 形态）bot 掌握不了凭据，同样跳过回全局。
+    cp = _chat_provider(chat_id)
+    if cp.get("env") and not cp.get("dirty"):
+        child_env.update(cp["env"])
     return subprocess.Popen(
         cmd,
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -4073,6 +4120,96 @@ def _switch_provider(chat_id: str, arg: str) -> None:
     send_text(chat_id, "\n".join(tips))
 
 
+def _resolve_provider_arg(arg: str, provs: list) -> tuple:
+    """供应商定位（序号 1-based / 名称唯一关键字）：返回 (target, 错误文案)。"""
+    a = arg.strip().lower()
+    if a.isdigit() and 1 <= int(a) <= len(provs):
+        return provs[int(a) - 1], ""
+    if a:
+        cands = [p for p in provs if a in p["name"].lower()]
+        if len(cands) == 1:
+            return cands[0], ""
+    return None, ("定位不到供应商：" + arg +
+                  "（用序号或完整名称关键字；/provider 看列表）")
+
+
+def _local_provider_cmd(chat_id: str, arg: str, provs: list) -> None:
+    """会话级供应商绑定（/provider local …）：只影响本聊天的分身。
+
+    绑定存名字（cc-switch 库里实时解析——你在 cc-switch 改了该供应商的
+    key/base，绑定自动跟着走）；spawn 时 env 盖进子进程环境变量，全局
+    settings.json 和 cc-switch 状态完全不动，其他聊天不受影响。
+    """
+    a = arg.strip()
+    if not a:
+        # 查看：本聊天绑定状态 + 已绑定聊天的全局清单
+        cp = _chat_provider(chat_id)
+        bound = _chat_providers.get(chat_id)
+        lines = ["🔑 本聊天的供应商绑定"]
+        if cp.get("env") and not cp.get("dirty"):
+            lines.append(f"· 已绑定：{cp['name']} · {cp['base']} · key …{cp['key_tail']}")
+        elif bound:
+            lines.append(f"· ⚠️ 绑定的「{bound}」已失效（cc-switch 里删了或存档被污染），"
+                         "当前回退跟随全局。可重新绑定或 reset 清掉死绑定。")
+        else:
+            lines.append("· 未绑定，跟随全局")
+        if cp.get("dirty"):
+            lines.append(f"· ⚠️ 当前绑定「{bound}」的存档被污染（hooks/permissions 混入），"
+                         "分身实际回退全局。先在 cc-switch 清理该供应商再绑定。")
+        if provs:
+            lines.append("")
+            lines.append("可选供应商：")
+            for i, p in enumerate(provs, 1):
+                mark = " ← 本聊天" if bound == p["name"] else ""
+                warn = " ⚠️污染" if p.get("dirty") else ""
+                noenv = "（OAuth 形态不可绑）" if not p["env"] else ""
+                lines.append(f"{i}. {p['name']} · {p['base']} · key …{p['key_tail']}{warn}{noenv}{mark}")
+        lines += ["", "绑定：/provider local <序号|名称>  ·  解绑：/provider local reset"]
+        send_text(chat_id, "\n".join(lines))
+        return
+    if a.lower() in ("reset", "off", "clear"):
+        with _providers_guard:
+            old = _chat_providers.pop(chat_id, None)
+        save_chat_providers()
+        if not old:
+            send_text(chat_id, "本聊天没有供应商绑定（本来就在跟随全局）。")
+            return
+        idle, busy = _recycle_idle_children()
+        tips = [f"↩️ 本聊天供应商已解绑：{old} → 跟随全局（{_provider_now()}）"]
+        if idle:
+            tips.append(f"· 已回收空闲分身 {idle} 个（绑定保留，发消息自动续接）")
+        if busy:
+            tips.append(f"· ⚠️ {busy} 个分身正在跑回合，这轮跑完仍是旧供应商")
+        send_text(chat_id, "\n".join(tips))
+        return
+    target, err = _resolve_provider_arg(a, provs)
+    if err:
+        send_text(chat_id, "❌ " + err)
+        return
+    if not target["env"]:
+        send_text(chat_id, f"❌ {target['name']} 是官方 OAuth 等非 env 形态，"
+                           "bot 掌握不了它的凭据，绑不了（请在 cc-switch 界面处理）。")
+        return
+    if target.get("dirty"):
+        send_text(chat_id, f"❌ {target['name']} 的存档疑似被污染（顶层混入 hooks/permissions），"
+                           "拒绑以防弄坏分身环境。请先在 cc-switch 界面清理该供应商配置（只留 env）。")
+        return
+    with _providers_guard:
+        old = _chat_providers.get(chat_id)
+        _chat_providers[chat_id] = target["name"]
+    save_chat_providers()
+    idle, busy = _recycle_idle_children()
+    tips = [f"✅ 本聊天已绑定供应商：{target['name']}（{target['base']} · key …{target['key_tail']}）",
+            "· 只影响本聊天的分身（env 注入子进程，全局不动）；新起进程生效"]
+    if old and old != target["name"]:
+        tips.append(f"· 已替换原绑定 {old}")
+    if idle:
+        tips.append(f"· 已回收空闲分身 {idle} 个（发消息自动续接，即用新供应商）")
+    if busy:
+        tips.append(f"· ⚠️ {busy} 个分身正在跑回合，这轮跑完仍是旧供应商")
+    send_text(chat_id, "\n".join(tips))
+
+
 # ---------------- 命令缩写（/ob → /observe：唯一前缀展开，歧义则提示补全） ----------------
 COMMANDS = ["/help", "/new", "/exit", "/stop", "/status", "/session", "/sessions",
             "/takeover", "/peek", "/observe", "/unobserve", "/unqueue", "/rename",
@@ -4259,6 +4396,8 @@ def handle_command(chat_id: str, text: str) -> None:
                   f"- 全局生效：{_provider_now()}"]
         m_set = _chat_models.get(chat_id)
         lines.append(f"- 本聊天模型：{m_set}（显式）" if m_set else "- 本聊天模型：跟随全局")
+        cp = _chat_provider(chat_id)
+        lines.append(f"- 本聊天供应商：{cp['name']}（绑定）" if cp else "- 本聊天供应商：跟随全局")
         sess = _sessions.get(chat_id) or {}
         if sess.get("session_id"):
             sf, _cwd2 = _find_session_file(sess["session_id"])
@@ -4453,7 +4592,10 @@ def handle_command(chat_id: str, text: str) -> None:
             send_text(chat_id, "本聊天当前没有在观察任何会话（/observe <序号|ID|latest|last> 开始）。")
     elif cmd == "/provider":
         provs = _providers()
-        if not provs:
+        # /provider local …：本聊天的供应商绑定（子命令前置解析）
+        if arg == "local" or arg.lower().startswith("local "):
+            _local_provider_cmd(chat_id, arg[5:].strip(), provs)
+        elif not provs:
             send_text(chat_id, "❌ 读不到 cc-switch 供应商库（~/.cc-switch/cc-switch.db）。")
         elif arg:
             _switch_provider(chat_id, arg)
@@ -4469,8 +4611,11 @@ def handle_command(chat_id: str, text: str) -> None:
                 mark = " ← 生效中" if (p["key_tail"] == cur_tail and p["base"] == cur_base) else ""
                 warn = " ⚠️存档污染" if p.get("dirty") else ""
                 lines.append(f"{i}. {p['name']} · {p['base']} · key …{p['key_tail']}{warn}{mark}")
+            cp = _chat_provider(chat_id)
             lines += ["", f"当前生效：{_provider_now()}",
-                      "切换：/provider <序号|名称关键字>（新起进程生效，终端活会话需重启）"]
+                      f"本聊天绑定：{cp['name']}" if cp else "本聊天绑定：跟随全局（/provider local <名称> 设置）",
+                      "切换全局：/provider <序号|名称关键字>（新起进程生效）",
+                      "绑定本聊天：/provider local <序号|名称>（只影响本聊天，/provider local reset 解绑）"]
             send_text(chat_id, "\n".join(lines))
     elif cmd == "/model":
         a = arg.strip()
