@@ -76,9 +76,10 @@ gi = (ROOT / ".gitignore").read_text(encoding="utf-8")
 check(".gitignore 覆盖 data/ 与 logs/", "data/" in gi and "logs/" in gi)
 
 # ---------------- 3. 纯函数行为（ast 提取，exec 到受控命名空间） ----------------
-WANTED_FUNCS = {"_is_table_sep", "_md_tables_need_blank", "_split_chunks", "_api_err_cn"}
-WANTED_ASSIGNS = {"MAX_CHUNK", "_API_ERR_CN"}
-ns = {"os": os, "sys": sys}
+WANTED_FUNCS = {"_is_table_sep", "_md_tables_need_blank", "_split_chunks",
+                "_api_err_cn", "_trail_render"}
+WANTED_ASSIGNS = {"MAX_CHUNK", "_API_ERR_CN", "PROGRESS_TRAIL_KEEP"}
+ns = {"os": os, "sys": sys, "time": __import__("time")}
 got = set()
 for node in tree.body:
     if isinstance(node, ast.FunctionDef) and node.name in WANTED_FUNCS:
@@ -125,6 +126,34 @@ if got == WANTED_FUNCS:
           and f_err("rate_limit_error") == "限流")
     check("_api_err_cn 未命中保原词", f_err("weird_x") == "weird_x")
     check("_api_err_cn 空值兜底", f_err("") == "未知错误")
+
+    # _md_tables_need_blank：代码块（``` 围栏）内的分隔行不误判（11-27 修复）
+    check("代码块内分隔行不补空行",
+          f_tbl("```\n| a |\n| --- |\n```\n后文")
+          == "```\n| a |\n| --- |\n```\n后文")
+    check("围栏外表格照常补",
+          f_tbl("段落\n| a |\n| --- |") == "段落\n\n| a |\n| --- |")
+    check("围栏开合正确（闭合后恢复判定）",
+          f_tbl("```\nx\n```\n段落\n| a |\n| --- |") == "```\nx\n```\n段落\n\n| a |\n| --- |")
+
+    # _trail_render：轨迹带时刻+结算耗时（11-27 功能）
+    f_tr = ns["_trail_render"]
+    f_PT = ns.get("PROGRESS_TRAIL_KEEP")
+    check("PROGRESS_TRAIL_KEEP 常量仍在", f_PT == 6)
+    slot_tr = {"p_trail": [
+        {"t": 1000000.0, "s": "🔧 Bash ▸ ls", "done": 1000003.2, "ok": True, "id": 0},
+        {"t": 1000004.0, "s": "💬 回复摘要", "done": None, "ok": None, "id": 1},
+        {"t": 1000010.0, "s": "🔧 Bash ▸ sleep 30", "done": None, "ok": None, "id": 2},
+        {"t": 1000012.0, "s": "🔧 Bash ▸ fail-cmd", "done": 1000013.0, "ok": False, "id": 3},
+    ]}
+    lines = f_tr(slot_tr, 1000014.0)   # now=14: 进行中工具已跑 4s（纯函数模式无锁）
+    check("轨迹行数", len(lines) == 4, str(lines))
+    check("已结算成功带耗时✓", "✓3.2s" in lines[0], lines[0])
+    check("💬 行不带运行标记", "⏱" not in lines[1], lines[1])
+    check("进行中工具实时秒数", "⏱4s" in lines[2], lines[2])
+    check("失败结算✗", "✗1.0s" in lines[3], lines[3])
+    check("行首 HH:MM 时刻", len(lines[0]) >= 5 and lines[0][:2].isdigit()
+          and lines[0][2] == ":", lines[0])   # 本地时区 HH:MM 开头（具体钟点随时区）
 
 # ---------------- 汇总 ----------------
 print(f"\n{'=' * 46}\n{'全部通过' if not failures else '失败 ' + str(len(failures)) + ' 项: ' + '; '.join(failures)}")

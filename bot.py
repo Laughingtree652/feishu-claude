@@ -849,6 +849,26 @@ def log(msg: str) -> None:
 _send_lock = threading.Lock()
 _last_send = 0.0
 
+# 全局卡片 patch 节流（11-27 排障定谳）：飞书 230429 是 **app 级** patch 频控——
+# 不是单卡（单消息维度是 230020）。quiet 状态卡 0.5s/帧、流式卡 1.2s、观察卡
+# 15s、HUD 回合级，多个聊天同时活跃时叠加打满 app QPS（bot.log 实证 258 次
+# 230429，11-12 17:10 一分钟内 12 轮失败-恢复循环；16:38 流式卡失败 8 秒后 HUD
+# 也失败=跨卡连坐）。所有 patch 统一过这道 gate：任意两次 patch ≥0.55s，
+# 多卡并发自动排队而非互相撞墙。
+_PATCH_MIN_INTERVAL = 0.55
+_patch_gate_lock = threading.Lock()
+_patch_gate_last = 0.0
+
+
+def _patch_gate() -> None:
+    """全局 patch 最小间隔控制（阻塞到本线程可发为止）。"""
+    global _patch_gate_last
+    with _patch_gate_lock:
+        wait = _PATCH_MIN_INTERVAL - (time.time() - _patch_gate_last)
+        if wait > 0:
+            time.sleep(wait)
+        _patch_gate_last = time.time()
+
 
 def _split_chunks(text: str, cap: int = MAX_CHUNK) -> list:
     """长文本分段：按行贪心装段；表格块（连续含 | 行）作为原子整体不拆——
@@ -909,12 +929,17 @@ def _md_tables_need_blank(text: str) -> str:
     分隔行的上一行是表头行；表头行若紧贴非空段落（out[-2] 非空），
     在表头行**之前**补空行（插到表头和分隔行之间会把表格拆散）。
     幂等：已补过（表头上是空行）不重复补。
+    代码块（``` 围栏）内的 | --- | 是内容不是表格，跳过判定（否则会在
+    围栏内凭空插一行空行，展示的代码示例变形）。
     """
     lines = (text or "").split("\n")
     out: list = []
+    in_fence = False
     for i, ln in enumerate(lines):
-        if (i >= 2 and _is_table_sep(ln)
-                and out[-1].strip() and out[-2].strip()):
+        if ln.lstrip().startswith("```"):
+            in_fence = not in_fence
+        elif not in_fence and i >= 2 and _is_table_sep(ln) \
+                and out[-1].strip() and out[-2].strip():
             out.insert(len(out) - 1, "")   # 表头前补空行
         out.append(ln)
     return "\n".join(out)
@@ -1097,6 +1122,7 @@ class _LiveReply:
 
     def _patch(self, content: str, streaming: bool) -> None:
         """把当前卡片整卡更新为指定内容；失败置 ok=False（后续走文本降级）。"""
+        _patch_gate()
         try:
             req = PatchMessageRequest.builder() \
                 .message_id(self.msg_id) \
@@ -1127,27 +1153,63 @@ class _LiveReply:
                 return
         if not self.ok:
             return
-        if self.sealed is not None:
-            return   # 满段已定格：尾部攒到块末 close 时一起补发
-        if len(self.buf) >= MAX_CHUNK:
-            self.sealed = _split_chunks(self.buf)[0]
-            self._patch(self.sealed, streaming=False)
+        if len(self.buf) - len(self.sealed or "") >= MAX_CHUNK:
+            # 滚动续卡（11-27 改版，修"超长回复生成期卡片静止数分钟"）：
+            # 旧版满段定格后尾部一直攒到块末，几千字生成期间当前卡零刷新——
+            # 用户看第一张卡定住、第二张卡迟迟不来，像挂了。新版满段定格后
+            # 立即给尾段开新卡继续流式，每张卡都实时；sealed 累计已定格前缀，
+            # close 时据此扣掉已发部分。
+            full = _split_chunks(self.buf[len(self.sealed or ""):] if self.sealed
+                                 else self.buf)[0]
+            self.sealed = (self.sealed or "") + full
+            self._patch(full, streaming=False)
+            if not self.ok:
+                return   # 定格失败：等 close 按已发口径降级补发剩余
+            self.msg_id = _send_card(self.chat_id,
+                                     self._card(self.buf[len(self.sealed):] or "…", True))
+            self._last_patch = time.time()
+            if self.msg_id is None:
+                # 新卡没建成：ok 不置 False（前段已发出去了），后续增量继续攒
+                # 在 buf 里，下帧重建；close 时按已发口径补尾
+                self.msg_id = None
             return
+        if self.msg_id is None:
+            # 上帧滚动新卡失败：重试建卡（首帧同款逻辑）
+            self.msg_id = _send_card(self.chat_id, self._card(self.buf[len(self.sealed or ""):], True))
+            self._last_patch = time.time()
+            if self.msg_id is None:
+                return
         if time.time() - self._last_patch >= LIVE_PATCH_INTERVAL:
-            self._patch(self.buf, streaming=True)
+            self._patch(self.buf[len(self.sealed or ""):], streaming=True)
 
     def close(self, final=None) -> bool:
-        """文本块结束：整块定格（去"生成中"角标；剩余内容续新卡片）。
+        """文本块结束：整块定格（去"生成中"角标；超长部分续新卡片）。
 
-        返回 False = 卡片没能承载（调用方用普通文本补发整块，内容不丢）。
+        返回 False = 卡片完全没能承载（调用方用普通文本补发整块，内容不丢）。
+        11-27：降级口径改"已发部分不重发"——旧版 close 失败调用方整块补发
+        markdown，前段已定格进卡的内容会重复出现两遍。
         """
         text = self.buf if final is None else final
+        if self.msg_id is None and self.sealed:
+            # 前段卡已发出、当前卡没建成：补发剩余部分即可（不重发已定格内容）
+            rest = text[len(self.sealed):]
+            if rest.strip():
+                send_markdown(self.chat_id, rest)
+            return True
         if self.msg_id is None or not self.ok:
             return False
         if self.sealed is not None:
             if not text.startswith(self.sealed):
                 return False   # 极端情况（增量与成块文本不一致）：整块走文本降级
             rest = text[len(self.sealed):]
+            # 滚动续卡场景：当前卡正流式显示着尾段——用权威成块文本 patch 定格
+            # 当前卡（去角标），不再另发新卡（B11：旧实现留着"生成中"角标不定格）。
+            # rest 与当前卡显示内容有出入也覆盖（成块文本为权威）。
+            if self.msg_id:
+                self._patch(rest, streaming=False)
+                if self.ok:
+                    return True
+                return False   # 定格失败：调用方 markdown 补（rest 未发出过，不重复）
         else:
             chunks = _split_chunks(text)
             self._patch(chunks[0], streaming=False)
@@ -1155,12 +1217,22 @@ class _LiveReply:
                 return False
             rest = "".join(chunks[1:])
         if rest.strip():
-            for c in _split_chunks(rest):
-                mid = _send_card(self.chat_id, self._card(c, False))
-                if mid is None:
-                    send_text(self.chat_id, c)   # 续卡失败：该段走文本，不丢内容
-                else:
-                    self.msg_id = mid
+            mid = _send_card(self.chat_id, self._card(rest, False)) \
+                if len(rest) < MAX_CHUNK else None
+            if mid is None and len(rest) >= MAX_CHUNK:
+                # 剩余部分超限：逐段续卡（段间节流，11-27 旧版连发撞 create 频控）
+                for i, c in enumerate(_split_chunks(rest)):
+                    if i:
+                        time.sleep(SEND_INTERVAL)
+                    mid = _send_card(self.chat_id, self._card(c, False))
+                    if mid is None:
+                        send_text(self.chat_id, c)   # 续卡失败：该段走文本，不丢内容
+                    else:
+                        self.msg_id = mid
+            elif mid is not None:
+                self.msg_id = mid
+            else:
+                send_text(self.chat_id, rest)   # 单段发卡失败：走文本，不丢内容
         return True
 
 
@@ -1199,6 +1271,7 @@ def _freeze_choice_card(msg_id, card: dict, answer) -> None:
     if status:
         new_card.setdefault("elements", []).append(
             {"tag": "div", "text": {"tag": "lark_md", "content": status}})
+    _patch_gate()
     req = PatchMessageRequest.builder() \
         .message_id(msg_id) \
         .request_body(PatchMessageRequestBody.builder()
@@ -1466,9 +1539,7 @@ def _perm_conn(conn) -> None:
                 pslot = _running.get(_task_key(chat_id))
                 if pslot is not None:
                     pslot["p_stage"] = "⏸ 等待权限确认（见上方 🔐 卡片）"
-                    with _progress_lock:
-                        pslot.setdefault("p_trail", []).append("⏸ 等待权限确认")
-                        del pslot["p_trail"][:-PROGRESS_TRAIL_KEEP]
+                    _trail_push(pslot, "⏸ 等待权限确认")
             except Exception:
                 pass
             kind, val = _ask_choice(
@@ -1855,7 +1926,67 @@ PROGRESS_BACKOFF = 4.0                     # 失败帧退避（秒）：ReadTime
                                            # 通道恢复自动回正常节拍（11-10 判死改退避）
 PROGRESS_TRAIL_KEEP = 6                    # 状态卡活动轨迹保留步数（11-25 quiet 想看 agent
                                            # 干活但不被刷屏：滚动展示最近 6 步，旧的挤掉）
-_progress_lock = threading.Lock()          # p_trail 写者=reader 线程，读者=刷帧线程
+_progress_lock = threading.Lock()          # p_trail 写者=reader/perm 线程，读者=刷帧线程
+PROGRESS_TRAIL_RUN = "⏱"                   # 进行中工具的耗时标记（刷帧线程每帧现算）
+
+def _trail_push(slot: dict, text: str, tool_use_id: str = "",
+                done: float = None, ok: bool = None) -> None:
+    """往状态卡轨迹追加一条（带时刻；tool_result 结算时更新对应条目的耗时）。
+
+    条目形态：{"t": 时刻, "s": 文本, "done": 结算时刻 or None, "ok": 成败 or None}。
+    done=None 的最后一条 🔧 = 进行中（刷帧线程每帧现算已运行秒数）；
+    user 事件的 tool_result 到达时按 tool_use_id 回填 done/ok（11-27）。
+    """
+    with _progress_lock:
+        trail = slot.setdefault("p_trail", [])
+        trail.append({"t": time.time(), "s": text,
+                      "done": done, "ok": ok, "id": _trail_push.n})
+        if tool_use_id:
+            _trail_settle.ids[tool_use_id] = _trail_push.n
+        _trail_push.n += 1
+        del trail[:-PROGRESS_TRAIL_KEEP]
+
+_trail_push.n = 0
+
+
+def _trail_settle(slot: dict, tool_use_id: str, ok: bool) -> None:
+    """tool_result 到达：给对应 tool_use 的轨迹条目结算耗时与成败。
+
+    逆序找（最近调用最先返回）；没找到（轨迹已被挤出/非工具结果）静默跳过。"""
+    with _progress_lock:
+        for item in reversed(slot.get("p_trail") or []):
+            if item.get("id") == _trail_settle.ids.get(tool_use_id):
+                item["done"] = time.time()
+                item["ok"] = ok
+                break
+
+_trail_settle.ids = {}   # tool_use_id -> 轨迹条目号（append 时登记；进程级即可——
+                         # 轨迹条目被挤出后 id 映射残留无害，结算时查不到就跳过）
+
+
+def _trail_render(slot: dict, now: float, lock=None, run_mark: str = "⏱") -> list:
+    """刷帧线程用：把轨迹渲染成卡片行。lock=None 时由调用方保证线程安全
+    （selfcheck 纯函数提取注入 threading.Lock()）；run_mark 同理可注入。"""
+    if lock:
+        lock.acquire()
+    try:
+        items = list(slot.get("p_trail") or [])
+        lines = []
+        for it in items:
+            hm = time.strftime("%H:%M", time.localtime(it["t"]))
+            if it.get("done") is not None:
+                dur = it["done"] - it["t"]
+                mark = "✓" if it.get("ok") else "✗"
+                lines.append(f"{hm} {it['s']} {mark}{dur:.1f}s")
+            elif it["s"].startswith(("🔧", "⏸")):
+                lines.append(f"{hm} {it['s']} {run_mark}{now - it['t']:.0f}s")
+            else:
+                lines.append(f"{hm} {it['s']}")
+        return lines
+    finally:
+        if lock:
+            lock.release()
+
 
 _API_ERR_CN = {   # stdout api_retry 行的 error 字段 → 展示文案（实测 mock 500 值为 server_error）
     "server_error": "服务器错误",
@@ -1893,6 +2024,7 @@ def _patch_progress(slot: dict, title: str, md: str) -> bool:
     失败打详情、恢复打一条），断网期不刷屏。
     """
     ok = False
+    _patch_gate()   # 全局节流（230429 是 app 级频控，见 _patch_gate 注释）
     try:
         req = PatchMessageRequest.builder() \
             .message_id(slot["p_msg_id"]) \
@@ -1914,7 +2046,6 @@ def _patch_progress(slot: dict, title: str, md: str) -> bool:
             log("[状态卡更新恢复] 失败后已自动续上")
         return True
     slot["p_err"] = True
-    return False
     return False
 
 
@@ -1983,8 +2114,10 @@ def _progress_loop(chat_id: str, slot: dict) -> None:
             md += f"\n\n本轮已调用工具 {slot['p_tool_n']} 次"
         # 活动轨迹（11-25）：滚动展示最近几步工具调用/回复，agent 在干什么一目
         # 了然；只进状态卡不进聊天区，refresh 由 0.5s 刷帧节拍兜着（自带节流）
-        with _progress_lock:
-            trail = list(slot.get("p_trail") or [])
+        # 11-27：条目带时刻（HH:MM）；已完成的工具结算耗时（✓3.2s/✗），进行中的
+        # 工具每帧现算已运行秒数（⏱12s）——长命令一眼看出"还在跑"
+        trail = _trail_render(slot, time.time(), lock=_progress_lock,
+                              run_mark=PROGRESS_TRAIL_RUN)
         if trail:
             md += "\n\n" + "\n".join(t[:80] for t in trail)
         rn = slot.get("p_retry_n") or 0
@@ -1997,7 +2130,12 @@ def _progress_loop(chat_id: str, slot: dict) -> None:
         if not _patch_progress(slot, (title[:23] + "…") if len(title) > 24 else title, md):
             # 失败退避（11-10：判死改退避）：断网/频控期拉开帧距、线程保持活着，
             # 通道恢复自动回到正常节拍继续转——卡片不再定格成"永远思考中"
-            next_t += PROGRESS_BACKOFF
+            # 11-27 改指数：固定 4s 在持续失败期太激进（每 4s 撞一次），恢复瞬间
+            # 又回 0.5s 高频立刻再撞——指数退避 min(4×2^n, 16) 拉开重试距离
+            slot["p_fail_n"] = slot.get("p_fail_n", 0) + 1
+            next_t += PROGRESS_BACKOFF * (2 ** min(slot["p_fail_n"] - 1, 2))
+        else:
+            slot["p_fail_n"] = 0
 
 
 def _stop_progress(chat_id: str, slot: dict, title: str, md: str,
@@ -2191,6 +2329,14 @@ def _session_reader(chat_id: str, key: str, slot: dict) -> None:
                     extra = "，可 /provider 切换供应商" if "rate" in slot["p_retry_err"] else ""
                     send_text(chat_id, "⚠️ 上游 API 报错（" + _api_err_cn(slot["p_retry_err"]) +
                              "），Claude 正在自动重试（最多 10 次，可能要等几分钟" + extra + "）…")
+            elif etype == "user":
+                # tool_result 事件（11-27）：结算轨迹里对应工具的耗时与成败。
+                # stream-json 的 user 事件 = 工具结果回传（含 is_error），assistant
+                # 的对话轮里不出现——只认 content 里的 tool_result 块。
+                for block in (evt.get("message") or {}).get("content") or []:
+                    if isinstance(block, dict) and block.get("type") == "tool_result":
+                        _trail_settle(slot, str(block.get("tool_use_id") or ""),
+                                      not bool(block.get("is_error")))
             elif etype == "stream_event":
                 if slot.get("p_retry_n"):
                     slot["p_retry_n"] = 0   # 增量开始流动 = 上次重试已成功
@@ -2224,20 +2370,19 @@ def _session_reader(chat_id: str, key: str, slot: dict) -> None:
                     if btype == "text" and (block.get("text") or "").strip():
                         final = block["text"].strip()
                         slot["last_text_block"] = final   # _finish_turn 的兜底（见其注释）
-                        # 回复成块 = 本步工具活动收束，轨迹换行（11-25）
-                        with _progress_lock:
-                            trail = slot.setdefault("p_trail", [])
-                            trail.append(f"💬 {final[:60].replace(chr(10), ' ')}")
-                            del trail[:-PROGRESS_TRAIL_KEEP]
                         if final == _NO_CHANGE:
                             # 监控静默协议（见 _schedule_tick）：无变化回合零痕迹——
                             # 流式卡直接删除（删失败留着也无妨，反正是"无变化"占
-                            # 位），不发任何文本。last_sent 置标记防 result 兜底补发
+                            # 位），不发任何文本。last_sent 置标记防 result 兜底补发。
+                            # 轨迹也不记（11-27 前置了这段：内部协议词 [NO-CHANGE]
+                            # 曾泄漏进状态卡轨迹，用户看到 💬 [NO-CHANGE] 一脸懵）
                             if live is not None:
                                 _delete_message(live.msg_id)
                                 live = None
                             last_sent = final
                             continue
+                        # 回复成块 = 本步工具活动收束，轨迹换行（11-25）
+                        _trail_push(slot, f"💬 {final[:60].replace(chr(10), ' ')}")
                         if live is not None:
                             # 流式卡片收尾定格（超长续卡 / 通道失败降级都在里面）
                             if not live.close(final):
@@ -2257,10 +2402,9 @@ def _session_reader(chat_id: str, key: str, slot: dict) -> None:
                         slot["p_stage"] = "🔧 " + summary[:50]
                         # 工具活动轨迹（11-25 用户定调：quiet 想看到 agent 在干活但
                         # 不被零散过程刷屏）——状态卡里滚动展示最近 N 步，聊天区零打扰
-                        with _progress_lock:
-                            trail = slot.setdefault("p_trail", [])
-                            trail.append(f"🔧 {summary}")
-                            del trail[:-PROGRESS_TRAIL_KEEP]
+                        # 11-27 起带时刻；tool_use_id 登记，tool_result 到达结算耗时
+                        _trail_push(slot, f"🔧 {summary}",
+                                    tool_use_id=str(block.get("id") or ""))
                         if FORWARD_TOOLS and chat_id not in _quiet:
                             if live is not None:   # 文本后紧跟工具调用：先定格卡片再发 🔧
                                 live.close()
@@ -2938,6 +3082,7 @@ def _observe_loop(chat_id: str, sid: str, stop: threading.Event) -> None:
                 "body": {"elements": [{"tag": "markdown",
                                        "content": _md_tables_need_blank(content or "…") + f"\n\n*({note})*"}]}}
         if msg_id:   # 常规路径：整卡刷新；失败降级为重建新卡
+            _patch_gate()
             try:
                 req = PatchMessageRequest.builder() \
                     .message_id(msg_id) \
@@ -2948,6 +3093,9 @@ def _observe_loop(chat_id: str, sid: str, stop: threading.Event) -> None:
                 if resp.success():
                     return
                 log(f"[观察卡片更新失败] code={resp.code} msg={resp.msg}")
+                if resp.code == 230429:
+                    return   # app 级频控（11-27）：卡还在，保留 msg_id 下帧重试
+                             # patch，不重建——重建的新卡一样撞频控，旧卡还残留在聊天区
             except Exception as e:
                 log(f"[观察卡片更新异常] {e!r}")
             msg_id = None
@@ -3414,11 +3562,14 @@ def _hud_rebuild(chat_id: str) -> None:
 
 def _hud_patch(chat_id: str) -> None:
     """刷新 HUD 卡（每回合一次的频率，远离频控红线）。失败状态翻转制 log：
-    连续 2 次失败判卡被删，自动重建恢复置顶。"""
+    连续 2 次失败判卡被删，自动重建恢复置顶。
+    230429（app 级频控，11-27 定谳）不计入：卡还在，计数清零等下回合重试——
+    重建的新卡照样撞频控还丢置顶。"""
     with _hud_lock:
         mid = _hud.get(chat_id)
     if not mid:
         return
+    _patch_gate()
     try:
         sid = _lookup_session(chat_id) or ""
         req = PatchMessageRequest.builder() \
@@ -3433,6 +3584,8 @@ def _hud_patch(chat_id: str) -> None:
             if _hud_fail.get(chat_id):
                 log("[HUD] 已自动续上（刷新恢复）")
             _hud_fail[chat_id] = 0
+        elif resp.code == 230429:
+            _hud_fail[chat_id] = 0   # 频控：卡健在，不积累失败计数
         else:
             n = _hud_fail.get(chat_id, 0) + 1
             _hud_fail[chat_id] = n
