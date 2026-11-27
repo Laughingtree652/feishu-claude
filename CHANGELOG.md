@@ -5,6 +5,13 @@
 
 ---
 
+## 2026-11-27
+
+### 会话级供应商绑定 /provider local（5fa0b5a）
+- **用法**：`/provider local <序号|名称>` 把 cc-switch 里的某个供应商绑定到本聊天（只影响本聊天的分身）；`/provider local` 查看绑定状态，`/provider local reset` 解绑回全局。绑定按名字引用，cc-switch 里改了该供应商的 key/base 自动跟着走。
+- **机制**：绑定存 `data/chat_providers.json`（chat_id → 供应商名，实时从 cc-switch 库解析；供应商被删自动清死绑定回全局）。spawn 时把绑定供应商的 env 直接盖进子进程环境变量——环境变量优先级高于 settings.json（冒烟实证 `--settings` 注入不覆盖全局），全局配置、cc-switch 状态、其他聊天零影响。污染存档/OAuth 形态拒绑，沿用全局切换同一套体检。绑定/解绑均回收空闲分身，下一条消息即用新供应商。
+- **技术背景**：全局 `/provider` 切换是整块换 settings.json 的 env，所有聊天共用一个 key；CLI `--settings` 参数的 env 实测不覆盖全局 settings.json，环境变量才是更高优先级。
+
 ## 2026-11-26
 
 ### 群公告角色注入（060c1df）
