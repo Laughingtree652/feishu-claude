@@ -2156,6 +2156,44 @@ def _stop_progress(chat_id: str, slot: dict, title: str, md: str,
     return alive
 
 
+def _spawn_and_compact(chat_id: str, sid: str, payload: str) -> None:
+    """/compact 按需拉起：进程不在时 --resume 冷启动 → 注入 /compact → 走正常读泵。
+
+    与 run_task 同构（互斥/读泵/看门狗一个不少），只是首条消息是压缩指令。
+    11-28 用户场景：/stop 优雅退出后立刻 /compact——旧路径 stdin 已关写不进，
+    提示"先发条消息叫起来"，用户得再等一条消息的冷启动；这里直接拉起注入。
+    """
+    with _running_lock:
+        key = _task_key(chat_id)
+        slot = _running.get(key)
+        if slot is None and key != chat_id:
+            cand = _running.get(chat_id)
+            if cand is not None and cand.get("chat_id") == chat_id and cand.get("sid") == key:
+                slot = cand
+        if slot is not None:
+            if slot.get("chat_id") != chat_id:
+                send_text(chat_id, f"⚠️ 会话 {key[:8]}… 正在被另一个聊天使用，无法压缩。")
+                return
+            if _write_to_session(slot, payload):
+                send_text(chat_id, "🧹 分身刚好在运行，压缩指令已送达。")
+                return
+        slot = {"chat_id": chat_id, "proc": None, "started": time.time(), "reason": None,
+                "wlock": threading.Lock(), "last_event": time.time(),
+                "turn_start": time.time(), "in_turn": False, "sid": sid,
+                "mode": _chat_mode(chat_id), "provider": _provider_now()}
+        try:
+            proc = _spawn_claude(chat_id, sid)
+        except (FileNotFoundError, OSError) as e:
+            send_text(chat_id, f"❌ 冷启动失败：{e!r}")
+            return
+        slot["proc"] = proc
+        _running[key] = slot
+        _write_to_session(slot, payload)
+    send_text(chat_id, "🧹 压缩指令已注入（完成后有 ✅ 回执）。")
+    threading.Thread(target=_session_reader, args=(chat_id, key, slot), daemon=True).start()
+    threading.Thread(target=_session_watchdog, args=(chat_id, key, slot), daemon=True).start()
+
+
 def run_task(chat_id: str, prompt: str) -> None:
     """任务入口：每个会话一个长驻 claude 进程（stream-json 双向）。
 
@@ -2436,7 +2474,8 @@ def _session_reader(chat_id: str, key: str, slot: dict) -> None:
             if k and _running.get(k) is slot:
                 _running.pop(k, None)
     if reason == "stop":
-        send_text(chat_id, "⛔ 已手动中断。")
+        send_text(chat_id, "⛔ 已手动中断（进程已优雅退出，上下文保留）。\n"
+                           "· /compact 立即压缩 · 直接发消息 --resume 续接 · /takeover last 换绑接回")
     elif reason == "timeout":
         send_text(chat_id, f"⚠️ 执行超过 {CLAUDE_TIMEOUT}s，已强制中断。可在 .env 中调大 CLAUDE_TIMEOUT。")
     elif reason == "idle":
@@ -4508,11 +4547,21 @@ def handle_command(chat_id: str, text: str) -> None:
             for key, slot in slots:
                 slot["reason"] = "stop"
                 if slot.get("proc"):
-                    kill_task(slot["proc"])
+                    # 优雅中断（11-28 用户需求：stop 后还要 /compact 继续——
+                    # taskkill 整树强杀把进程弄死，stdin 也没了，/compact 只能
+                    # 等下次发消息 --resume 冷启动拉起，等半天）。改关 stdin：
+                    # claude 收到 EOF 在工具间隙终止当前回合、进程自然退出，
+                    # 读泵按 reason=stop 收尾——与闲置回收同一条优雅路径。
+                    # CLI 实测 EOF 即停：当前 API 调用返回后不再发起新调用。
+                    try:
+                        slot["proc"].stdin.close()
+                    except (BrokenPipeError, OSError, ValueError):
+                        kill_task(slot["proc"])   # 管道已断：退回强杀兜底
                 with _msg_queue_lock:
                     dropped_total += len(_msg_queue.pop(key, []))
             extra = f"，排队的 {dropped_total} 条消息将一并取消" if dropped_total else ""
-            send_text(chat_id, f"🛑 正在中断当前任务{extra}…")
+            send_text(chat_id, f"🛑 正在中断当前任务{extra}…"
+                               "\n· 进程将优雅退出，/compact 可立即跟上（无需等冷启动）")
         else:
             send_text(chat_id, "当前没有正在执行的任务。")
     elif cmd == "/status":
@@ -5171,6 +5220,9 @@ def handle_command(chat_id: str, text: str) -> None:
         # （11-04 双实验实测：空会话喂 /compact 得 <synthetic> 合成回复零计费；
         #  有内容会话触发 system:compact_boundary + 摘要生成计费，进程继续存活）。
         # 直接写进分身 stdin 即可；compact 的 result 走正常回合收尾自动推 ✅ 回执。
+        # 进程不在时支持按需拉起（11-28 用户场景：/stop 后立刻 /compact——
+        # 优雅退出后 stdin 已关写不进，这里 --resume 冷启动拉起进程再注入压缩，
+        # 免去"先发条消息叫起来再 /compact"的两步等待）。
         info = _sessions.get(chat_id)
         sid = (info or {}).get("session_id") or ""
         if not sid:
@@ -5180,8 +5232,11 @@ def handle_command(chat_id: str, text: str) -> None:
             slot = _running.get(sid) or _running.get(chat_id)   # init 前后键不同，两边都找
         proc = (slot or {}).get("proc")
         if not slot or proc is None or proc.poll() is not None:
-            send_text(chat_id, "💤 分身进程当前不在运行（闲置回收/已退出）。上下文都在盘上不会丢："
-                               "autoCompact 已开，下次拉起满载时会自动压缩；想立即压就先发条消息把分身叫起来。")
+            payload = "/compact" + ((" " + arg) if arg else "")
+            threading.Thread(target=_spawn_and_compact, args=(chat_id, sid, payload),
+                             daemon=True).start()
+            send_text(chat_id, "🧹 分身进程不在运行——正在 --resume 冷启动并注入压缩指令"
+                               "（转录加载几秒，完成后有 ✅ 回执）。")
         elif slot.get("in_turn"):
             send_text(chat_id, "⏳ 分身正在跑回合，此刻注入压缩可能打断工作；等收到 ✅ 完成回执后再 /compact。")
         else:
