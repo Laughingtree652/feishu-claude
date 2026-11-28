@@ -5177,9 +5177,10 @@ def on_message(event: P2ImMessageReceiveV1) -> None:
         if msg is None:
             return
         chat_id = msg.chat_id
-        if msg.message_type not in ("text", "post", "file", "image", "merge_forward"):
-            # 拒收前留全量实样：下次遇到新类型（语音/sticker/分享卡片等）直接
-            # 有原始 content 可查，不用再猜结构（merge_forward 接入就是这么补的课）
+        if msg.message_type not in ("text", "post", "file", "image", "merge_forward",
+                                    "interactive", "todo", "share_chat", "share_group"):
+            # 拒收前留全量实样：下次遇到新类型（语音/sticker 等）直接
+            # 有原始 content 可查，不用再猜结构（merge_forward/转发卡接入就是这么补的课）
             log(f"[未支持消息类型] type={msg.message_type} content={msg.content}")
             send_text(chat_id, f"⚠️ 暂不支持「{msg.message_type}」类型消息"
                                "（已记录原始报文，可让 bot 补充支持）。")
@@ -5242,6 +5243,23 @@ def on_message(event: P2ImMessageReceiveV1) -> None:
                         return
             log(f"[聊天记录原始报文] {msg.content}")
             prompt = _merge_forward_to_prompt(msg.content or "")
+            dispatch_text(chat_id, prompt, sender_id=sender_id,
+                          mid=(msg.message_id or "").strip())
+            return
+        if msg.message_type in ("interactive", "todo", "share_chat", "share_group"):
+            # 转发卡片/待办/名片（11-28 用户需求）：抽卡片文本转 prompt。
+            # 群聊口径同 merge_forward（卡片消息没有 @ 机制，仅 /listen 群响应）；
+            # 单聊直接响应。原始 content 落日志校准（user_dsl 结构来自实样，
+            # 新形态出现时对照）。
+            if msg.chat_type == "group":
+                with _listen_lock:
+                    if chat_id not in _listen:
+                        return
+            log(f"[卡片消息原始报文] type={msg.message_type} {str(msg.content)[:300]}")
+            body = _parent_text_from_message(msg.message_type, msg.content or "")
+            prompt = (f"[转发卡片] 用户转发了一张卡片消息（{msg.message_type}），"
+                      "卡片内容如下，请阅读（用户可能基于它提问或交代任务）：\n"
+                      + (body or "（卡片内容抽取为空——可能只有图片/交互组件）"))
             dispatch_text(chat_id, prompt, sender_id=sender_id,
                           mid=(msg.message_id or "").strip())
             return
@@ -5417,9 +5435,53 @@ def _parent_text_from_message(msg_type: str, content: str) -> str:
             _walk(d)
             t = " ".join(out)
     elif msg_type == "interactive":
+        # 转发卡片（11-28 实测定谳）：2.0 卡片被转发时 content = {"title",
+        # "elements", "user_dsl"}——user_dsl 是**完整卡片 JSON 字符串**（真实内容），
+        # elements 只是旧客户端兼容层（实测 text 全是"请升级至最新版本客户端"
+        # 占位，不能用）。1.0 卡片/异常形态可能没有 user_dsl：降级抽 title+
+        # elements。user_dsl 解析出的卡片复用 _card_text 抽 markdown/div 文本。
         out = []
-        _card_text(d, out)
-        t = "\n".join(x for x in out if x.strip())
+        dsl = d.get("user_dsl")
+        if isinstance(dsl, str) and dsl.strip():
+            try:
+                inner = json.loads(dsl)
+                if isinstance(inner, dict):
+                    header = (inner.get("header") or {}).get("title") or {}
+                    htc = header.get("content")
+                    if isinstance(htc, str) and htc.strip():
+                        out.append(f"【{htc}】")
+                    _card_text(inner.get("body") or inner, out)
+            except json.JSONDecodeError:
+                pass
+        if not out:
+            title = d.get("title")
+            if isinstance(title, str) and title.strip():
+                out.append(f"【{title}】")
+            _card_text(d.get("elements") or d, out)
+        # 占位卡过滤：elements 兜底抽到的"请升级至最新版本客户端"不是内容
+        t = "\n".join(x for x in out if x.strip()
+                      and x.strip() != "请升级至最新版本客户端，以查看内容")
+        if not t:
+            t = "[一张卡片（无可抽取文本，可能是纯图片/交互组件）]"
+    elif msg_type == "todo":
+        # 任务卡（飞书待办，11-19 实样）：content = {"task_id","summary","due_time"}，
+        # summary.content 是 post 同款段落数组——复用段落抽取
+        sm = d.get("summary") or {}
+        lines = []
+        tt = (sm.get("title") or "").strip() if isinstance(sm.get("title"), str) else ""
+        if tt:
+            lines.append(f"待办：{tt}")
+        for para in sm.get("content") or []:
+            if not isinstance(para, list):
+                continue
+            line = "".join(seg.get("text") for seg in para
+                           if isinstance(seg, dict) and isinstance(seg.get("text"), str)).strip()
+            if line:
+                lines.append(line)
+        t = "\n".join(lines)
+    elif msg_type in ("share_chat", "share_group"):
+        # 群/频道名片：content 只有 chat_id 之类标识，拿不到群名——占位说明
+        t = "[分享了一张群/频道名片（bot 拿不到名片内容）]"
     else:
         t = f"[{msg_type or '未知'} 类型消息，无法摘录原文]"
     t = re.sub(r"@_user_\d+", "", t).strip()

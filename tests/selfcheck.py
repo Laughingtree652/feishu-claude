@@ -8,6 +8,7 @@
 退出码：0=全部通过；1=有失败（输出里标 FAIL）。
 """
 import ast
+import json
 import os
 import sys
 from pathlib import Path
@@ -77,9 +78,11 @@ check(".gitignore 覆盖 data/ 与 logs/", "data/" in gi and "logs/" in gi)
 
 # ---------------- 3. 纯函数行为（ast 提取，exec 到受控命名空间） ----------------
 WANTED_FUNCS = {"_is_table_sep", "_md_tables_need_blank", "_split_chunks",
-                "_api_err_cn", "_trail_render"}
+                "_api_err_cn", "_trail_render", "_card_text",
+                "_parent_text_from_message"}
 WANTED_ASSIGNS = {"MAX_CHUNK", "_API_ERR_CN", "PROGRESS_TRAIL_KEEP"}
-ns = {"os": os, "sys": sys, "time": __import__("time")}
+ns = {"os": os, "sys": sys, "time": __import__("time"),
+      "json": __import__("json"), "re": __import__("re")}
 got = set()
 for node in tree.body:
     if isinstance(node, ast.FunctionDef) and node.name in WANTED_FUNCS:
@@ -154,6 +157,37 @@ if got == WANTED_FUNCS:
     check("失败结算✗", "✗1.0s" in lines[3], lines[3])
     check("行首 HH:MM 时刻", len(lines[0]) >= 5 and lines[0][:2].isdigit()
           and lines[0][2] == ":", lines[0])   # 本地时区 HH:MM 开头（具体钟点随时区）
+
+    # _parent_text_from_message：转发卡片抽取（11-28 功能，结构按 11-23/11-28 日志实样）
+    f_pt = ns["_parent_text_from_message"]
+    # 2.0 卡转发形态：user_dsl 是完整卡片 JSON，elements 只是占位
+    dsl = json.dumps({"body": {"elements": [{"tag": "markdown",
+                                            "content": "**标题**\n\n| a | b |\n| --- | --- |\n| 1 | 2 |"}]},
+                      "schema": "2.0"}, ensure_ascii=False)
+    fwd = json.dumps({"title": None,
+                      "elements": [[{"tag": "text",
+                                     "text": "请升级至最新版本客户端，以查看内容"}]],
+                      "user_dsl": dsl}, ensure_ascii=False)
+    got_fwd = f_pt("interactive", fwd)
+    check("转发卡抽 user_dsl 正文", "**标题**" in got_fwd and "| 1 | 2 |" in got_fwd, got_fwd[:60])
+    check("转发卡占位文案被滤", "请升级至最新版本客户端" not in got_fwd)
+    # 1.0 卡/无 user_dsl：title+elements 兜底
+    v1 = json.dumps({"title": "分享卡片",
+                     "elements": [[{"tag": "div",
+                                    "text": {"tag": "lark_md", "content": "正文内容"}}]]},
+                    ensure_ascii=False)
+    got_v1 = f_pt("interactive", v1)
+    check("1.0 卡 title+elements 兜底", "分享卡片" in got_v1 and "正文内容" in got_v1)
+    # 纯占位（无任何可抽取内容）：给占位说明不空转
+    blank = f_pt("interactive", json.dumps({"title": None, "elements": [],
+                                            "user_dsl": ""}))
+    check("纯占位卡给说明", "一张卡片" in blank, blank)
+    # todo 待办卡：summary.content 段落数组
+    got_todo = f_pt("todo", '{"task_id":"x","summary":{"title":"待办","content":'
+                    '[[{"tag":"text","text":"买东西","style":[]}]]},"due_time":"0000"}')
+    check("todo 卡抽标题+正文", "待办" in got_todo and "买东西" in got_todo, got_todo)
+    # 名片占位
+    check("名片占位", "名片" in f_pt("share_chat", '{"chat_id":"oc_x"}'))
 
 # ---------------- 汇总 ----------------
 print(f"\n{'=' * 46}\n{'全部通过' if not failures else '失败 ' + str(len(failures)) + ' 项: ' + '; '.join(failures)}")
