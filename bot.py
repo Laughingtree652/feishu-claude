@@ -2299,13 +2299,35 @@ def _spawn_claude(chat_id: str, session_id):
     if GIT_BASH:
         child_env["CLAUDE_CODE_GIT_BASH_PATH"] = GIT_BASH
     # 会话级供应商（/provider local）：把绑定供应商的 env 直接盖进子进程环境。
-    # 环境变量优先级高于 settings.json（11-27 冒烟实证），分身连的就是绑定的
-    # 那家；全局 settings.json 和 cc-switch 状态不动，其他聊天不受影响。
+    # 全局 settings.json 和 cc-switch 状态不动，其他聊天不受影响。
     # 污染存档拒用（脏存档 env 缺模型映射键/形态不对，灌进去会弄坏分身）；
     # 空 env（官方 OAuth 形态）bot 掌握不了凭据，同样跳过回全局。
+    #
+    # ⚠️ 11-28 实测定谳（推翻 11-27 结论）：settings.json 的 env 块优先级**高于**
+    # 进程环境变量——CLI 加载 settings 文件时把 env 块同名覆盖进会话环境。
+    # 实测矩阵（端到端真进程，--model 用只在绑定网关存在的 GLM-5.4 做探针）：
+    #   ①绑定 env + 默认加载 settings → api_retry server_error 挂死
+    #     （请求打到 settings 的 127 网关，那里没有 GLM-5.4）
+    #   ②绑定 env + --setting-sources "" → result OK（真连了绑定的 113 网关）
+    # 所以绑定生效的前提是**跳过 settings 文件加载**，env 注入成为唯一配置源。
+    # 代价与补偿（跳过会丢 settings.json 里的三样东西）：
+    #   · autoCompactEnabled → --autocompact auto 显式补回
+    #   · permissions.allow 免确认白名单 → --allowedTools 显式补回
+    #   · hooks（notify/perm_gate/ask_gate 桌面钩子）→ 分身本来就不该走桌面钩子
+    #     （bot 自管通知/权限/提问：perm_mcp 走 --permission-prompt-tool MCP），不补
     cp = _chat_provider(chat_id)
     if cp.get("env") and not cp.get("dirty"):
         child_env.update(cp["env"])
+        # 跳过 settings 文件（含全局/项目/local 三级），防 env 块遮蔽绑定注入
+        cmd += ["--setting-sources", ""]
+        cmd += ["--autocompact", "auto"]   # settings 的 autoCompactEnabled 补回
+        try:
+            allow = json.loads(CLAUDE_SETTINGS.read_text("utf-8")) \
+                .get("permissions", {}).get("allow", [])
+        except Exception:
+            allow = []
+        if allow:
+            cmd += ["--allowedTools", *allow]   # 免确认白名单补回
     return subprocess.Popen(
         cmd,
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
