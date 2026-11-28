@@ -3968,8 +3968,14 @@ def _gateway_models(base: str, key: str) -> list:
         return []
 
 
-def _current_endpoint() -> tuple:
-    """settings.json 生效中的 (base_url, key)——网关模型查询用。"""
+def _current_endpoint(provider: dict | None = None) -> tuple:
+    """生效中的 (base_url, key)——网关模型查询用。默认读 settings.json（全局当前
+    供应商）；传入 provider（_providers() 里的一条）读它的存档 env（/provider
+    local 绑定后网关降级查询要打本聊天生效的网关，不是全局的）。"""
+    if provider is not None:
+        env = provider.get("env") or {}
+        return env.get("ANTHROPIC_BASE_URL") or "", str(env.get("ANTHROPIC_AUTH_TOKEN")
+                                                         or env.get("ANTHROPIC_API_KEY") or "")
     try:
         env = json.loads(CLAUDE_SETTINGS.read_text("utf-8")).get("env") or {}
         return env.get("ANTHROPIC_BASE_URL") or "", str(env.get("ANTHROPIC_API_KEY") or "")
@@ -3977,13 +3983,19 @@ def _current_endpoint() -> tuple:
         return "", ""
 
 
-def _model_chain() -> list:
-    """模型决定链（settings.json）：顶层 model（别名展开）→ env 默认，一层一条。"""
-    try:
-        s = json.loads(CLAUDE_SETTINGS.read_text("utf-8"))
-    except Exception:
-        return []
-    env = s.get("env") or {}
+def _model_chain(provider: dict | None = None) -> list:
+    """模型决定链：顶层 model（别名展开）→ env 默认，一层一条。默认读
+    settings.json；传入 provider 读它的存档 env（本聊天绑定供应商时 /model reset
+    的"全局链路"回执要显示实际生效的那家的链路）。"""
+    if provider is not None:
+        s = {"env": provider.get("env") or {}}
+        env = s["env"]
+    else:
+        try:
+            s = json.loads(CLAUDE_SETTINGS.read_text("utf-8"))
+        except Exception:
+            return []
+        env = s.get("env") or {}
     out = []
     m = s.get("model")
     if m:
@@ -3997,17 +4009,23 @@ def _model_chain() -> list:
     return out
 
 
-def _configured_models() -> list:
-    """已配置模型清单（settings.json env = 当前 cc-switch 供应商的模型配置）。
+def _configured_models(provider: dict | None = None) -> list:
+    """已配置模型清单：默认读 settings.json env（= 全局当前供应商的模型配置）；
+    传入 provider（_providers() 里的一条）则读它的存档 env——/provider local
+    绑定后 /model 要列**本聊天生效供应商**的模型，而不是全局的（11-28 用户实测
+    报障：绑了新供应商 /model 显示的还是旧 provider 的模型）。
     11-07 用户反馈：/model 拉网关 /v1/models 全量清单太长，只想看自己在
     cc-switch 里配的那几个。收集 env 的 ANTHROPIC_MODEL +
     ANTHROPIC_DEFAULT_{OPUS,SONNET,HAIKU,FABLE}_MODEL，去重保留顺序。
     返回 [{"name","tags"}]，tags=哪些位置引用它（默认/opus/sonnet/haiku/fable）。
     官方 OAuth 等无 env 模型键的形态返回空，调用方降级网关清单。"""
-    try:
-        env = json.loads(CLAUDE_SETTINGS.read_text("utf-8")).get("env") or {}
-    except Exception:
-        return []
+    if provider is not None:
+        env = provider.get("env") or {}
+    else:
+        try:
+            env = json.loads(CLAUDE_SETTINGS.read_text("utf-8")).get("env") or {}
+        except Exception:
+            return []
     order = [("默认", "ANTHROPIC_MODEL"),
              ("opus", "ANTHROPIC_DEFAULT_OPUS_MODEL"),
              ("sonnet", "ANTHROPIC_DEFAULT_SONNET_MODEL"),
@@ -4619,6 +4637,12 @@ def handle_command(chat_id: str, text: str) -> None:
             send_text(chat_id, "\n".join(lines))
     elif cmd == "/model":
         a = arg.strip()
+        # 本聊天绑定了供应商（/provider local）：模型清单/网关/链路全部以绑定
+        # 供应商为准（分身实际连的是它）——不这样列表永远显示全局供应商的
+        # 模型（11-28 用户实测报障）。未绑定/绑定失效时 cp={} 走全局口径。
+        cp = _chat_provider(chat_id)
+        cp = cp if (cp.get("env") and not cp.get("dirty")) else None
+        src_note = f"（供应商绑定 {cp['name']}）" if cp else ""
         if a.lower() in ("reset", "default", "clear"):
             with _models_lock:
                 old = _chat_models.pop(chat_id, None)
@@ -4627,22 +4651,22 @@ def handle_command(chat_id: str, text: str) -> None:
                 send_text(chat_id, "本聊天未单独设置模型（本来就在跟随全局）。")
             else:
                 idle, busy = _recycle_idle_children()
-                tips = [f"↩️ 本聊天模型已重置：{old} → 跟随全局",
-                        "· 全局链路：" + (" ｜ ".join(_model_chain()) or "?")]
+                tips = [f"↩️ 本聊天模型已重置：{old} → 跟随全局{src_note}",
+                        "· 全局链路：" + (" ｜ ".join(_model_chain(cp)) or "?")]
                 if idle:
                     tips.append(f"· 已回收空闲分身 {idle} 个（绑定保留，发消息自动续接）")
                 if busy:
                     tips.append(f"· ⚠️ {busy} 个分身正在跑回合，这轮跑完仍是旧模型")
                 send_text(chat_id, "\n".join(tips))
         elif a:
-            # 目标：已配置模型序号（cc-switch 供应商配置）或名称直接采纳；
+            # 目标：已配置模型序号（生效供应商配置）或名称直接采纳；
             # 没有配置清单时退回网关序号（官方 OAuth 等形态）
             target = None
-            mlist = [m["name"] for m in _configured_models()]
+            mlist = [m["name"] for m in _configured_models(cp)]
             if a.isdigit():
                 names = mlist
                 if not names:
-                    base, key = _current_endpoint()
+                    base, key = _current_endpoint(cp)
                     names = _gateway_models(base, key)
                 if names:
                     if 1 <= int(a) <= len(names):
@@ -4654,7 +4678,7 @@ def handle_command(chat_id: str, text: str) -> None:
                 target = a
                 names = mlist
                 if not names:
-                    base, key = _current_endpoint()
+                    base, key = _current_endpoint(cp)
                     names = _gateway_models(base, key)
                 if names and target not in names:
                     send_text(chat_id, f"⚠️ {target} 不在清单中，仍按名称设置"
@@ -4672,19 +4696,22 @@ def handle_command(chat_id: str, text: str) -> None:
             send_text(chat_id, "\n".join(tips))
         else:
             m_set = _chat_models.get(chat_id)
-            mlist = _configured_models()
+            mlist = _configured_models(cp)
             lines = ["🧬 模型"]
             lines.append(f"· 本聊天设置：{m_set}（显式 --model）" if m_set
                          else "· 本聊天设置：未设置（跟随全局）")
+            if cp:
+                lines.append(f"· 清单口径：本聊天绑定的供应商「{cp['name']}」"
+                             "（/provider local reset 解绑后回到全局供应商的清单）")
             if mlist:
                 # 只列 cc-switch 里配置过的模型（11-07 用户要求），不再拉网关全量
-                lines.append(f"· 已配置模型（cc-switch 当前供应商，共 {len(mlist)} 个）：")
+                lines.append(f"· 已配置模型（{('绑定供应商 ' + cp['name']) if cp else 'cc-switch 当前供应商'}，共 {len(mlist)} 个）：")
                 for i, m in enumerate(mlist, 1):
                     mark = " ← 本聊天" if m["name"] == m_set else ""
                     lines.append(f"  {i}. {m['name']}（{'·'.join(m['tags'])}）{mark}")
             else:
                 # 降级：官方 OAuth 等没配模型键的形态，退回网关实时清单
-                base, key = _current_endpoint()
+                base, key = _current_endpoint(cp)
                 glist = _gateway_models(base, key)
                 if glist:
                     lines.append(f"· 网关可用模型（{base}）：")
